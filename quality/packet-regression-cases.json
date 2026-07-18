@@ -1,0 +1,471 @@
+{
+  "cases": [
+    {
+      "name": "venus-trade-link-009",
+      "caseId": "fef680dd-73fc-4fb1-a8dc-57486d733241",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0
+      },
+      "documents": [
+        {
+          "type": "Tax Invoice",
+          "fields": {
+            "invoiceNumber": "VTL/009/26-27",
+            "eWayBillNumber": "242186042810",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "214609.4" },
+            "taxAmount": { "amount": "38629.7" },
+            "totalAmount": { "amount": "253239" }
+          },
+          "lineItems": [
+            {
+              "match": { "hsnSac": "7308" },
+              "fields": {
+                "quantity": { "amount": "1450" },
+                "unit": "KG",
+                "taxableAmount": { "amount": "130253.5" }
+              }
+            },
+            {
+              "match": { "hsnSac": "8501" },
+              "fields": {
+                "quantity": { "amount": "2" },
+                "unit": "Nos",
+                "taxableAmount": { "amount": "64406.76" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "E-Way Bill",
+          "fields": {
+            "referenceInvoiceNumber": "VTL/009/26-27",
+            "eWayBillNumber": "242186042810",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "214609.4" },
+            "taxAmount": { "amount": "38629.7" },
+            "totalAmount": { "amount": "253239" }
+          },
+          "lineItems": [
+            {
+              "match": { "hsnSac": "7308" },
+              "fields": {
+                "quantity": { "amount": "1450" },
+                "unit": "KG",
+                "taxableAmount": { "amount": "147202.64" }
+              }
+            },
+            {
+              "match": { "hsnSac": "8501" },
+              "fields": {
+                "quantity": { "amount": "2" },
+                "unit": "Nos",
+                "taxableAmount": { "amount": "67406.76" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "essem-gases-0653-invoice-duplicate-copy",
+      "caseId": "c617887d-a34d-4de4-b6c7-4b1a4934aa80",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0
+      },
+      "documentTypeCounts": {
+        "Invoice": 1
+      },
+      "documents": [
+        {
+          "type": "Invoice",
+          "fields": {
+            "invoiceNumber": "EGPL/26-27/0653",
+            "supplierGstin": "27AAACE7293E1ZL",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "6962" },
+            "taxAmount": { "amount": "1253.16" },
+            "totalAmount": { "amount": "8215" }
+          },
+          "lineItemCount": 2,
+          "lineItems": [
+            {
+              "match": { "hsnSac": "28044090" },
+              "fields": {
+                "description": { "oneOf": ["Ind. Oxygen 7 cm (T)", "Ind. Oxygen"] },
+                "quantity": { "amount": "14" },
+                "unit": "Cyl",
+                "rate": { "amount": "126" },
+                "taxRate": { "amount": "18" },
+                "taxableAmount": { "amount": "1764" },
+                "lineTotal": { "amount": "1764" },
+                "sourcePage": { "amount": "1" }
+              }
+            },
+            {
+              "match": { "hsnSac": "28043000" },
+              "fields": {
+                "description": { "oneOf": ["Nitrogen Gas 7 cm(T)", "Nitrogen Gas"] },
+                "quantity": { "amount": "23" },
+                "unit": "Cyl",
+                "rate": { "amount": "226" },
+                "taxRate": { "amount": "18" },
+                "taxableAmount": { "amount": "5198" },
+                "lineTotal": { "amount": "5198" },
+                "sourcePage": { "amount": "1" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shri-balaji-impex-159",
+      "caseId": "e995b33b-2c52-4806-9011-83577f205756",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0
+      },
+      "documents": [
+        {
+          "type": "Weighment Slip",
+          "fields": {
+            "vehicleNumber": "RJ14GK5455"
+          }
+        },
+        {
+          "type": "Invoice",
+          "fields": {
+            "invoiceNumber": "159",
+            "referencePoNumber": "IF/25-26/PF25Y-04961",
+            "eWayBillNumber": "741626284031",
+            "vehicleNumber": "RJ14GK5455",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "61000" },
+            "taxAmount": { "amount": "10980" },
+            "totalAmount": { "amount": "71980" }
+          },
+          "lineItems": [
+            {
+              "match": { "hsnSac": "38160000" },
+              "fields": {
+                "quantity": { "amount": "30.5" },
+                "unit": "MT",
+                "rate": { "amount": "2000" },
+                "taxableAmount": { "amount": "61000" },
+                "lineTotal": { "amount": "61000" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "E-Way Bill",
+          "fields": {
+            "referenceInvoiceNumber": "159",
+            "eWayBillNumber": "741626284031",
+            "vehicleNumber": "RJ14GK5455",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "61000" },
+            "taxAmount": { "amount": "10980" },
+            "totalAmount": { "amount": "71980" }
+          },
+          "lineItems": [
+            {
+              "match": { "hsnSac": "38160000" },
+              "fields": {
+                "quantity": { "amount": "30.5" },
+                "unit": "MT",
+                "taxableAmount": { "amount": "61000" },
+                "lineTotal": { "amount": "61000" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "Amended Purchase Order",
+          "fields": {
+            "poNumber": "IF/25-26/PF25Y-04961",
+            "buyerGstin": "27AACCK1502A1ZD"
+          }
+        }
+      ]
+    },
+    {
+      "name": "galvi-engineering-1008-eway-vehicle-validity",
+      "caseId": "ce56a53f-5ae7-4522-8e4a-e7c66f9b5792",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0
+      },
+      "documents": [
+        {
+          "type": "E-Way Bill",
+          "fields": {
+            "referenceInvoiceNumber": "DTA/1008/25-26",
+            "eWayBillNumber": "222153198658",
+            "documentDate": "05/03/2026 07:33 PM",
+            "validityDate": "13/03/2026",
+            "vehicleNumber": "MH22AA2095",
+            "transporterName": "TCI EXPRESS LTD",
+            "lorryReceiptNumber": "077946514",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "54720.63" },
+            "taxAmount": { "amount": "9849.47" },
+            "totalAmount": { "amount": "64570" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "gajkesari-705-amended-po-date-tax",
+      "caseId": "d3f67251-b354-47d0-9295-d4d4147344e6",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 1
+      },
+      "documents": [
+        {
+          "type": "E-Way Bill",
+          "fields": {
+            "referenceInvoiceNumber": "705",
+            "eWayBillNumber": "192358457158",
+            "lorryReceiptNumber": "208651774",
+            "subtotal": { "amount": "397800" },
+            "taxAmount": { "amount": "71604" },
+            "totalAmount": { "amount": "469404" }
+          },
+          "lineItems": [
+            {
+              "match": { "description": "5822PR1 & GUIDE ROLLERS" },
+              "fields": {
+                "quantity": { "amount": "10" },
+                "unit": "Nos",
+                "taxRate": { "amount": "18" },
+                "taxableAmount": { "amount": "16000" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "Tax Invoice",
+          "fields": {
+            "invoiceNumber": "705",
+            "referencePoNumber": "RM/25-26/PR25Y-00948",
+            "eWayBillNumber": "192358457158",
+            "subtotal": { "amount": "397800" },
+            "taxAmount": { "amount": "71604" },
+            "totalAmount": { "amount": "469404" }
+          },
+          "lineItems": [
+            {
+              "match": { "itemCode": "5822PR1" },
+              "fields": {
+                "quantity": { "amount": "10" },
+                "unit": "Nos",
+                "rate": { "amount": "1600" },
+                "taxRate": { "amount": "18" },
+                "lineTotal": { "amount": "16000" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "Amended Purchase Order",
+          "fields": {
+            "poNumber": "RM/25-26/PR25Y-00948",
+            "documentDate": "14-AUG-25",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "2928900" },
+            "taxAmount": { "amount": "527202" },
+            "totalAmount": { "amount": "3456102" }
+          },
+          "lineItems": [
+            {
+              "match": { "itemCode": "5374 ERG150" },
+              "fields": {
+                "quantity": { "amount": "30" },
+                "unit": "Nos",
+                "rate": { "amount": "14070" },
+                "taxRate": { "amount": "18" },
+                "taxAmount": { "amount": "75978" },
+                "lineTotal": { "amount": "422100" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "leo-metals-874-split-weighment",
+      "caseId": "3d9e2da4-9734-46e7-a620-312681ac88c0",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0,
+        "forbiddenMissingDocTypes": ["E-Way Bill"]
+      },
+      "documents": [
+        {
+          "type": "Tax Invoice",
+          "fields": {
+            "invoiceNumber": "LEO-874",
+            "eWayBillNumber": "162383895944",
+            "supplierGstin": "29ARZPG7503L1Z0",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "subtotal": { "amount": "829290" },
+            "taxAmount": { "amount": "149272.2" },
+            "totalAmount": { "amount": "978562" },
+            "vehicleNumber": "TN52L0893"
+          },
+          "lineItemCount": 1,
+          "lineItems": [
+            {
+              "match": { "hsnSac": "72044900" },
+              "fields": {
+                "description": "MS Scrap",
+                "quantity": { "amount": "25130" },
+                "unit": "KG",
+                "rate": { "amount": "33" },
+                "taxRate": { "amount": "18" },
+                "taxableAmount": { "amount": "829290" },
+                "lineTotal": { "amount": "829290" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "Lorry Receipt",
+          "fields": {
+            "eWayBillNumber": "162383895944",
+            "lorryReceiptNumber": "25-26/1098",
+            "vehicleNumber": "TN52L0893",
+            "netWeight": { "amount": "25130" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "electrotherm-150006849-gst-broad-po-lines",
+      "caseId": "387449e6-973e-4a55-a3ff-e52ceca4d445",
+      "requiresReingest": true,
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0
+      },
+      "forbiddenMismatchFields": [
+        "lineItems.amountMismatch",
+        "lineItems.unmatchedDocumentLine",
+        "lineItems.unitMismatch",
+        "taxRate",
+        "cgstRate",
+        "sgstRate",
+        "igstRate"
+      ],
+      "documents": [
+        {
+          "type": "Tax Invoice",
+          "titleIncludes": "1.pdf",
+          "fields": {
+            "invoiceNumber": "150006849",
+            "poNumber": "IF/24-25/PF24Y-04623",
+            "supplierGstin": "24AAACE2669L1ZI",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "taxRate": { "amount": "18" },
+            "igstRate": { "amount": "18" },
+            "taxAmount": { "amount": "730836" }
+          },
+          "lineItems": [
+            {
+              "match": {
+                "description": "MEDIUM FREQUENCY INDUCTION HEATING EQUIPMENT CONSISTING OF FOLLOWING UNDER CHAPTER HEADING"
+              },
+              "fields": {
+                "taxRate": { "amount": "18" },
+                "igstRate": { "amount": "18" },
+                "taxAmount": { "amount": "730836" },
+                "igstAmount": { "amount": "730836" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "Delivery Challan",
+          "titleIncludes": "3.pdf",
+          "fields": {
+            "referencePoNumber": "IF/24-25/PF24Y-04623"
+          },
+          "lineItems": [
+            {
+              "match": {
+                "lineNumber": "1"
+              },
+              "fields": {
+                "quantity": { "amount": "1" },
+                "unit": "SET",
+                "lineTotal": "",
+                "taxableAmount": ""
+              }
+            }
+          ]
+        },
+        {
+          "type": "E-Way Bill",
+          "fields": {
+            "supplierGstin": "24AAACE2669L1ZI",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "taxRate": { "amount": "18" },
+            "igstRate": { "amount": "18" },
+            "subtotal": { "amount": "4060200" },
+            "taxAmount": { "amount": "730836" },
+            "totalAmount": { "amount": "4791036" }
+          },
+          "lineItems": [
+            {
+              "match": {
+                "description": "HEATING EQUIPMENT & HEATING EQUIPMENT"
+              },
+              "fields": {
+                "quantity": { "amount": "1" },
+                "unit": "SET",
+                "taxableAmount": { "amount": "4060200" },
+                "taxRate": { "amount": "18" },
+                "igstRate": { "amount": "18" },
+                "igstAmount": { "amount": "730836" }
+              }
+            }
+          ]
+        },
+        {
+          "type": "Purchase Order",
+          "titleIncludes": "7.pdf",
+          "fields": {
+            "poNumber": "IF/24-25/PF24Y-04623",
+            "supplierGstin": "24AAACE2669L1ZI",
+            "buyerGstin": "27AACCK1502A1ZD",
+            "taxRate": { "amount": "18" },
+            "igstRate": { "amount": "18" },
+            "subtotal": { "amount": "11000000" },
+            "taxAmount": { "amount": "1980000" },
+            "totalAmount": { "amount": "12980000" }
+          },
+          "lineItems": [
+            {
+              "match": {
+                "description": "2400KW Inline Induction Heater As Per Attached Annexure"
+              },
+              "fields": {
+                "quantity": { "amount": "1" },
+                "unit": "LOT",
+                "taxableAmount": { "amount": "11000000" },
+                "taxRate": { "amount": "18" },
+                "igstRate": { "amount": "18" },
+                "igstAmount": { "amount": "1980000" }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

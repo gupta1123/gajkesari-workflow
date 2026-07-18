@@ -1,0 +1,1034 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tally UX Mockups</title>
+    <style>
+      :root {
+        --bg: #f7f2eb;
+        --panel: #fffdf9;
+        --panel-2: #fbf7f0;
+        --line: #e4d9c9;
+        --text: #191817;
+        --muted: #82776a;
+        --green: #0f8a5f;
+        --green-bg: #e7f7ef;
+        --amber: #b7791f;
+        --amber-bg: #fff6df;
+        --red: #b42318;
+        --red-bg: #fff0ee;
+        --blue: #245b9f;
+        --blue-bg: #edf4ff;
+        --shadow: 0 16px 44px rgba(40, 32, 20, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .app {
+        display: grid;
+        grid-template-columns: 232px 1fr;
+        width: 1440px;
+        height: 900px;
+        overflow: hidden;
+        background: var(--bg);
+      }
+
+      .sidebar {
+        border-right: 1px solid var(--line);
+        background: #f3ede4;
+        padding: 22px 14px;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        margin-bottom: 30px;
+        padding: 0 4px;
+      }
+
+      .brand-mark {
+        width: 38px;
+        height: 38px;
+        border-radius: 8px;
+        background: #1d1d1b;
+        color: white;
+        display: grid;
+        place-items: center;
+        font-weight: 900;
+      }
+
+      .brand-name {
+        font-size: 18px;
+        font-weight: 900;
+      }
+
+      .nav {
+        display: grid;
+        gap: 6px;
+      }
+
+      .nav-item {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        padding: 12px 12px;
+        border-radius: 8px;
+        color: #5e554c;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .nav-item.active {
+        background: #e7dece;
+        color: #151515;
+        box-shadow: inset 4px 0 0 #10a36e;
+      }
+
+      .nav-icon {
+        width: 18px;
+        height: 18px;
+        border: 2px solid currentColor;
+        border-radius: 5px;
+        opacity: 0.72;
+      }
+
+      .user {
+        margin-top: auto;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 12px;
+        border-top: 1px solid var(--line);
+      }
+
+      .avatar {
+        width: 36px;
+        height: 36px;
+        border-radius: 999px;
+        background: #171717;
+        color: white;
+        display: grid;
+        place-items: center;
+        font-weight: 900;
+      }
+
+      .main {
+        padding: 28px 34px;
+        overflow: hidden;
+      }
+
+      .topline {
+        text-transform: uppercase;
+        letter-spacing: 0.22em;
+        color: var(--muted);
+        font-weight: 900;
+        font-size: 11px;
+        margin-bottom: 6px;
+      }
+
+      .page-title-row {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 28px;
+        margin-bottom: 22px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 32px;
+        line-height: 1.1;
+        letter-spacing: -0.01em;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 20px;
+      }
+
+      h3 {
+        margin: 0;
+        font-size: 15px;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.4;
+      }
+
+      .actions {
+        display: flex;
+        gap: 10px;
+      }
+
+      .btn {
+        height: 42px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: white;
+        padding: 0 16px;
+        font-weight: 900;
+        font-size: 14px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+      }
+
+      .btn.primary {
+        background: #191817;
+        color: white;
+        border-color: #191817;
+      }
+
+      .btn.green {
+        background: var(--green);
+        border-color: var(--green);
+        color: white;
+      }
+
+      .screen {
+        display: none;
+      }
+
+      .screen.active {
+        display: block;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+      }
+
+      .section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 20px;
+      }
+
+      .grid {
+        display: grid;
+        gap: 14px;
+      }
+
+      .grid.cols-2 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .grid.cols-3 {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .grid.cols-4 {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px;
+      }
+
+      .status-band {
+        display: grid;
+        grid-template-columns: 1.2fr repeat(3, 1fr);
+        gap: 14px;
+        margin-bottom: 18px;
+      }
+
+      .status-main {
+        background: var(--green-bg);
+        border-color: #aee7c7;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 900;
+        border: 1px solid var(--line);
+      }
+
+      .pill.green {
+        color: var(--green);
+        background: var(--green-bg);
+        border-color: #b5e8cc;
+      }
+
+      .pill.amber {
+        color: var(--amber);
+        background: var(--amber-bg);
+        border-color: #f4d28a;
+      }
+
+      .pill.red {
+        color: var(--red);
+        background: var(--red-bg);
+        border-color: #f4b0a9;
+      }
+
+      .pill.blue {
+        color: var(--blue);
+        background: var(--blue-bg);
+        border-color: #b9d5fb;
+      }
+
+      .metric {
+        font-size: 31px;
+        font-weight: 950;
+        letter-spacing: -0.03em;
+        margin-top: 8px;
+      }
+
+      .label {
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 10px;
+        color: var(--muted);
+        font-weight: 950;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 13px 0;
+        border-bottom: 1px solid #eee5d8;
+      }
+
+      .row:last-child {
+        border-bottom: 0;
+      }
+
+      .progress {
+        height: 10px;
+        border-radius: 999px;
+        background: #efe5d7;
+        overflow: hidden;
+      }
+
+      .progress span {
+        display: block;
+        height: 100%;
+        background: var(--green);
+      }
+
+      .health-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .issue-row {
+        display: grid;
+        grid-template-columns: 38px 1fr auto;
+        gap: 14px;
+        align-items: center;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      .score {
+        width: 38px;
+        height: 38px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        font-weight: 950;
+      }
+
+      .score.good {
+        color: var(--green);
+        background: var(--green-bg);
+      }
+
+      .score.warn {
+        color: var(--amber);
+        background: var(--amber-bg);
+      }
+
+      .score.bad {
+        color: var(--red);
+        background: var(--red-bg);
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: 1fr 380px;
+        gap: 18px;
+      }
+
+      .check-row {
+        display: grid;
+        grid-template-columns: 28px 1fr auto;
+        gap: 12px;
+        align-items: center;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        margin-bottom: 10px;
+        background: var(--panel);
+      }
+
+      .dot {
+        width: 28px;
+        height: 28px;
+        border-radius: 999px;
+        display: grid;
+        place-items: center;
+        font-weight: 900;
+      }
+
+      .dot.good {
+        background: var(--green-bg);
+        color: var(--green);
+      }
+
+      .dot.warn {
+        background: var(--amber-bg);
+        color: var(--amber);
+      }
+
+      .dot.bad {
+        background: var(--red-bg);
+        color: var(--red);
+      }
+
+      .doc-card {
+        border: 1px solid var(--line);
+        background: #fff;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .doc-top {
+        padding: 14px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel-2);
+      }
+
+      .doc-body {
+        padding: 14px;
+        display: grid;
+        gap: 8px;
+      }
+
+      .two-column {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+
+      .field {
+        display: grid;
+        gap: 5px;
+      }
+
+      .field strong {
+        font-size: 13px;
+      }
+
+      .input {
+        height: 42px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: white;
+        padding: 0 12px;
+        font-weight: 800;
+        display: flex;
+        align-items: center;
+      }
+
+      .table {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: white;
+      }
+
+      .table-row {
+        display: grid;
+        grid-template-columns: 1.15fr 1fr 1fr 120px;
+        gap: 12px;
+        padding: 12px 14px;
+        border-bottom: 1px solid #eee5d8;
+        font-size: 13px;
+        align-items: center;
+      }
+
+      .table-row.header {
+        background: var(--panel-2);
+        color: var(--muted);
+        font-weight: 950;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 10px;
+      }
+
+      .table-row:last-child {
+        border-bottom: 0;
+      }
+
+      .voucher {
+        display: grid;
+        grid-template-columns: 1fr 340px;
+        gap: 18px;
+      }
+
+      .voucher-lines {
+        display: grid;
+        gap: 8px;
+      }
+
+      .amount-line {
+        display: flex;
+        justify-content: space-between;
+        padding: 12px 0;
+        border-bottom: 1px solid #eee5d8;
+        font-size: 14px;
+      }
+
+      .amount-line.total {
+        font-size: 22px;
+        font-weight: 950;
+        border-bottom: 0;
+      }
+
+      .footer-note {
+        margin-top: 16px;
+        border: 1px solid #b9d5fb;
+        background: var(--blue-bg);
+        color: #23456f;
+        border-radius: 8px;
+        padding: 12px;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">K</div>
+          <div>
+            <div class="brand-name">Gajkesari</div>
+            <p style="font-size: 12px">Procurement Control</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <div class="nav-item"><span class="nav-icon"></span>Dashboard</div>
+          <div class="nav-item"><span class="nav-icon"></span>Add Case</div>
+          <div class="nav-item"><span class="nav-icon"></span>All Cases</div>
+          <div class="nav-item active"><span class="nav-icon"></span>Tally Prime</div>
+          <div class="nav-item"><span class="nav-icon"></span>Recycle Bin</div>
+        </nav>
+        <div class="user">
+          <div class="avatar">N</div>
+          <div>
+            <h3>Admin</h3>
+            <p style="font-size: 12px">admin@gajkesari.local</p>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section id="command" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Automation</div>
+              <h1>Tally Prime</h1>
+              <p>Your live Tally connection and posting readiness.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Sync from Tally</button>
+              <button class="btn primary">Review Tally Work</button>
+            </div>
+          </div>
+
+          <div class="status-band">
+            <div class="card status-main">
+              <span class="pill green">Tally Connected</span>
+              <div class="metric">Test Company</div>
+              <p>Last checked just now. Manual approval is on.</p>
+            </div>
+            <div class="card">
+              <div class="label">Connection</div>
+              <div class="metric" style="font-size: 24px">Online</div>
+              <p>Bridge running nearby</p>
+            </div>
+            <div class="card">
+              <div class="label">Company</div>
+              <div class="metric" style="font-size: 24px">Loaded</div>
+              <p>Correct Tally company</p>
+            </div>
+            <div class="card">
+              <div class="label">Posting Safety</div>
+              <div class="metric" style="font-size: 24px">Protected</div>
+              <p>No silent overwrite</p>
+            </div>
+          </div>
+
+          <div class="grid cols-4" style="margin-bottom: 18px">
+            <div class="card"><div class="label">Ready to post</div><div class="metric">8</div></div>
+            <div class="card"><div class="label">Needs mapping</div><div class="metric">3</div></div>
+            <div class="card"><div class="label">Conflicts</div><div class="metric">2</div></div>
+            <div class="card"><div class="label">Posted today</div><div class="metric">5</div></div>
+          </div>
+
+          <div class="grid cols-2">
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <div>
+                  <h2>Master Health</h2>
+                  <p>Ledger quality before posting anything.</p>
+                </div>
+                <span class="pill amber">12 need review</span>
+              </div>
+              <div class="progress"><span style="width: 84%"></span></div>
+              <div class="grid cols-2" style="margin-top: 14px">
+                <div class="card"><div class="label">Clean ledgers</div><div class="metric">92</div></div>
+                <div class="card"><div class="label">Possible duplicates</div><div class="metric">6</div></div>
+                <div class="card"><div class="label">Missing GSTIN</div><div class="metric">4</div></div>
+                <div class="card"><div class="label">Wrong group</div><div class="metric">2</div></div>
+              </div>
+            </div>
+            <div class="section">
+              <h2>Recent Tally Activity</h2>
+              <div style="margin-top: 10px">
+                <div class="row"><strong>Masters synced</strong><span class="muted">2 min ago</span></div>
+                <div class="row"><strong>GST ledger mapped</strong><span class="muted">8 min ago</span></div>
+                <div class="row"><strong>Ledger rename queued</strong><span class="muted">12 min ago</span></div>
+                <div class="row"><strong>Purchase voucher posted</strong><span class="muted">18 min ago</span></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="health" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Tally Masters</div>
+              <h1>Master Health Review</h1>
+              <p>Find duplicate, incomplete, or risky ledgers before they cause wrong entries.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Export Review</button>
+              <button class="btn primary">Fix Selected</button>
+            </div>
+          </div>
+          <div class="grid cols-4" style="margin-bottom: 18px">
+            <div class="card"><div class="label">Health score</div><div class="metric">84%</div></div>
+            <div class="card"><div class="label">Possible duplicates</div><div class="metric">6</div></div>
+            <div class="card"><div class="label">Missing GSTIN</div><div class="metric">4</div></div>
+            <div class="card"><div class="label">Wrong group</div><div class="metric">2</div></div>
+          </div>
+          <div class="split">
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <h2>Issues to review</h2>
+                <span class="pill amber">Needs action</span>
+              </div>
+              <div class="health-list">
+                <div class="issue-row">
+                  <div class="score warn">78</div>
+                  <div>
+                    <h3>ABC Traders and A B C Traders may be same party</h3>
+                    <p>Similar name, same city, invoice history overlaps. GSTIN missing on one ledger.</p>
+                  </div>
+                  <button class="btn">Review</button>
+                </div>
+                <div class="issue-row">
+                  <div class="score bad">42</div>
+                  <div>
+                    <h3>Supplier ledger under wrong group</h3>
+                    <p>Placed under Purchase Accounts. Should usually be Sundry Creditors.</p>
+                  </div>
+                  <button class="btn">Fix</button>
+                </div>
+                <div class="issue-row">
+                  <div class="score warn">66</div>
+                  <div>
+                    <h3>Purchase GST 18% is configured as Other tax</h3>
+                    <p>Looks like GST ledger, but tax type may not be CGST, SGST, or IGST.</p>
+                  </div>
+                  <button class="btn">Review</button>
+                </div>
+                <div class="issue-row">
+                  <div class="score good">96</div>
+                  <div>
+                    <h3>Cash</h3>
+                    <p>Clean ledger. No issue found.</p>
+                  </div>
+                  <span class="pill green">Clean</span>
+                </div>
+              </div>
+            </div>
+            <div class="section">
+              <h2>Recommended fix</h2>
+              <p style="margin: 8px 0 16px">Merge only after accountant approval. We never change Tally silently.</p>
+              <div class="card">
+                <div class="label">Keep ledger</div>
+                <h3 style="margin-top: 6px">ABC Traders</h3>
+              </div>
+              <div class="card" style="margin-top: 10px">
+                <div class="label">Possible duplicate</div>
+                <h3 style="margin-top: 6px">A B C Traders</h3>
+              </div>
+              <div class="footer-note">Action will be queued to Tally and visible in audit history.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="case" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Case Tally</div>
+              <h1>Case INV-1024 Readiness</h1>
+              <p>Post only after packet review, mapping checks, and duplicate checks pass.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Open Case</button>
+              <button class="btn primary">Preview Tally Voucher</button>
+            </div>
+          </div>
+          <div class="split">
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <div>
+                  <h2>Posting checklist</h2>
+                  <p>Everything needed for ledger-only purchase entry.</p>
+                </div>
+                <span class="pill amber">2 fixes needed</span>
+              </div>
+              <div class="check-row">
+                <div class="dot good">OK</div>
+                <div><h3>Packet accepted</h3><p>All document mismatches reviewed.</p></div>
+                <span class="pill green">Passed</span>
+              </div>
+              <div class="check-row">
+                <div class="dot good">OK</div>
+                <div><h3>Supplier ledger matched</h3><p>ABC Traders matched with high confidence.</p></div>
+                <span class="pill green">Passed</span>
+              </div>
+              <div class="check-row">
+                <div class="dot warn">!</div>
+                <div><h3>GST ledger needs confirmation</h3><p>Invoice has GST 18%. Suggested ledger: Purchase GST 18%.</p></div>
+                <button class="btn">Resolve</button>
+              </div>
+              <div class="check-row">
+                <div class="dot warn">!</div>
+                <div><h3>Freight ledger missing</h3><p>Freight charge detected, but no approved ledger mapping exists.</p></div>
+                <button class="btn">Map</button>
+              </div>
+              <div class="check-row">
+                <div class="dot good">OK</div>
+                <div><h3>No duplicate invoice found</h3><p>Checked supplier, invoice number, date, and amount.</p></div>
+                <span class="pill green">Passed</span>
+              </div>
+            </div>
+            <div class="section">
+              <h2>Case summary</h2>
+              <div class="doc-card" style="margin-top: 12px">
+                <div class="doc-top"><strong>Invoice packet</strong><p>6 files checked</p></div>
+                <div class="doc-body">
+                  <div class="row"><span>Supplier</span><strong>ABC Traders</strong></div>
+                  <div class="row"><span>Invoice no.</span><strong>INV-1024</strong></div>
+                  <div class="row"><span>Taxable amount</span><strong>Rs 1,00,000</strong></div>
+                  <div class="row"><span>GST</span><strong>Rs 18,000</strong></div>
+                  <div class="row"><span>Total</span><strong>Rs 1,18,000</strong></div>
+                </div>
+              </div>
+              <div class="footer-note">The final Post button stays disabled until every warning is resolved.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="mapping" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Resolve Mapping</div>
+              <h1>Choose the Right Tally Ledger</h1>
+              <p>The app suggests matches. The user only confirms simple choices.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Skip for now</button>
+              <button class="btn green">Confirm Mapping</button>
+            </div>
+          </div>
+          <div class="two-column">
+            <div class="section">
+              <h2>What we found in the packet</h2>
+              <div class="grid cols-2" style="margin-top: 16px">
+                <div class="card"><div class="label">Field</div><h3>Supplier</h3></div>
+                <div class="card"><div class="label">Detected value</div><h3>ABC Traders</h3></div>
+                <div class="card"><div class="label">GSTIN</div><h3>27ABCDE1234F1Z5</h3></div>
+                <div class="card"><div class="label">Source</div><h3>Invoice page 1</h3></div>
+              </div>
+              <div class="doc-card" style="margin-top: 16px">
+                <div class="doc-top"><strong>Evidence preview</strong><p>Highlighted values from uploaded documents.</p></div>
+                <div class="doc-body">
+                  <div class="field"><strong>Supplier name</strong><div class="input">ABC Traders</div></div>
+                  <div class="field"><strong>Invoice total</strong><div class="input">Rs 1,18,000</div></div>
+                  <div class="field"><strong>Tax rate</strong><div class="input">GST 18%</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <h2>Suggested Tally matches</h2>
+                <span class="pill green">High confidence</span>
+              </div>
+              <div class="issue-row">
+                <div class="score good">96</div>
+                <div><h3>ABC Traders</h3><p>Parent: Sundry Creditors. Used in similar invoices.</p></div>
+                <span class="pill green">Recommended</span>
+              </div>
+              <div class="issue-row" style="margin-top: 10px">
+                <div class="score warn">71</div>
+                <div><h3>A B C Traders</h3><p>Similar name, missing GSTIN.</p></div>
+                <button class="btn">Compare</button>
+              </div>
+              <div class="issue-row" style="margin-top: 10px">
+                <div class="score bad">38</div>
+                <div><h3>ABC Trading Co.</h3><p>Different parent group and address.</p></div>
+                <span class="pill red">Risky</span>
+              </div>
+              <div class="footer-note">After confirmation, future packets with this supplier can be matched automatically.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="voucher" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Final Approval</div>
+              <h1>Preview Tally Voucher</h1>
+              <p>Review the exact ledger-only entry before it is posted to Tally.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Back to checks</button>
+              <button class="btn green">Post to Tally</button>
+            </div>
+          </div>
+          <div class="voucher">
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <div>
+                  <h2>Purchase voucher</h2>
+                  <p>Company: Test Company. Voucher type: Purchase.</p>
+                </div>
+                <span class="pill green">Ready</span>
+              </div>
+              <div class="table">
+                <div class="table-row header">
+                  <div>Ledger</div><div>Debit</div><div>Credit</div><div>Status</div>
+                </div>
+                <div class="table-row">
+                  <div><strong>Purchase GST 18%</strong><p>Purchase ledger</p></div>
+                  <div>Rs 1,00,000</div><div>-</div><span class="pill green">Mapped</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>Input GST 18%</strong><p>Tax ledger</p></div>
+                  <div>Rs 18,000</div><div>-</div><span class="pill green">Mapped</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>ABC Traders</strong><p>Supplier ledger</p></div>
+                  <div>-</div><div>Rs 1,18,000</div><span class="pill green">Matched</span>
+                </div>
+              </div>
+              <div class="footer-note">No duplicate invoice found. This voucher will be created only after approval.</div>
+            </div>
+            <div class="section">
+              <h2>Posting summary</h2>
+              <div class="voucher-lines" style="margin-top: 14px">
+                <div class="amount-line"><span>Supplier</span><strong>ABC Traders</strong></div>
+                <div class="amount-line"><span>Invoice no.</span><strong>INV-1024</strong></div>
+                <div class="amount-line"><span>Invoice date</span><strong>26 May 2026</strong></div>
+                <div class="amount-line"><span>Taxable value</span><strong>Rs 1,00,000</strong></div>
+                <div class="amount-line"><span>GST</span><strong>Rs 18,000</strong></div>
+                <div class="amount-line total"><span>Total</span><span>Rs 1,18,000</span></div>
+              </div>
+              <div class="footer-note">Audit trail will store source case, user approval, Tally GUID, and posting result.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="edit" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Tally Write Back</div>
+              <h1>Edit Ledger Safely</h1>
+              <p>Every Tally master change is reviewed, compared, queued, and confirmed.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Discard</button>
+              <button class="btn green">Queue Tally Change</button>
+            </div>
+          </div>
+          <div class="two-column">
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <div>
+                  <h2>Current Tally ledger</h2>
+                  <p>Synced from Test Company two minutes ago.</p>
+                </div>
+                <span class="pill blue">Ledger</span>
+              </div>
+              <div class="grid cols-2" style="margin-top: 14px">
+                <div class="field">
+                  <strong>Ledger name</strong>
+                  <div class="input">A B C Traders</div>
+                </div>
+                <div class="field">
+                  <strong>Under group</strong>
+                  <div class="input">Sundry Creditors</div>
+                </div>
+                <div class="field">
+                  <strong>GSTIN</strong>
+                  <div class="input">Missing</div>
+                </div>
+                <div class="field">
+                  <strong>Status</strong>
+                  <div class="input">Possible duplicate</div>
+                </div>
+              </div>
+              <div class="footer-note">This screen edits Tally only after a user approves the proposed change. No background overwrite.</div>
+            </div>
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <div>
+                  <h2>Proposed correction</h2>
+                  <p>Suggested by case evidence and duplicate detection.</p>
+                </div>
+                <span class="pill amber">Needs approval</span>
+              </div>
+              <div class="table" style="margin-top: 14px">
+                <div class="table-row header">
+                  <div>Field</div><div>Current</div><div>Proposed</div><div>Risk</div>
+                </div>
+                <div class="table-row">
+                  <div><strong>Name</strong></div><div>A B C Traders</div><div>ABC Traders</div><span class="pill amber">Medium</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>GSTIN</strong></div><div>Blank</div><div>27ABCDE1234F1Z5</div><span class="pill green">Low</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>Group</strong></div><div>Sundry Creditors</div><div>Sundry Creditors</div><span class="pill green">Low</span>
+                </div>
+              </div>
+              <div class="doc-card" style="margin-top: 14px">
+                <div class="doc-top"><strong>Evidence</strong><p>Invoice, GSTIN, and prior packet history support this correction.</p></div>
+                <div class="doc-body">
+                  <div class="row"><span>Used in accepted packets</span><strong>14</strong></div>
+                  <div class="row"><span>Duplicate probability</span><strong>91%</strong></div>
+                  <div class="row"><span>Approval required</span><strong>Admin or Accountant</strong></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="audit" class="screen">
+          <div class="page-title-row">
+            <div>
+              <div class="topline">Controls</div>
+              <h1>Tally Action Queue</h1>
+              <p>Track every sync, mapping, master edit, voucher preview, and posting attempt.</p>
+            </div>
+            <div class="actions">
+              <button class="btn">Filter</button>
+              <button class="btn primary">Retry Failed</button>
+            </div>
+          </div>
+          <div class="grid cols-4" style="margin-bottom: 18px">
+            <div class="card"><div class="label">Pending approval</div><div class="metric">3</div></div>
+            <div class="card"><div class="label">Queued to Tally</div><div class="metric">2</div></div>
+            <div class="card"><div class="label">Failed today</div><div class="metric">1</div></div>
+            <div class="card"><div class="label">Completed today</div><div class="metric">18</div></div>
+          </div>
+          <div class="split">
+            <div class="section">
+              <div class="row" style="padding-top: 0">
+                <div>
+                  <h2>Work queue</h2>
+                  <p>Nothing disappears after a click. Every result is visible.</p>
+                </div>
+                <span class="pill amber">Review first</span>
+              </div>
+              <div class="table">
+                <div class="table-row header">
+                  <div>Action</div><div>Source</div><div>Result</div><div>Status</div>
+                </div>
+                <div class="table-row">
+                  <div><strong>Post purchase voucher</strong><p>INV-1024</p></div><div>Case approval</div><div>Waiting for accountant</div><span class="pill amber">Pending</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>Rename ledger</strong><p>A B C Traders</p></div><div>Master health</div><div>Queued for Tally</div><span class="pill blue">Queued</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>Sync masters</strong><p>Test Company</p></div><div>Manual sync</div><div>32 ledgers updated</div><span class="pill green">Done</span>
+                </div>
+                <div class="table-row">
+                  <div><strong>Post voucher</strong><p>INV-1019</p></div><div>Case approval</div><div>Tally company changed</div><span class="pill red">Failed</span>
+                </div>
+              </div>
+            </div>
+            <div class="section">
+              <h2>Selected action</h2>
+              <div class="doc-card" style="margin-top: 12px">
+                <div class="doc-top"><strong>INV-1019 failed</strong><p>The bridge reached Tally, but the loaded company was different.</p></div>
+                <div class="doc-body">
+                  <div class="row"><span>Expected company</span><strong>Test Company</strong></div>
+                  <div class="row"><span>Loaded company</span><strong>Demo Company</strong></div>
+                  <div class="row"><span>Next step</span><strong>Load correct company, then retry</strong></div>
+                  <div class="row"><span>Data written</span><strong>Nothing posted</strong></div>
+                </div>
+              </div>
+              <div class="footer-note">This is the safety layer that makes automation sellable: clear failure reason, no partial posting, and retry after fix.</div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const selected = params.get("screen") || "command";
+      for (const element of document.querySelectorAll(".screen")) {
+        element.classList.toggle("active", element.id === selected);
+      }
+    </script>
+  </body>
+</html>
