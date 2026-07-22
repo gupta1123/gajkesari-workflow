@@ -4,17 +4,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useRef, useState } from "react";
 import {
-  LayoutDashboard,
-  FolderOpen,
-  FileStack,
-  FileText,
   Landmark,
-  Trash2,
   LogOut,
   ChevronsUpDown,
   Settings,
   ChevronLeft,
-  Receipt,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
@@ -22,33 +16,10 @@ import styles from "./DashboardSidebar.module.css";
 /* ── Sectioned nav ───────────────────────────── */
 const SIDEBAR_SECTIONS = [
   {
-    id: "main",
-    title: "Main",
+    id: "bank-statement",
+    title: "Bank Statement",
     items: [
-      { href: "/", label: "Dashboard", icon: LayoutDashboard },
-    ],
-  },
-  {
-    id: "cases",
-    title: "Cases",
-    items: [
-      { href: "/workspace", label: "Add Case", icon: FileStack },
-      { href: "/cases", label: "All Cases", icon: FolderOpen },
-    ],
-  },
-  {
-    id: "reconciliation",
-    title: "Reconciliation",
-    items: [
-      { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
-      { href: "/collections", label: "Cash Discounts", icon: FileText },
-    ],
-  },
-  {
-    id: "system",
-    title: "System",
-    items: [
-      { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
+      { href: "/bank-statements", label: "Bank Statement", icon: Landmark },
     ],
   },
 ];
