@@ -1,4 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
+import { listLocalTallyConnections } from "@/lib/local/tally-store";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { serializeTallyConnectionStatus, type TallyConnectionRow } from "@/lib/tally/connections";
@@ -264,9 +266,41 @@ export function OPTIONS(request: Request) {
 
 export async function GET(request: Request) {
   try {
-    const user = await requireRequestUser(request);
+    const localMode = isLocalDbMode();
+    const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+    }
+
+    if (localMode) {
+      const localTallyCompanies = readLocalTallyCompanies();
+      const companyEntries = (await listLocalTallyConnections(user.id)).map((connection) => {
+        const companyName = pickCompanyName(connection);
+
+        return {
+          company: serializeCompany(connection, companyName),
+          hasSpecificName: !isGenericTallyLabel(companyName),
+          updatedAt: connection.updated_at,
+        };
+      });
+
+      companyEntries.sort((a, b) => {
+        if (a.hasSpecificName !== b.hasSpecificName) {
+          return a.hasSpecificName ? -1 : 1;
+        }
+
+        return timestampValue(b.updatedAt) - timestampValue(a.updatedAt);
+      });
+
+      const connectedCompanyEntries = companyEntries.filter(
+        (entry) => entry.company.bridgeConnected && entry.company.tallyReachable && entry.company.companyLoaded
+      );
+      const companies = companyEntries.map((entry) => withLocalBankLedgers(entry.company, localTallyCompanies));
+
+      return jsonWithCors(request, {
+        companies,
+        selectedCompanyId: connectedCompanyEntries[0]?.company.id ?? companies[0]?.id ?? null,
+      });
     }
 
     const supabase = createSupabaseAdminClient();

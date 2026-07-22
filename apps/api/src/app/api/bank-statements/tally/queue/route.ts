@@ -12,13 +12,14 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 export const runtime = "nodejs";
 
 type QueuePayload = {
+  async?: boolean;
   connectionId?: string;
   companyName?: string;
   transactionIds?: string[];
   accountId?: string;
   bankLedgerName?: string;
   counterpartyLedgerName?: string;
-    transactions?: Array<{
+  transactions?: Array<{
     transactionId?: string;
     counterpartyLedgerName?: string;
     createLedgerName?: string;
@@ -117,6 +118,20 @@ type TallyCommandInsert = {
   priority: number;
   payload: Record<string, unknown>;
 };
+
+function serializeQueueJob(row: Record<string, unknown>) {
+  return {
+    id: row.id,
+    status: row.status,
+    totalCount: row.total_count,
+    processedCount: row.processed_count,
+    result: row.result ?? {},
+    error: row.error ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at ?? null,
+  };
+}
 
 function toText(value: unknown, maxLength = 500) {
   if (value === null || value === undefined) return "";
@@ -330,6 +345,47 @@ export async function POST(request: Request) {
 
     const connection = submittedConnection;
     const connectionId = connection.id;
+
+    if (body.async === true) {
+      const totalCount =
+        requestedTransactionIds.length || (Array.isArray(body.transactions) ? body.transactions.length : 0) || 1;
+      const { data: job, error: jobError } = await supabase
+        .from("bank_statement_tally_queue_jobs")
+        .insert({
+          owner_user_id: user.id,
+          connection_id: connectionId,
+          bank_account_id: accountId || null,
+          status: "queued",
+          request_payload: {
+            ...body,
+            async: false,
+            connectionId,
+          },
+          result: {
+            queuedCount: 0,
+            verificationCount: 0,
+            commandCount: 0,
+            commands: [],
+          },
+          total_count: totalCount,
+          processed_count: 0,
+        })
+        .select("*")
+        .single();
+
+      if (jobError) throw jobError;
+
+      return jsonWithCors(
+        request,
+        {
+          async: true,
+          jobId: job.id,
+          job: serializeQueueJob(job as Record<string, unknown>),
+        },
+        { status: 202 }
+      );
+    }
+
     let query = supabase
       .from("bank_transactions")
       .select("*")
