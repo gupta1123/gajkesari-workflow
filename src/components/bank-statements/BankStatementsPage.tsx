@@ -70,6 +70,8 @@ type LocalBankLedger = {
   bankAccountNumber?: string | null;
 };
 
+const BANK_STATEMENT_COMPANY_SELECTION_KEY = "gajkesari.bankStatements.selectedCompany.v1";
+
 function uniqueCompanyOptions(options: CompanyOption[]) {
   const seen = new Set<string>();
   return options.filter((option) => {
@@ -80,8 +82,79 @@ function uniqueCompanyOptions(options: CompanyOption[]) {
   });
 }
 
+function sortCompanyOptions(options: CompanyOption[]) {
+  return [...options].sort((left, right) => {
+    const leftLiveRank = Number(left.bridgeConnected) + Number(left.tallyReachable) + Number(left.companyLoaded);
+    const rightLiveRank = Number(right.bridgeConnected) + Number(right.tallyReachable) + Number(right.companyLoaded);
+    if (leftLiveRank !== rightLiveRank) return rightLiveRank - leftLiveRank;
+
+    return new Date(right.lastHeartbeatAt ?? right.lastSyncAt ?? 0).getTime() -
+      new Date(left.lastHeartbeatAt ?? left.lastSyncAt ?? 0).getTime();
+  });
+}
+
 function formatCompanyOptionLabel(company: CompanyOption) {
   return [company.companyName, company.financialYear].filter(Boolean).join(" - ");
+}
+
+function readStoredCompanySelection(): CompanyOption | null {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const raw = window.localStorage.getItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<CompanyOption>;
+    const id = typeof value.id === "string" ? value.id.trim() : "";
+    const connectionId = typeof value.connectionId === "string" ? value.connectionId.trim() : "";
+    const companyName = typeof value.companyName === "string" ? value.companyName.trim() : "";
+    const financialYear = typeof value.financialYear === "string" ? value.financialYear.trim() : "Current year";
+
+    if (!id || !connectionId || !companyName) return null;
+
+    return {
+      id,
+      connectionId,
+      companyName,
+      financialYear,
+      status: typeof value.status === "string" ? value.status : "restoring",
+      bridgeConnected: false,
+      tallyReachable: false,
+      companyLoaded: false,
+      bankAccountCount: null,
+      lastSyncAt: null,
+      lastHeartbeatAt: null,
+      lastError: null,
+      bankLedgers: [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredCompanySelection(company: CompanyOption | null) {
+  if (typeof window === "undefined") return;
+
+  if (!company) {
+    window.localStorage.removeItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(
+    BANK_STATEMENT_COMPANY_SELECTION_KEY,
+    JSON.stringify({
+      id: company.id,
+      connectionId: company.connectionId,
+      companyName: company.companyName,
+      financialYear: company.financialYear,
+      status: company.status,
+    })
+  );
+}
+
+function findStoredCompanySelection(options: CompanyOption[]) {
+  const stored = readStoredCompanySelection();
+  if (!stored) return null;
+  return options.find((company) => company.id === stored.id) ?? null;
 }
 
 type TallyConnection = {
@@ -103,6 +176,35 @@ type TallyCommand = {
   status: string;
   result: Record<string, unknown> | null;
   error: string | null;
+};
+
+type TallyQueueJob = {
+  id: string;
+  status: string;
+  totalCount?: number;
+  processedCount?: number;
+  result?: TallyQueueResult | null;
+  error?: string | null;
+};
+
+type TallyQueueJobResponse = {
+  async?: boolean;
+  jobId?: string;
+  job?: TallyQueueJob;
+  result?: TallyQueueResult | null;
+  error?: string;
+};
+
+type TallyQueueResult = {
+  queuedCount?: number;
+  verificationCount?: number;
+  commands?: TallyCommand[];
+  diagnostics?: {
+    expectedReceiptCount?: number;
+    expectedPaymentCheckCount?: number;
+    companySuspenseLedgerName?: string | null;
+    skippedRows?: Array<{ transactionId?: string; description?: string; reason?: string }>;
+  };
 };
 
 type BankLedgerFetchResult = {
@@ -149,8 +251,10 @@ type LedgerRecommendationAction =
   | "needs_review";
 
 type LedgerRecommendation = {
+  matchType?: "direct_match" | "close_match" | "suspense";
   action: LedgerRecommendationAction;
   ledgerName: string | null;
+  candidateLedgerNames?: string[];
   ledgerGroup: string | null;
   confidence: number;
   requiresUserConfirmation: boolean;
@@ -172,6 +276,7 @@ type ReviewTransaction = {
   suggestedLedgerName: string;
   suggestionConfidence: number | null;
   suggestionReason: string;
+  candidateLedgerNames: string[];
   selectedLedgerName: string;
   ledgerAction: LedgerRecommendationAction;
   ledgerGroup: string;
@@ -216,6 +321,27 @@ type PreviewResponse = {
   } | null;
 };
 
+type DocumentPreviewKind = "csv" | "text" | "pdf" | "image" | "unsupported";
+
+type DocumentPreviewState = {
+  fileName: string;
+  kind: DocumentPreviewKind;
+  headers: string[];
+  rows: string[][];
+  totalRows: number;
+  textLines: string[];
+  objectUrl: string | null;
+  error: string | null;
+};
+
+type ApiErrorPayload = {
+  error?: string;
+  code?: string;
+  detail?: string;
+  userAction?: string;
+  diagnostics?: unknown;
+};
+
 type TallyMaster = {
   key: string;
   name: string;
@@ -243,6 +369,7 @@ type QueueTransaction = {
 type MessageTone = "success" | "error" | "info";
 type ReviewStatusFilter = "all" | "matched" | "needs_review" | "suspense";
 type ReviewDirectionFilter = "all" | "debit" | "credit";
+type TallySendMode = "post_receipts" | "check_payments";
 
 type ToastMessage = {
   id: string;
@@ -267,6 +394,14 @@ type TallyPostingStatus = {
   canceled: number;
   finished: boolean;
   errors: string[];
+  voucherTotal: number;
+  voucherWaiting: number;
+  voucherCompleted: number;
+  voucherFailed: number;
+  paymentCheckTotal: number;
+  paymentCheckWaiting: number;
+  paymentCheckCompleted: number;
+  paymentCheckFailed: number;
 };
 
 type LedgerSelection = {
@@ -355,8 +490,21 @@ type OutgoingVerificationDraft = {
   voucherNumber?: string | null;
   voucherDate?: string | null;
   matchCount?: number | null;
+  duplicateInTally?: boolean;
+  duplicateVoucherCount?: number;
   scannedCount?: number | null;
   matches?: OutgoingMatchCandidate[];
+};
+
+type TallyBalanceProof = {
+  available?: boolean;
+  statementSequenceValid?: boolean;
+  statementOpeningBalance?: number | null;
+  statementClosingBalance?: number | null;
+  tallyOpeningBalance?: number | null;
+  tallyClosingBalance?: number | null;
+  balancesMatch?: boolean | null;
+  warning?: string | null;
 };
 
 type LedgerPickerOption = LedgerSelection & {
@@ -592,6 +740,24 @@ function findLedgerByNormalizedName(ledgerMasters: TallyMaster[], ledgerName?: s
   );
 }
 
+function findCompanySuspenseLedger(ledgerMasters: TallyMaster[]) {
+  const candidates = ledgerMasters.filter((ledger) => {
+    const name = normalizeName(ledger.name);
+    const parent = normalizeName(ledger.parent);
+    return name.includes("suspense") || parent.includes("suspense");
+  });
+  return candidates.sort((left, right) => {
+    const rank = (ledger: TallyMaster) => {
+      const name = normalizeName(ledger.name);
+      if (name === "bankstatementsuspense") return 4;
+      if (name === "suspense") return 3;
+      if (name.includes("bankstatement") && name.includes("suspense")) return 2;
+      return name.includes("suspense") ? 1 : 0;
+    };
+    return rank(right) - rank(left);
+  })[0] ?? null;
+}
+
 function findLedgerByCandidates(ledgerMasters: TallyMaster[], candidates: string[]) {
   for (const candidate of candidates) {
     const ledger = findLedgerByNormalizedName(ledgerMasters, candidate);
@@ -674,8 +840,14 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   const recommendation = readRecommendation(transaction);
   const suggestedLedgerName = transaction.suggestedLedgerName || "";
   const action = recommendation?.action ?? "needs_review";
+  const aiCandidateLedgerNames = Array.isArray(recommendation?.candidateLedgerNames)
+    ? recommendation.candidateLedgerNames
+        .map((ledgerName) => String(ledgerName ?? "").trim())
+        .filter(Boolean)
+    : [];
+  const isAiCloseMatch = recommendation?.matchType === "close_match" || aiCandidateLedgerNames.length > 0;
   const recommendedLedgerName = recommendation?.ledgerName || suggestedLedgerName || fallbackReviewLedgerName(transaction);
-  const suspenseLedger = findLedgerByNormalizedName(ledgerMasters, "Suspense");
+  const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
   const suspenseName = suspenseLedger?.name || "Suspense";
   const confirmedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.confirmedLedgerName);
   const confirmedSuspenseLedger = confirmedLedger && isSuspenseLedgerName(confirmedLedger.name) ? confirmedLedger : null;
@@ -687,23 +859,49 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   );
   const standardLedger = findLedgerByNormalizedName(ledgerMasters, standardLedgerNameForTransaction(transaction));
   const matchedLedger = findLedgerByCandidates(ledgerMasters, ledgerCandidates);
+  const fallbackCloseExactName = normalizeName(transaction.counterpartyName || suggestedLedgerName || recommendedLedgerName);
+  const fallbackCloseCandidateNames = !matchedLedger
+    ? Array.from(
+        new Set(
+          [
+            ...findTokenPrefixCloseLedgerMatches(ledgerMasters, ledgerCandidates, fallbackCloseExactName, 5),
+            ...ledgerCandidates.flatMap((candidate) =>
+              findCloseLedgerMatches(ledgerMasters, candidate).map((match) => match.ledger.name)
+            ),
+          ]
+        )
+      )
+    : [];
+  const candidateLedgerNames =
+    aiCandidateLedgerNames.length > 0
+      ? aiCandidateLedgerNames
+      : isAiCloseMatch || fallbackCloseCandidateNames.length >= 2
+        ? fallbackCloseCandidateNames
+        : [];
+  const hasCloseMatchCandidates = candidateLedgerNames.length >= 2;
+  const firstCloseMatchCandidate = hasCloseMatchCandidates
+    ? candidateLedgerNames
+        .map((ledgerName) => findLedgerByNormalizedName(ledgerMasters, ledgerName))
+        .find((ledger): ledger is TallyMaster => Boolean(ledger))
+    : null;
   const closeLedgerMatch = !matchedLedger
     ? findUniqueCloseLedgerMatchByCandidates(ledgerMasters, ledgerCandidates)
     : null;
-  const reviewSuggestedLedgerName = closeLedgerMatch
-    ? closeLedgerMatch?.ledger.name || recommendedLedgerName
-    : recommendedLedgerName;
-  const selectedLedgerName =
-    confirmedMappedLedger?.name ||
-    standardLedger?.name ||
-    matchedLedger?.name ||
-    closeLedgerMatch?.ledger.name ||
-    confirmedSuspenseLedger?.name ||
-    suspenseName;
+  const reviewSuggestedLedgerName = firstCloseMatchCandidate?.name || closeLedgerMatch?.ledger.name || recommendedLedgerName;
+  const selectedLedgerName = hasCloseMatchCandidates
+    ? confirmedMappedLedger?.name || standardLedger?.name || matchedLedger?.name || firstCloseMatchCandidate?.name || ""
+    : confirmedMappedLedger?.name ||
+      standardLedger?.name ||
+      matchedLedger?.name ||
+      closeLedgerMatch?.ledger.name ||
+      confirmedSuspenseLedger?.name ||
+      suspenseName;
   const ledgerAction: LedgerRecommendationAction = confirmedMappedLedger
     ? "use_existing_ledger"
     : standardLedger
     ? "use_standard_ledger"
+    : hasCloseMatchCandidates
+    ? "needs_review"
     : closeLedgerMatch
     ? "use_existing_ledger"
     : matchedLedger
@@ -737,19 +935,25 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
     suggestionReason: closeLedgerMatch
       ? `Single close Tally ledger match found: ${closeLedgerMatch.ledger.name}.`
+      : hasCloseMatchCandidates
+        ? `Close Tally ledger matches found: ${candidateLedgerNames.join(", ")}.`
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
         : recommendation?.reason || transaction.suggestionReason || "",
+    candidateLedgerNames,
     selectedLedgerName,
     ledgerAction,
     ledgerGroup: recommendation?.ledgerGroup || "",
-    requiresUserConfirmation: false,
+    requiresUserConfirmation: hasCloseMatchCandidates,
     ledgerSelectionTouched: false,
   };
 }
 
 function autoMatchUntouchedLedgerSelection(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
   if (transaction.ledgerSelectionTouched) return transaction;
+  if (transaction.ledgerAction === "needs_review" && (transaction.candidateLedgerNames ?? []).length > 0) {
+    return transaction;
+  }
 
   const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
   if (
@@ -799,8 +1003,19 @@ function transactionHasPostingAmount(transaction: ReviewTransaction) {
   return Math.max(parseNumber(transaction.debitAmount) ?? 0, parseNumber(transaction.creditAmount) ?? 0) > 0;
 }
 
+function hasValidTransactionDate(value: string | null | undefined) {
+  const trimmed = String(value ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return false;
+  const date = new Date(`${trimmed}T00:00:00`);
+  return !Number.isNaN(date.getTime());
+}
+
 function transactionIsValid(transaction: ReviewTransaction) {
-  return Boolean(transaction.transactionDate && transaction.description.trim() && transactionHasPostingAmount(transaction));
+  return Boolean(
+    hasValidTransactionDate(transaction.transactionDate) &&
+    transaction.description.trim() &&
+    transactionHasPostingAmount(transaction)
+  );
 }
 
 function formatAmount(value: string | number | null | undefined) {
@@ -815,6 +1030,15 @@ function formatAmount(value: string | number | null | undefined) {
 function formatCurrencyAmount(value: string | number | null | undefined) {
   const formatted = formatAmount(value);
   return formatted ? `Rs. ${formatted}` : "Rs. 0";
+}
+
+function formatCurrencyInputAmount(value: string | number | null | undefined) {
+  const parsed = parseNumber(value) ?? 0;
+  if (!Number.isFinite(parsed) || parsed === 0) return "";
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 2,
+    minimumFractionDigits: 2,
+  }).format(parsed);
 }
 
 function formatDataLabel(value?: string | null) {
@@ -926,6 +1150,89 @@ function getLedgerCandidateName(transaction: ReviewTransaction) {
   ).trim();
 }
 
+const GENERIC_CLOSE_MATCH_TOKENS = new Set([
+  "and",
+  "bank",
+  "by",
+  "co",
+  "company",
+  "cr",
+  "credit",
+  "debit",
+  "dr",
+  "from",
+  "imps",
+  "limited",
+  "ltd",
+  "nach",
+  "neft",
+  "payment",
+  "private",
+  "pvt",
+  "receipt",
+  "ref",
+  "rtgs",
+  "supplier",
+  "suppliers",
+  "supply",
+  "to",
+  "trader",
+  "traders",
+  "trading",
+  "transaction",
+  "txn",
+  "upi",
+  "utr",
+]);
+
+function closeMatchTokens(value?: string | null) {
+  return normalizeName(value)
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !GENERIC_CLOSE_MATCH_TOKENS.has(token));
+}
+
+function tokenMatchesCloseLedgerToken(inputToken: string, ledgerToken: string) {
+  return inputToken === ledgerToken || ledgerToken.startsWith(inputToken);
+}
+
+function findTokenPrefixCloseLedgerMatches(
+  ledgerMasters: TallyMaster[],
+  searchTerms: string[],
+  exactName: string,
+  limit = 5
+) {
+  const matchesByLedger = new Map<string, { ledger: TallyMaster; score: number }>();
+
+  for (const term of searchTerms) {
+    const tokens = closeMatchTokens(term);
+    if (tokens.length === 0) continue;
+
+    for (const ledger of ledgerMasters) {
+      const normalizedLedger = normalizeName(ledger.name);
+      if (!normalizedLedger || normalizedLedger === exactName) continue;
+
+      const ledgerTokens = closeMatchTokens(ledger.name);
+      const matched = tokens.every((token) =>
+        ledgerTokens.some((ledgerToken) => tokenMatchesCloseLedgerToken(token, ledgerToken))
+      );
+      if (!matched) continue;
+
+      const key = normalizeName(ledger.name);
+      const score = tokens.reduce((total, token) => {
+        const exactToken = ledgerTokens.some((ledgerToken) => ledgerToken === token);
+        return total + (exactToken ? 2 : 1);
+      }, 0);
+      const existing = matchesByLedger.get(key);
+      if (!existing || score > existing.score) matchesByLedger.set(key, { ledger, score });
+    }
+  }
+
+  return Array.from(matchesByLedger.values())
+    .sort((left, right) => right.score - left.score || left.ledger.name.localeCompare(right.ledger.name))
+    .slice(0, limit)
+    .map(({ ledger }) => ledger.name);
+}
+
 function getCloseLedgerMatches(transaction: ReviewTransaction, ledgerMasters: TallyMaster[], limit = 5) {
   const searchTerms = [
     transaction.counterpartyName,
@@ -937,6 +1244,7 @@ function getCloseLedgerMatches(transaction: ReviewTransaction, ledgerMasters: Ta
 
   const exactName = normalizeName(getLedgerCandidateName(transaction));
   const matches: Array<{ ledger: TallyMaster; score: number }> = [];
+  const tokenPrefixMatches = findTokenPrefixCloseLedgerMatches(ledgerMasters, searchTerms, exactName, limit);
 
   for (const ledger of ledgerMasters) {
     const normalizedLedger = normalizeName(ledger.name);
@@ -957,10 +1265,11 @@ function getCloseLedgerMatches(transaction: ReviewTransaction, ledgerMasters: Ta
     if (score > 0) matches.push({ ledger, score });
   }
 
-  return matches
+  const fuzzyMatches = matches
     .sort((left, right) => right.score - left.score || left.ledger.name.localeCompare(right.ledger.name))
     .slice(0, limit)
     .map(({ ledger }) => ledger.name);
+  return Array.from(new Set([...tokenPrefixMatches, ...fuzzyMatches])).slice(0, limit);
 }
 
 function getCommonLedgerOptions(ledgerMasters: TallyMaster[]) {
@@ -1004,11 +1313,15 @@ function uniqueLedgerOptions(options: LedgerPickerOption[]) {
 }
 
 function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]): LedgerPickerGroup[] {
-  const suspenseLedger = ledgerMasters.find((ledger) => normalizeName(ledger.name) === "suspense");
+  const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
   const suspenseName = suspenseLedger?.name || "Suspense";
   const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
   const suggestedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.suggestedLedgerName);
+  const candidateLedgers = (transaction.candidateLedgerNames ?? [])
+    .map((ledgerName) => findLedgerByNormalizedName(ledgerMasters, ledgerName))
+    .filter((ledger): ledger is TallyMaster => Boolean(ledger));
   const closeMatches = getCloseLedgerMatches(transaction, ledgerMasters);
+  const hasPotentialCloseMatches = candidateLedgers.length > 0 || closeMatches.length > 0;
   const commonLedgers = getCommonLedgerOptions(ledgerMasters);
   const groups: LedgerPickerGroup[] = [];
   const usedKeys = new Set<string>();
@@ -1048,7 +1361,7 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
         badge: "Standard",
       },
     ]);
-  } else if (transaction.ledgerAction === "use_suspense") {
+  } else if (transaction.ledgerAction === "use_suspense" && !hasPotentialCloseMatches) {
     addGroup("Current selection", [
       {
         name: suspenseName,
@@ -1075,6 +1388,13 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
             },
           ]
         : []),
+      ...candidateLedgers.map((ledger) => ({
+        name: ledger.name,
+        action: "use_existing_ledger" as const,
+        label: ledger.name,
+        helper: ledger.parent ? `Group: ${ledger.parent}` : "AI close-match candidate.",
+        badge: "Close",
+      })),
       ...closeMatches.map((name) => ({
         name,
         action: "use_existing_ledger" as const,
@@ -1204,7 +1524,7 @@ function getLedgerPickerDisplayValue(transaction: ReviewTransaction) {
 }
 
 function isSuspenseLedgerName(value: string) {
-  return normalizeName(value) === "suspense";
+  return normalizeName(value).includes("suspense");
 }
 
 function LedgerReviewSelect({
@@ -1367,7 +1687,58 @@ function LedgerReviewSelect({
   );
 }
 
+function CurrencyAmountInput({
+  max,
+  min = 0,
+  onChange,
+  value,
+}: {
+  max?: number;
+  min?: number;
+  onChange: (value: string) => void;
+  value: number;
+}) {
+  const [focused, setFocused] = useState(false);
+  const [draftValue, setDraftValue] = useState(formatCurrencyInputAmount(value));
+
+  useEffect(() => {
+    if (!focused) {
+      setDraftValue(formatCurrencyInputAmount(value));
+    }
+  }, [focused, value]);
+
+  return (
+    <div className="inline-flex h-8.5 w-36 items-center rounded-xl border border-[#e5ddd0] bg-white px-3 focus-within:border-amber-500">
+      <span className="mr-1.5 text-xs font-bold text-slate-400">Rs.</span>
+      <input
+        className="min-w-0 flex-1 bg-transparent text-right text-xs font-bold text-[#1a1a1a] outline-none"
+        inputMode="decimal"
+        max={max}
+        min={min}
+        onBlur={() => {
+          setFocused(false);
+          setDraftValue(formatCurrencyInputAmount(value));
+        }}
+        onChange={(event) => {
+          setDraftValue(event.target.value);
+          onChange(event.target.value);
+        }}
+        onFocus={() => {
+          setFocused(true);
+          setDraftValue(value > 0 ? value.toFixed(2) : "");
+        }}
+        step="0.01"
+        type="text"
+        value={draftValue}
+      />
+    </div>
+  );
+}
+
 function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
+  if (transaction.ledgerAction === "needs_review") {
+    return "needs_review";
+  }
   if (transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)) {
     return "suspense";
   }
@@ -1440,6 +1811,9 @@ function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null
   if (!draft) return "Find existing payment";
   if (draft.status === "checking") return "Checking Tally...";
   if (draft.status === "found") {
+    if (draft.duplicateInTally) {
+      return `${draft.duplicateVoucherCount || draft.matchCount || 2} duplicate Tally vouchers`;
+    }
     const voucher = draft.voucherNumber ? `Voucher ${draft.voucherNumber}` : "Existing voucher found";
     return draft.voucherDate ? `${voucher} - ${formatShortDate(draft.voucherDate)}` : voucher;
   }
@@ -1476,6 +1850,12 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
         : null;
   const voucherDate = typeof result.voucherDate === "string" ? result.voucherDate : null;
   const matchCount = typeof result.matchCount === "number" ? result.matchCount : null;
+  const duplicateInTally = result.duplicateInTally === true;
+  const duplicateVoucherCount = typeof result.duplicateVoucherCount === "number"
+    ? result.duplicateVoucherCount
+    : duplicateInTally
+      ? matchCount || 0
+      : 0;
   const scannedCount = typeof result.scannedCount === "number" ? result.scannedCount : null;
   const matches = Array.isArray(result.matches)
     ? result.matches.flatMap((match) => {
@@ -1507,6 +1887,8 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
       voucherNumber,
       voucherDate,
       matchCount,
+      duplicateInTally,
+      duplicateVoucherCount,
       scannedCount,
       matches,
     };
@@ -1880,24 +2262,48 @@ function buildTallyPostingStatus(
   let completed = 0;
   let failed = 0;
   let canceled = 0;
+  let voucherTotal = 0;
+  let voucherWaiting = 0;
+  let voucherCompleted = 0;
+  let voucherFailed = 0;
+  let paymentCheckTotal = 0;
+  let paymentCheckWaiting = 0;
+  let paymentCheckCompleted = 0;
+  let paymentCheckFailed = 0;
   const errors: string[] = [];
 
   for (const commandId of commandIds) {
     const command = commandById.get(commandId);
     const status = command?.status ?? "queued";
+    const commandType = command?.commandType || command?.command_type || "";
+    const isVoucherCommand = commandType === "post_bank_voucher";
+    const isPaymentCheckCommand = commandType === "verify_bank_transaction";
+
+    if (isVoucherCommand) voucherTotal += 1;
+    if (isPaymentCheckCommand) paymentCheckTotal += 1;
 
     if (status === "succeeded") {
       completed += 1;
+      if (isVoucherCommand) voucherCompleted += 1;
+      if (isPaymentCheckCommand) paymentCheckCompleted += 1;
     } else if (status === "failed") {
       failed += 1;
+      if (isVoucherCommand) voucherFailed += 1;
+      if (isPaymentCheckCommand) paymentCheckFailed += 1;
       if (command?.error) errors.push(command.error);
     } else if (status === "canceled") {
       canceled += 1;
+      if (isVoucherCommand) voucherFailed += 1;
+      if (isPaymentCheckCommand) paymentCheckFailed += 1;
       if (command?.error) errors.push(command.error);
     } else if (status === "claimed") {
       sent += 1;
+      if (isVoucherCommand) voucherWaiting += 1;
+      if (isPaymentCheckCommand) paymentCheckWaiting += 1;
     } else {
       waiting += 1;
+      if (isVoucherCommand) voucherWaiting += 1;
+      if (isPaymentCheckCommand) paymentCheckWaiting += 1;
     }
   }
 
@@ -1912,11 +2318,191 @@ function buildTallyPostingStatus(
     canceled,
     finished: completed + failed + canceled >= commandIds.length,
     errors: Array.from(new Set(errors)).slice(0, 3),
+    voucherTotal,
+    voucherWaiting,
+    voucherCompleted,
+    voucherFailed,
+    paymentCheckTotal,
+    paymentCheckWaiting,
+    paymentCheckCompleted,
+    paymentCheckFailed,
   };
 }
 
 function wait(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isCsvFile(file: File) {
+  const name = file.name.toLowerCase();
+  return file.type === "text/csv" || name.endsWith(".csv");
+}
+
+function isTextFile(file: File) {
+  const name = file.name.toLowerCase();
+  return file.type.startsWith("text/") || name.endsWith(".txt");
+}
+
+function isPdfFile(file: File) {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+}
+
+function isImageFile(file: File) {
+  return file.type.startsWith("image/");
+}
+
+function parseCsvRows(text: string) {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const nextChar = text[index + 1];
+
+    if (char === "\"") {
+      if (inQuotes && nextChar === "\"") {
+        cell += "\"";
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      row.push(cell.trim());
+      cell = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      row.push(cell.trim());
+      rows.push(row);
+      row = [];
+      cell = "";
+      if (char === "\r" && nextChar === "\n") {
+        index += 1;
+      }
+      continue;
+    }
+
+    cell += char;
+  }
+
+  if (inQuotes) {
+    throw new Error("The CSV has an unclosed quoted value.");
+  }
+
+  row.push(cell.trim());
+  rows.push(row);
+
+  return rows.filter((cells) => cells.some((value) => value.length > 0));
+}
+
+async function buildDocumentPreview(file: File): Promise<DocumentPreviewState> {
+  const basePreview = {
+    fileName: file.name,
+    headers: [],
+    rows: [],
+    totalRows: 0,
+    textLines: [],
+    objectUrl: null,
+  };
+
+  if (!isCsvFile(file)) {
+    if (isTextFile(file)) {
+      const text = await file.text();
+      const textLines = text
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter((line) => line.trim().length > 0);
+
+      return {
+        ...basePreview,
+        kind: "text",
+        textLines: textLines.slice(0, 20),
+        totalRows: textLines.length,
+        error: text.trim()
+          ? null
+          : "This text file is empty. Choose a bank statement file with readable content.",
+      };
+    }
+
+    if (isPdfFile(file)) {
+      return {
+        ...basePreview,
+        kind: "pdf",
+        objectUrl: URL.createObjectURL(file),
+        totalRows: 1,
+        error: file.size > 0 ? null : "This PDF is empty. Choose a valid bank statement PDF.",
+      };
+    }
+
+    if (isImageFile(file)) {
+      return {
+        ...basePreview,
+        kind: "image",
+        objectUrl: URL.createObjectURL(file),
+        totalRows: 1,
+        error: file.size > 0 ? null : "This image is empty. Choose a valid scanned bank statement image.",
+      };
+    }
+
+    return {
+      ...basePreview,
+      kind: "unsupported",
+      error: "This file type is not supported. Choose CSV, TXT, PDF, or a scanned statement image.",
+    };
+  }
+
+  const text = await file.text();
+  if (!text.trim()) {
+    return {
+      ...basePreview,
+      kind: "csv",
+      error: "This CSV is empty. Choose a bank statement CSV with headers and transaction rows.",
+    };
+  }
+
+  try {
+    const parsedRows = parseCsvRows(text);
+    const [headerRow, ...dataRows] = parsedRows;
+    const headers = (headerRow ?? []).map((header, index) => header || `Column ${index + 1}`);
+    const meaningfulRows = dataRows.filter((row) => row.some((value) => value.trim().length > 0));
+
+    if (headers.length < 2 || !headers.some((header) => header.trim().length > 0)) {
+      return {
+        ...basePreview,
+        kind: "csv",
+        error: "This CSV does not appear to have readable headers.",
+      };
+    }
+
+    if (meaningfulRows.length === 0) {
+      return {
+        ...basePreview,
+        kind: "csv",
+        error: "This CSV has headers but no transaction rows to preview.",
+      };
+    }
+
+    return {
+      ...basePreview,
+      kind: "csv",
+      headers: headers.slice(0, 8),
+      rows: meaningfulRows.slice(0, 6).map((row) => headers.slice(0, 8).map((_, index) => row[index] ?? "")),
+      totalRows: meaningfulRows.length,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ...basePreview,
+      kind: "csv",
+      error: error instanceof Error ? error.message : "This CSV could not be parsed.",
+    };
+  }
 }
 
 function getAnalysisCompleteMessage(payload: PreviewResponse) {
@@ -1936,7 +2522,7 @@ function getAnalysisCompleteMessage(payload: PreviewResponse) {
   if (payload.ledgerRecommendationError) {
     return {
       tone: "info" as const,
-      text: `Statement analyzed, but ledger recommendations need review: ${payload.ledgerRecommendationError}`,
+      text: `Statement analyzed. ${payload.ledgerRecommendationError}`,
     };
   }
 
@@ -1947,14 +2533,17 @@ function getAnalysisCompleteMessage(payload: PreviewResponse) {
 }
 
 async function readError(response: Response) {
-  const payload = (await response.json().catch(() => ({}))) as {
-    error?: string;
-    diagnostics?: unknown;
-  };
+  const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
   const message = payload.error || `Request failed with status ${response.status}`;
-  if (!payload.diagnostics) return message;
+  return [message, payload.detail, payload.userAction].filter(Boolean).join(" ");
+}
 
-  return `${message} ${JSON.stringify(payload.diagnostics)}`;
+async function readApiErrorPayload(response: Response): Promise<ApiErrorPayload> {
+  const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
+  return {
+    ...payload,
+    error: payload.error || `Request failed with status ${response.status}`,
+  };
 }
 
 function normalizeFetchedBankLedger(value: unknown): LocalBankLedger | null {
@@ -2011,10 +2600,26 @@ function normalizeFetchedBankLedgersByCompany(
   return next;
 }
 
+function getPdfPreviewUrl(objectUrl: string) {
+  return `${objectUrl}#navpanes=0&view=Fit&zoom=page-fit`;
+}
+
+function formatFileSize(size: number | null | undefined) {
+  if (!size || size <= 0) return "Size unavailable";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function BankStatementsPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
+  const [documentPreview, setDocumentPreview] = useState<DocumentPreviewState | null>(null);
+  const [documentPreviewLoading, setDocumentPreviewLoading] = useState(false);
+  const [statementPassword, setStatementPassword] = useState("");
+  const [statementPasswordRequired, setStatementPasswordRequired] = useState(false);
+  const [statementPasswordError, setStatementPasswordError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
@@ -2030,7 +2635,6 @@ export function BankStatementsPage() {
   const [bankLedgerManuallyConfirmed, setBankLedgerManuallyConfirmed] = useState(false);
   const [bankLedgerChangeMode, setBankLedgerChangeMode] = useState(false);
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
-  const [syncBeforeAnalysis, setSyncBeforeAnalysis] = useState(true);
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
@@ -2042,6 +2646,8 @@ export function BankStatementsPage() {
   const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
   const [banner, setBanner] = useState<{ tone: MessageTone; text: string } | null>(null);
+  const [postUploadSyncImportId, setPostUploadSyncImportId] = useState<string | null>(null);
+  const [postUploadSyncError, setPostUploadSyncError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [tallyPostingStatus, setTallyPostingStatus] = useState<TallyPostingStatus | null>(null);
   const [statementDoneSummary, setStatementDoneSummary] = useState<StatementDoneSummary | null>(null);
@@ -2054,42 +2660,54 @@ export function BankStatementsPage() {
   const [rowsPerPage, setRowsPerPage] = useState(50);
   const [billAllocationsByTransactionId, setBillAllocationsByTransactionId] = useState<Record<string, BillAllocationDraft>>({});
   const [outgoingVerificationsByTransactionId, setOutgoingVerificationsByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
+  const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
+  const [tallyBalanceProof, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [outgoingReviewTransactionId, setOutgoingReviewTransactionId] = useState<string | null>(null);
   const ledgerLoadSeqRef = useRef(0);
   const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
+  const lastNonEmptyCompaniesRef = useRef<CompanyOption[]>([]);
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
 
   const validTransactions = useMemo(
     () => transactions.filter(transactionIsValid),
     [transactions]
   );
-  const incomingReceiptCount = validTransactions.filter(isIncomingReceiptRow).length;
+  const ignoredStatementRowCount = Math.max(0, transactions.length - validTransactions.length);
+
+  useEffect(() => {
+    const objectUrl = documentPreview?.objectUrl;
+    return () => {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [documentPreview?.objectUrl]);
   const outgoingPaymentTransactions = useMemo(
     () => validTransactions.filter(isOutgoingPaymentRow),
     [validTransactions]
   );
-  const outgoingPaymentCheckCount = outgoingPaymentTransactions.length;
   const visibleConnections = useMemo(
     () => getRelevantTallyConnections(connections),
     [connections]
   );
+  useEffect(() => {
+    if (companies.length > 0) {
+      lastNonEmptyCompaniesRef.current = companies;
+    }
+  }, [companies]);
   const selectedConnection = useMemo(
     () => connections.find((connection) => connection.id === tallyConnectionId) ?? null,
     [connections, tallyConnectionId]
   );
-  const selectedCompany = useMemo(
-    () =>
-      companies.find((company) => company.id === selectedCompanyId) ??
-      companies.find((company) => company.connectionId === tallyConnectionId) ??
-      null,
-    [companies, selectedCompanyId, tallyConnectionId]
-  );
   const companyOptions = useMemo(() => {
-    if (companies.length > 0) return uniqueCompanyOptions(companies);
-    return uniqueCompanyOptions(visibleConnections.map((connection) => ({
+    if (companies.length > 0) {
+      return uniqueCompanyOptions(sortCompanyOptions(companies));
+    }
+
+    return uniqueCompanyOptions(sortCompanyOptions(visibleConnections.map((connection) => ({
       id: connection.id,
       connectionId: connection.id,
       companyName: connection.lastCompanyName || connection.displayName,
@@ -2102,8 +2720,22 @@ export function BankStatementsPage() {
       lastSyncAt: null,
       lastHeartbeatAt: connection.updatedAt ?? null,
       lastError: null,
-    })));
+    }))));
   }, [companies, visibleConnections]);
+  const selectedCompany = useMemo(
+    () =>
+      companyOptions.find((company) => company.id === selectedCompanyId) ??
+      companyOptions.find((company) => company.connectionId === tallyConnectionId) ??
+      null,
+    [companyOptions, selectedCompanyId, tallyConnectionId]
+  );
+  useEffect(() => {
+    if (selectedCompany) {
+      writeStoredCompanySelection(selectedCompany);
+    } else if (!selectedCompanyId) {
+      writeStoredCompanySelection(null);
+    }
+  }, [selectedCompany, selectedCompanyId]);
   const commandConnection = useMemo<TallyConnection | null>(() => {
     if (!selectedCompany) return null;
     if (selectedConnection) {
@@ -2128,7 +2760,7 @@ export function BankStatementsPage() {
     };
   }, [selectedCompany, selectedConnection]);
   const selectedCompanyName =
-    selectedCompany?.companyName || selectedConnection?.lastCompanyName || "";
+    selectedCompany?.companyName || "";
   const selectedFinancialYear = selectedCompany?.financialYear || "Current year";
   const tallyConnected =
     selectedCompany
@@ -2202,6 +2834,7 @@ export function BankStatementsPage() {
   }, [bankLedgerChangeMode, bankLedgerName, exactBankLedgerMatch, preview]);
 
   const uploadContextReady = Boolean(tallyCompanyContextVerified);
+  const workflowStep = preview ? 3 : documentPreview ? 1 : loading ? 2 : 0;
   const setupErrorMessage = !tallyConnectionId
     ? "Select the Tally company first."
     : !tallyConnected
@@ -2211,26 +2844,101 @@ export function BankStatementsPage() {
         : !tallyCompanyContextVerified
           ? `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh.`
           : "";
+  const syncModeStatus = useMemo(() => {
+    const stateLabel = "Tally sync after upload";
+    const readyText = "The current Tally company will sync after upload; ledger matching updates when sync completes.";
+
+    if (!tallyConnectionId || !selectedCompanyName) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: "Sync cannot run until you select a Tally company.",
+      };
+    }
+
+    if (!tallyConnected) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: "Sync cannot run because the connector or Tally is not reachable. Open Tally Prime, load the company, then refresh.",
+      };
+    }
+
+    if (!activeTallyCompanyName) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: "Refresh Gajkesari to confirm the company currently open in Tally before upload.",
+      };
+    }
+
+    if (!tallyCompanyContextVerified) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh before analysis.`,
+      };
+    }
+
+    return {
+      tone: "success" as const,
+      title: stateLabel,
+      text: readyText,
+    };
+  }, [
+    activeTallyCompanyName,
+    selectedCompanyName,
+    tallyCompanyContextVerified,
+    tallyConnected,
+    tallyConnectionId,
+  ]);
   const missingLedgerCount = useMemo(
     () => validTransactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
     [validTransactions]
   );
-  const matchedLedgerCount = validTransactions.filter(
-    (transaction) =>
-      transaction.selectedLedgerName.trim() &&
-      !isSuspenseLedgerName(transaction.selectedLedgerName) &&
-      (transaction.ledgerAction === "use_existing_ledger" || transaction.ledgerAction === "use_standard_ledger")
-  ).length;
-  const suspenseLedgerCount = validTransactions.filter(
-    (transaction) => transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)
-  ).length;
-  const needsReviewCount = validTransactions.filter(
-    (transaction) => getReviewStatus(transaction) === "needs_review"
-  ).length;
-  const pendingBillEligibleTransactions = useMemo(
-    () => validTransactions.filter((transaction) => isBillMatchEligibleTransaction(transaction, ledgerMasters)),
-    [ledgerMasters, validTransactions]
+  const pendingLedgerReviewCount = useMemo(
+    () => validTransactions.filter((transaction) => transaction.ledgerAction === "needs_review").length,
+    [validTransactions]
   );
+  const pendingBillEligibleTransactions = useMemo(
+    () => validTransactions.filter(
+      (transaction) =>
+        isBillMatchEligibleTransaction(transaction, ledgerMasters) &&
+        tallyPresenceByTransactionId[transaction.id]?.status !== "found"
+    ),
+    [ledgerMasters, tallyPresenceByTransactionId, validTransactions]
+  );
+  const uncheckedTallyPresenceCount = validTransactions.filter((transaction) => {
+    const status = tallyPresenceByTransactionId[transaction.id]?.status;
+    return status !== "found" && status !== "missing" && status !== "ambiguous";
+  }).length;
+  const ambiguousTallyPresenceCount = validTransactions.filter(
+    (transaction) => tallyPresenceByTransactionId[transaction.id]?.status === "ambiguous"
+  ).length;
+  const duplicateTallyPresenceCount = validTransactions.filter(
+    (transaction) => tallyPresenceByTransactionId[transaction.id]?.duplicateInTally === true
+  ).length;
+  const transactionsNeedingTallyWork = useMemo(
+    () => validTransactions.filter(
+      (transaction) => tallyPresenceByTransactionId[transaction.id]?.status === "missing"
+    ),
+    [tallyPresenceByTransactionId, validTransactions]
+  );
+  const receiptTransactionsNeedingPost = useMemo(
+    () => transactionsNeedingTallyWork.filter(isIncomingReceiptRow),
+    [transactionsNeedingTallyWork]
+  );
+  const outgoingTransactionsNeedingCheck = useMemo(
+    () => transactionsNeedingTallyWork.filter(isOutgoingPaymentRow),
+    [transactionsNeedingTallyWork]
+  );
+  const newReceiptCount = receiptTransactionsNeedingPost.length;
+  const missingOutgoingCount = outgoingTransactionsNeedingCheck.length;
+  const statementReviewIssueCount =
+    pendingLedgerReviewCount + missingOutgoingCount + ambiguousTallyPresenceCount + duplicateTallyPresenceCount;
+  const alreadyInTallyCount = validTransactions.filter(
+    (transaction) => tallyPresenceByTransactionId[transaction.id]?.status === "found"
+  ).length;
   const blockingBillAllocationCount = useMemo(
     () =>
       pendingBillEligibleTransactions.filter((transaction) => {
@@ -2238,6 +2946,15 @@ export function BankStatementsPage() {
         return !draft || draft.status === "cannot_match_yet" || draft.status === "needs_review" || draft.status === "stale_data";
       }).length,
     [billAllocationsByTransactionId, pendingBillEligibleTransactions]
+  );
+  const blockingReceiptBillAllocationCount = useMemo(
+    () =>
+      receiptTransactionsNeedingPost.filter((transaction) => {
+        if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) return false;
+        const draft = billAllocationsByTransactionId[transaction.id];
+        return !draft || draft.status === "cannot_match_yet" || draft.status === "needs_review" || draft.status === "stale_data";
+      }).length,
+    [billAllocationsByTransactionId, ledgerMasters, receiptTransactionsNeedingPost]
   );
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
@@ -2278,11 +2995,32 @@ export function BankStatementsPage() {
     });
   }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, validTransactions]);
   const visibleReviewTransactions = useMemo(
-    () => filteredTransactions.slice(0, rowsPerPage),
+    () => filteredTransactions.filter(transactionIsValid).slice(0, rowsPerPage),
     [filteredTransactions, rowsPerPage]
   );
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
+  const postReceiptsButtonLabel = sending
+    ? "Sending..."
+    : uncheckedTallyPresenceCount > 0
+      ? "Check Matches First"
+      : pendingLedgerReviewCount > 0
+        ? `Review ${pendingLedgerReviewCount} Ledger Match${pendingLedgerReviewCount === 1 ? "" : "es"}`
+        : ambiguousTallyPresenceCount > 0
+          ? `Review ${ambiguousTallyPresenceCount} Ambiguous`
+          : blockingReceiptBillAllocationCount > 0
+            ? `Review ${blockingReceiptBillAllocationCount} Bill Match`
+            : `Post ${newReceiptCount} Receipt${newReceiptCount === 1 ? "" : "s"}`;
+  const checkPaymentsButtonLabel = sending
+    ? "Checking..."
+    : uncheckedTallyPresenceCount > 0
+      ? "Check Matches First"
+      : pendingLedgerReviewCount > 0
+        ? `Review ${pendingLedgerReviewCount} Ledger Match${pendingLedgerReviewCount === 1 ? "" : "es"}`
+        : ambiguousTallyPresenceCount > 0
+          ? `Review ${ambiguousTallyPresenceCount} Ambiguous`
+          : `Check ${missingOutgoingCount} Payment${missingOutgoingCount === 1 ? "" : "s"}`;
   const statementReviewLocked = Boolean(statementDoneSummary) || tallyPostingInProgress;
+  const statementReviewDrawerLocked = tallyPostingInProgress;
   const activeReviewFilterCount = [
     reviewSearch.trim(),
     reviewStatusFilter !== "all" ? reviewStatusFilter : "",
@@ -2329,19 +3067,25 @@ export function BankStatementsPage() {
     }
 
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
-    const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
+    const fetchedCompanies = uniqueCompanyOptions(payload.companies ?? []);
+    const nextCompanies =
+      fetchedCompanies.length > 0 || lastNonEmptyCompaniesRef.current.length === 0
+        ? fetchedCompanies
+        : lastNonEmptyCompaniesRef.current;
+    if (fetchedCompanies.length > 0) {
+      lastNonEmptyCompaniesRef.current = fetchedCompanies;
+    }
     setCompanies(nextCompanies);
+    const storedCompany = findStoredCompanySelection(nextCompanies);
     setSelectedCompanyId((current) => {
       if (current && nextCompanies.some((company) => company.id === current)) {
         return current;
       }
-      return payload.selectedCompanyId || nextCompanies[0]?.id || current;
+      return storedCompany?.id ?? "";
     });
     setTallyConnectionId((current) => {
       const selectedOption =
-        nextCompanies.find((company) => company.id === selectedCompanyId) ??
-        nextCompanies.find((company) => company.id === payload.selectedCompanyId) ??
-        nextCompanies[0];
+        nextCompanies.find((company) => company.id === selectedCompanyId) ?? storedCompany ?? null;
       if (selectedOption) return selectedOption.connectionId;
       if (current && nextCompanies.some((company) => company.connectionId === current)) return current;
       return current;
@@ -2499,10 +3243,14 @@ export function BankStatementsPage() {
     }
   }
 
-  const clearStatementReview = useCallback(() => {
+  const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
     setTransactions([]);
-    setFile(null);
+    if (!options?.preserveSelectedFile) {
+      setFile(null);
+      setDocumentPreview(null);
+      setDocumentPreviewLoading(false);
+    }
     setAccount(EMPTY_ACCOUNT);
     setBankLedgerName("");
     setBankLedgerVerified(false);
@@ -2512,10 +3260,14 @@ export function BankStatementsPage() {
     setPendingBankLedgerName("");
     setEditingLedgerIds(new Set());
     setBanner(null);
+    setPostUploadSyncImportId(null);
+    setPostUploadSyncError(null);
     setTallyPostingStatus(null);
     setStatementDoneSummary(null);
     setBillAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
+    setTallyPresenceByTransactionId({});
+    setTallyBalanceProof(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }, []);
@@ -2547,30 +3299,102 @@ export function BankStatementsPage() {
           setStatementDoneSummary({
             tone: "error",
             title: "Done with issues.",
-            text: `${nextStatus.completed} completed, ${nextStatus.failed + nextStatus.canceled} failed. Review the failed rows before uploading another statement.`,
+            text: `${nextStatus.voucherCompleted}/${nextStatus.voucherTotal} receipt posting action(s) and ${nextStatus.paymentCheckCompleted}/${nextStatus.paymentCheckTotal} payment check(s) completed. Review the failed work before retrying.`,
           });
           showToast(
             "error",
-            `${nextStatus.completed} completed, ${nextStatus.failed + nextStatus.canceled} failed or canceled.`
+            `${nextStatus.failed + nextStatus.canceled} Tally operation(s) failed or were canceled.`
           );
         } else {
+          const checksOnly = nextStatus.voucherTotal === 0 && nextStatus.paymentCheckTotal > 0;
           setStatementDoneSummary({
             tone: "success",
-            title: "Done. Sent to Tally.",
-            text: `${nextStatus.completed} Tally action(s) completed. You can upload another statement when ready.`,
+            title: checksOnly ? "Payment checks completed." : "Tally work completed.",
+            text: checksOnly
+              ? `${nextStatus.paymentCheckCompleted} outgoing payment check(s) completed. No Tally vouchers were created.`
+              : `${nextStatus.voucherCompleted} receipt posting action(s) and ${nextStatus.paymentCheckCompleted} outgoing payment check(s) completed.`,
           });
           setBanner({
             tone: "success",
-            text: `${nextStatus.completed} Tally action(s) completed.`,
+            text: checksOnly
+              ? `${nextStatus.paymentCheckCompleted} outgoing payment check(s) completed. No Tally entries were created.`
+              : `${nextStatus.voucherCompleted} receipt posting action(s) and ${nextStatus.paymentCheckCompleted} payment check(s) completed.`,
           });
-          showToast("success", `${nextStatus.completed} Tally action(s) completed.`);
+          showToast(
+            "success",
+            checksOnly
+              ? `${nextStatus.paymentCheckCompleted} payment check(s) completed; no entries created.`
+              : `${nextStatus.voucherCompleted} receipt posting action(s) completed.`
+          );
         }
-        return;
+        return nextStatus;
       }
     }
 
     showToast("info", "Tally work is still running. Keep the connector open.");
+    return null;
   }, []);
+
+  const readTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueJobResponse> => {
+    const response = await apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+    return (await response.json()) as TallyQueueJobResponse;
+  }, []);
+
+  const pollTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueResult> => {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const response = await apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}/run`, {
+        method: "POST",
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        if ([502, 503, 504].includes(response.status)) {
+          const payload = await readTallyQueueJob(jobId).catch(() => null);
+          const job = payload?.job;
+          if (job?.status === "succeeded") {
+            return (payload?.result ?? job.result ?? { queuedCount: 0, verificationCount: 0, commands: [] }) as TallyQueueResult;
+          }
+          if (job?.status === "failed" || job?.status === "cancelled") {
+            throw new Error(job.error || payload?.error || "Tally queue job failed.");
+          }
+          const processed = Number(job?.processedCount ?? 0);
+          const total = Number(job?.totalCount ?? 0);
+          setBanner({
+            tone: "info",
+            text: total > 0
+              ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s). Retrying after a server timeout.`
+              : "Preparing Tally queue. Retrying after a server timeout.",
+          });
+          await wait(5000);
+          continue;
+        }
+        throw new Error(await readError(response));
+      }
+
+      const payload = (await response.json()) as TallyQueueJobResponse;
+      const job = payload.job;
+      if (job?.status === "succeeded") {
+        return (payload.result ?? job.result ?? { queuedCount: 0, verificationCount: 0, commands: [] }) as TallyQueueResult;
+      }
+      if (job?.status === "failed" || job?.status === "cancelled") {
+        throw new Error(job.error || payload.error || "Tally queue job failed.");
+      }
+
+      const processed = Number(job?.processedCount ?? 0);
+      const total = Number(job?.totalCount ?? 0);
+      setBanner({
+        tone: "info",
+        text: total > 0 ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s).` : "Preparing Tally queue.",
+      });
+      await wait(1200);
+    }
+
+    throw new Error("Tally queue preparation is still running. Keep the connector open and try refreshing in a moment.");
+  }, [readTallyQueueJob]);
 
   useEffect(() => {
     if (initialSummaryLoadStartedRef.current) return;
@@ -2597,10 +3421,12 @@ export function BankStatementsPage() {
         setAccounts(payload.accounts ?? []);
       }
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
-      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? loadedCompanies[0];
+      const restoredCompany = findStoredCompanySelection(loadedCompanies);
+      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? restoredCompany;
       const nextConnectionId = tallyConnectionId || preferredCompany?.connectionId || preferredConnection?.id || "";
-      const nextCompanyId = selectedCompanyId || preferredCompany?.id || "";
-      setSelectedCompanyId(nextCompanyId);
+      setSelectedCompanyId((current) =>
+        current && loadedCompanies.some((company) => company.id === current) ? current : restoredCompany?.id ?? ""
+      );
       setTallyConnectionId(nextConnectionId);
     }
 
@@ -2651,6 +3477,10 @@ export function BankStatementsPage() {
   }, [ledgerMasters.length, loadLedgerMasters, tallyConnectionId, transactions.length]);
 
   useEffect(() => {
+    if ((loading || sending || matchingBills || syncingMasters || postUploadSyncImportId) && selectedCompanyId) {
+      return;
+    }
+
     if (visibleConnections.length === 0 && companies.length === 0) {
       setTallyConnectionId("");
       setSelectedCompanyId("");
@@ -2663,13 +3493,22 @@ export function BankStatementsPage() {
     const currentCompanyExists = !selectedCompanyId || companies.some((company) => company.id === selectedCompanyId);
 
     if (!currentExists) {
-      const fallbackCompany = companies[0] ?? null;
-      setSelectedCompanyId(fallbackCompany?.id || "");
-      setTallyConnectionId(fallbackCompany?.connectionId || visibleConnections[0]?.id || "");
+      setSelectedCompanyId("");
+      setTallyConnectionId(visibleConnections[0]?.id || "");
     } else if (!currentCompanyExists) {
-      setSelectedCompanyId(companies.find((company) => company.connectionId === tallyConnectionId)?.id || companies[0]?.id || "");
+      setSelectedCompanyId("");
     }
-  }, [companies, selectedCompanyId, tallyConnectionId, visibleConnections]);
+  }, [
+    companies,
+    loading,
+    matchingBills,
+    postUploadSyncImportId,
+    selectedCompanyId,
+    sending,
+    syncingMasters,
+    tallyConnectionId,
+    visibleConnections,
+  ]);
 
   useEffect(() => {
     if (ledgerMasters.length === 0) return;
@@ -2679,8 +3518,29 @@ export function BankStatementsPage() {
         const autoMatchedTransaction = autoMatchUntouchedLedgerSelection(transaction, ledgerMasters);
         if (autoMatchedTransaction !== transaction) return autoMatchedTransaction;
 
+        if (transaction.ledgerAction === "use_suspense") {
+          const closeMatches = getCloseLedgerMatches(transaction, ledgerMasters);
+          if (closeMatches.length >= 2) {
+            const firstCloseMatch = findLedgerByNormalizedName(ledgerMasters, closeMatches[0]);
+            return {
+              ...transaction,
+              selectedLedgerName: firstCloseMatch?.name || closeMatches[0] || "",
+              suggestedLedgerName: firstCloseMatch?.name || closeMatches[0] || transaction.suggestedLedgerName,
+              candidateLedgerNames: closeMatches,
+              ledgerAction: "needs_review",
+              ledgerGroup: firstCloseMatch?.parent || transaction.ledgerGroup,
+              requiresUserConfirmation: true,
+              suggestionReason: `Close Tally ledger matches found: ${closeMatches.join(", ")}.`,
+            };
+          }
+
+          const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
+          return suspenseLedger && transaction.selectedLedgerName !== suspenseLedger.name
+            ? { ...transaction, selectedLedgerName: suspenseLedger.name, ledgerGroup: suspenseLedger.parent || "Suspense A/c" }
+            : transaction;
+        }
+
         if (
-          transaction.ledgerAction === "use_suspense" ||
           transaction.ledgerAction === "needs_review" ||
           transaction.requiresUserConfirmation
         ) {
@@ -2807,11 +3667,13 @@ export function BankStatementsPage() {
         loadCompanyOptions(),
       ]);
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
-      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? loadedCompanies[0];
+      const restoredCompany = findStoredCompanySelection(loadedCompanies);
+      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? restoredCompany;
       const nextConnectionId = preferredCompany?.connectionId || preferredConnection?.id || "";
-      const nextCompanyId = preferredCompany?.id || "";
       if (nextConnectionId) {
-        setSelectedCompanyId(nextCompanyId);
+        setSelectedCompanyId((current) =>
+          current && loadedCompanies.some((company) => company.id === current) ? current : restoredCompany?.id ?? ""
+        );
         setTallyConnectionId(nextConnectionId);
         const companyNames = loadedCompanies.map((company) => company.companyName).filter(Boolean);
         bankLedgerLoadKeyRef.current = "";
@@ -2827,6 +3689,19 @@ export function BankStatementsPage() {
   }
 
   function updateStatementContext(nextCompanyId: string) {
+    if (!nextCompanyId) {
+      if (!selectedCompanyId) return;
+      setSelectedCompanyId("");
+      setTallyConnectionId(visibleConnections[0]?.id || "");
+      setBankLedgerName("");
+      setBankLedgerChangeMode(false);
+      setPendingBankLedgerName("");
+      setSelectedAccountId("");
+      setAccount(EMPTY_ACCOUNT);
+      setLedgerMasters([]);
+      clearStatementReview();
+      return;
+    }
     const nextCompany = companyOptions.find((company) => company.id === nextCompanyId) ?? null;
     const nextConnectionId = nextCompany?.connectionId || nextCompanyId;
     if (nextCompanyId === selectedCompanyId && nextConnectionId === tallyConnectionId) return;
@@ -2921,20 +3796,15 @@ export function BankStatementsPage() {
     setTallyPostingStatus(null);
     setBillAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
+    setTallyPresenceByTransactionId({});
+    setTallyBalanceProof(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }
   async function pollImportUntilReady(importId: string, ledgerMastersForReview = ledgerMasters) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await wait(2500);
-      const response = await apiFetch(`/api/bank-statements/imports/${importId}`, {
-        cache: "no-store",
-      });
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-
-      const payload = (await response.json()) as PreviewResponse;
+      const payload = await loadImportPreview(importId);
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -2957,6 +3827,49 @@ export function BankStatementsPage() {
     throw new Error("Bank statement analysis is still running. Please refresh in a moment.");
   }
 
+  async function handleSelectedStatementFile(nextFile: File) {
+    setDocumentPreviewLoading(true);
+    setBanner(null);
+    setStatementDoneSummary(null);
+    setTallyPostingStatus(null);
+    setStatementPassword("");
+    setStatementPasswordRequired(false);
+    setStatementPasswordError(null);
+    setFile(nextFile);
+    try {
+      setDocumentPreview(await buildDocumentPreview(nextFile));
+    } finally {
+      setDocumentPreviewLoading(false);
+    }
+  }
+
+  function clearSelectedStatementFile() {
+    setFile(null);
+    setDocumentPreview(null);
+    setDocumentPreviewLoading(false);
+    setStatementPassword("");
+    setStatementPasswordRequired(false);
+    setStatementPasswordError(null);
+    setDragActive(false);
+    setBanner(null);
+    setPostUploadSyncImportId(null);
+    setPostUploadSyncError(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  async function loadImportPreview(importId: string) {
+    const response = await apiFetch(`/api/bank-statements/imports/${importId}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+
+    return (await response.json()) as PreviewResponse;
+  }
+
   async function analyzeFile(nextFile = file) {
     if (!nextFile) {
       setBanner({ tone: "error", text: "Select a bank statement file." });
@@ -2970,21 +3883,26 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: "Tally company is not ready. Open Tally Prime and refresh the connection." });
       return;
     }
+    if (!tallyCompanyContextVerified) {
+      setBanner({ tone: "error", text: setupErrorMessage || "Refresh Gajkesari to verify the Tally company before upload." });
+      return;
+    }
+    if (statementPasswordRequired && isPdfFile(nextFile) && !statementPassword.trim()) {
+      const message = "Enter the statement password to continue.";
+      setStatementPasswordError(message);
+      setBanner({ tone: "error", text: message });
+      return;
+    }
     try {
-      clearStatementReview();
+      clearStatementReview({ preserveSelectedFile: true });
       setLoading(true);
       setBanner(null);
+      setStatementPasswordError(null);
       setTallyPostingStatus(null);
       setStatementDoneSummary(null);
+      setPostUploadSyncImportId(null);
+      setPostUploadSyncError(null);
       setFile(nextFile);
-      let ledgerMastersForReview = ledgerMasters;
-      if (syncBeforeAnalysis) {
-        const syncedMasters = await syncCompanyData({ quiet: true });
-        if (!syncedMasters) {
-          return;
-        }
-        ledgerMastersForReview = syncedMasters;
-      }
       const formData = new FormData();
       formData.set("file", nextFile);
       formData.set("account", JSON.stringify(EMPTY_ACCOUNT));
@@ -2992,7 +3910,10 @@ export function BankStatementsPage() {
       formData.set("companyName", selectedCompanyName);
       formData.set("financialYear", selectedFinancialYear);
       formData.set("bankLedgerName", "");
-      formData.set("syncBeforeAnalysis", String(syncBeforeAnalysis));
+      formData.set("syncBeforeAnalysis", "true");
+      if (isPdfFile(nextFile) && statementPassword.trim()) {
+        formData.set("statementPassword", statementPassword);
+      }
 
       const response = await apiFetch("/api/bank-statements/imports", {
         method: "POST",
@@ -3000,10 +3921,34 @@ export function BankStatementsPage() {
       });
 
       if (!response.ok) {
-        throw new Error(await readError(response));
+        const payload = await readApiErrorPayload(response);
+        if (
+          payload.code === "BANK_STATEMENT_PASSWORD_REQUIRED" ||
+          payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT" ||
+          payload.code === "BANK_STATEMENT_PASSWORD_UNSUPPORTED"
+        ) {
+          setStatementPasswordRequired(payload.code !== "BANK_STATEMENT_PASSWORD_UNSUPPORTED");
+          setStatementPasswordError(payload.error ?? "This password-protected statement could not be opened.");
+          if (payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT") {
+            setStatementPassword("");
+          }
+          setBanner({
+            tone: "error",
+            text: payload.error ?? "This password-protected statement could not be opened.",
+          });
+          return;
+        }
+        throw new Error(payload.error || `Request failed with status ${response.status}`);
       }
 
       const payload = (await response.json()) as PreviewResponse;
+      setPostUploadSyncImportId(payload.import.id);
+      setStatementPassword("");
+      setStatementPasswordRequired(false);
+      setStatementPasswordError(null);
+      const syncPromise = syncCompanyData({ quiet: true });
+      const emptyLedgerMasters: TallyMaster[] = [];
+      let analyzedPayload: PreviewResponse;
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -3011,17 +3956,74 @@ export function BankStatementsPage() {
             ? `Analyzing statement: ${payload.job.stage}`
             : "Analyzing statement...",
         });
-        await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
-        return;
+        analyzedPayload = await pollImportUntilReady(payload.import.id, emptyLedgerMasters);
+      } else {
+        const latestPayload = await loadImportPreview(payload.import.id);
+        if (latestPayload.processing) {
+          analyzedPayload = await pollImportUntilReady(payload.import.id, emptyLedgerMasters);
+        } else {
+          applyPreviewPayload(latestPayload, EMPTY_ACCOUNT, emptyLedgerMasters);
+          setBanner(getAnalysisCompleteMessage(latestPayload));
+          analyzedPayload = latestPayload;
+        }
       }
 
-      applyPreviewPayload(payload, EMPTY_ACCOUNT, ledgerMastersForReview);
-      setBanner(getAnalysisCompleteMessage(payload));
+      const syncedMasters = await syncPromise;
+      if (!syncedMasters) {
+        const message =
+          "Statement analysis is ready, but Tally sync failed. Retry sync on this page to complete ledger matching.";
+        setPostUploadSyncError(message);
+        setBanner({ tone: "error", text: message });
+        return;
+      }
+      const ledgerMastersForReview = syncedMasters;
+      const latestPayload = await loadImportPreview(payload.import.id);
+      if (latestPayload.processing) {
+        await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
+      } else {
+        applyPreviewPayload(latestPayload || analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
+        setBanner(getAnalysisCompleteMessage(latestPayload || analyzedPayload));
+      }
+      setPostUploadSyncImportId(null);
+      setPostUploadSyncError(null);
     } catch (error) {
       setBanner({
         tone: "error",
         text: error instanceof Error ? error.message : "Bank statement analysis failed.",
       });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function retryPostUploadSync() {
+    if (!postUploadSyncImportId) return;
+
+    try {
+      setLoading(true);
+      setPostUploadSyncError(null);
+      setBanner({ tone: "info", text: "Retrying Tally company sync after upload..." });
+      const syncedMasters = await syncCompanyData({ quiet: true });
+      if (!syncedMasters) {
+        const message = "Tally company sync is still not complete. Keep the connector open, then retry.";
+        setPostUploadSyncError(message);
+        setBanner({ tone: "error", text: message });
+        return;
+      }
+
+      const payload = await loadImportPreview(postUploadSyncImportId);
+      if (payload.processing) {
+        await pollImportUntilReady(postUploadSyncImportId, syncedMasters);
+      } else {
+        applyPreviewPayload(payload, EMPTY_ACCOUNT, syncedMasters);
+        setBanner(getAnalysisCompleteMessage(payload));
+      }
+      setPostUploadSyncImportId(null);
+      setPostUploadSyncError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not retry Tally company sync.";
+      setPostUploadSyncError(message);
+      setBanner({ tone: "error", text: message });
     } finally {
       setLoading(false);
     }
@@ -3036,7 +4038,7 @@ export function BankStatementsPage() {
 
     try {
       setSyncingMasters(true);
-      setBanner(options?.quiet ? { tone: "info", text: "Refreshing Tally company data before analysis..." } : null);
+      setBanner(options?.quiet ? { tone: "info", text: "Refreshing Tally company data after upload..." } : null);
       const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3061,10 +4063,13 @@ export function BankStatementsPage() {
       setBanner({
         tone: "info",
         text: options?.quiet
-          ? "Refreshing Tally company data before analysis..."
+          ? "Refreshing Tally company data after upload..."
           : "Company data sync is running. Keep the connector open.",
       });
-      const completedCommand = await waitForCommand(connection.id, command.id);
+      const completedCommand = await waitForCommand(connection.id, command.id, {
+        attempts: 180,
+        intervalMs: 2000,
+      });
       if (!completedCommand) {
         setBanner({
           tone: "info",
@@ -3213,6 +4218,91 @@ export function BankStatementsPage() {
     return [];
   }
 
+  async function verifyBankStatementPresence(connection: TallyConnection, rows: ReviewTransaction[]) {
+    if (!bankLedgerName.trim()) {
+      throw new Error("Select the Tally bank ledger before checking the statement.");
+    }
+    const relevantLedgerNames = Array.from(
+      new Set(
+        [
+          bankLedgerName,
+          ...rows
+            .map((transaction) => transaction.selectedLedgerName)
+            .filter((ledgerName) => ledgerName.trim() && !isSuspenseLedgerName(ledgerName)),
+        ]
+          .map((ledgerName) => ledgerName.trim())
+          .filter(Boolean)
+      )
+    );
+    const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandType: "verify_bank_transaction",
+        payload: {
+          companyName: selectedCompanyName || connection.lastCompanyName,
+          bankLedgerName,
+          relevantLedgerNames,
+          voucherTypes: ["Receipt", "Payment", "Contra", "Journal"],
+          transactions: rows.map((transaction) => {
+            const incoming = isIncomingReceiptRow(transaction);
+            const debitAmount = parseNumber(transaction.debitAmount) ?? 0;
+            const creditAmount = parseNumber(transaction.creditAmount) ?? 0;
+            return {
+              transactionId: transaction.id,
+              voucherDate: transaction.transactionDate,
+              bankLedgerName,
+              amount: incoming ? creditAmount : debitAmount,
+              debitAmount,
+              creditAmount,
+              balanceAmount: parseNumber(transaction.balanceAmount),
+              expectedDirection: incoming ? "incoming" : "outgoing",
+              counterpartyLedgerName: isSuspenseLedgerName(transaction.selectedLedgerName)
+                ? null
+                : transaction.selectedLedgerName,
+              narration: transaction.description,
+              referenceNumber: transaction.referenceNumber || getTransactionReference(transaction),
+            };
+          }),
+        },
+      }),
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    const payload = (await response.json()) as { command?: TallyCommand };
+    if (!payload.command?.id) throw new Error("Tally statement check was queued without a command id.");
+
+    const completed = await waitForCommands(connection.id, [payload.command.id]);
+    const command = completed.find((item) => item.id === payload.command?.id);
+    if (!command) throw new Error("Tally statement check timed out.");
+    if (command.status !== "succeeded") {
+      throw new Error(command.error || `Tally statement check ${command.status}.`);
+    }
+    const result = command.result ?? {};
+    const resultRows = Array.isArray(result.transactions) ? result.transactions : [];
+    const drafts = Object.fromEntries(resultRows.flatMap((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const row = value as Record<string, unknown>;
+      const transactionId = typeof row.transactionId === "string" ? row.transactionId : "";
+      if (!transactionId) return [];
+      return [[transactionId, outgoingVerificationFromCommand({
+        ...command,
+        result: row,
+      })]];
+    })) as Record<string, OutgoingVerificationDraft>;
+    const balanceProof = result.balanceProof && typeof result.balanceProof === "object" && !Array.isArray(result.balanceProof)
+      ? result.balanceProof as TallyBalanceProof
+      : null;
+    setTallyPresenceByTransactionId(drafts);
+    setOutgoingVerificationsByTransactionId(Object.fromEntries(
+      rows.filter(isOutgoingPaymentRow).flatMap((transaction) => {
+        const draft = drafts[transaction.id];
+        return draft ? [[transaction.id, draft]] : [];
+      })
+    ));
+    setTallyBalanceProof(balanceProof);
+    return { drafts, balanceProof };
+  }
+
   async function verifyOutgoingPayments(connection: TallyConnection, rows: ReviewTransaction[]) {
     const nextDrafts: Record<string, OutgoingVerificationDraft> = {};
     const checkableRows: ReviewTransaction[] = [];
@@ -3306,20 +4396,24 @@ export function BankStatementsPage() {
       showToast("error", "Select a Tally connection before checking Tally matches.");
       return;
     }
-    if (pendingBillEligibleTransactions.length === 0 && outgoingPaymentTransactions.length === 0) {
-      showToast("info", "No receipt or outgoing payment rows were found to check.");
+    if (validTransactions.length === 0) {
+      showToast("info", "No valid bank statement rows were found to check.");
       return;
     }
 
     try {
       setMatchingBills(true);
-      setBanner({ tone: "info", text: "Checking receipts and outgoing payments in Tally..." });
+      setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
+      const { drafts: presenceDrafts, balanceProof } = await verifyBankStatementPresence(connection, validTransactions);
+      const receiptTransactionsToMatch = pendingBillEligibleTransactions.filter(
+        (transaction) => presenceDrafts[transaction.id]?.status === "missing"
+      );
       const nextDrafts: Record<string, BillAllocationDraft> = {};
-      if (pendingBillEligibleTransactions.length > 0) {
-        const ledgers = Array.from(new Set(pendingBillEligibleTransactions.map((transaction) => transaction.selectedLedgerName)));
+      if (receiptTransactionsToMatch.length > 0) {
+        const ledgers = Array.from(new Set(receiptTransactionsToMatch.map((transaction) => transaction.selectedLedgerName)));
         const billDataByLedger = await fetchOpenBillsForLedgers(connection, ledgers);
 
-        for (const transaction of validTransactions) {
+        for (const transaction of receiptTransactionsToMatch) {
           if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) {
             const context = getPartyBillMatchContext(transaction, ledgerMasters);
             nextDrafts[transaction.id] = {
@@ -3368,21 +4462,29 @@ export function BankStatementsPage() {
         }
       }
 
-      if (pendingBillEligibleTransactions.length > 0) {
+      if (receiptTransactionsToMatch.length > 0) {
         setBillAllocationsByTransactionId(nextDrafts);
       }
-      const outgoingDrafts =
-        outgoingPaymentTransactions.length > 0
-          ? await verifyOutgoingPayments(connection, outgoingPaymentTransactions)
-          : {};
-      const readyCount = Object.values(nextDrafts).filter((draft) => draft.status === "ready_to_post").length;
-      const foundOutgoingCount = Object.values(outgoingDrafts).filter((draft) => draft.status === "found").length;
-      const issueOutgoingCount = Object.values(outgoingDrafts).filter(
-        (draft) => draft.status === "missing" || draft.status === "ambiguous" || draft.status === "failed"
+      const foundCount = Object.values(presenceDrafts).filter((draft) => draft.status === "found").length;
+      const ambiguousCount = Object.values(presenceDrafts).filter((draft) => draft.status === "ambiguous").length;
+      const duplicateCount = Object.values(presenceDrafts).filter((draft) => draft.duplicateInTally).length;
+      const missingReceiptRows = validTransactions.filter(
+        (transaction) => isIncomingReceiptRow(transaction) && presenceDrafts[transaction.id]?.status === "missing"
       ).length;
+      const missingOutgoingRows = validTransactions.filter(
+        (transaction) => isOutgoingPaymentRow(transaction) && presenceDrafts[transaction.id]?.status === "missing"
+      ).length;
+      const uncheckedRows = validTransactions.length - foundCount - ambiguousCount - missingReceiptRows - missingOutgoingRows;
+      const hasReviewIssues =
+        duplicateCount > 0 ||
+        ambiguousCount > 0 ||
+        uncheckedRows > 0 ||
+        balanceProof?.balancesMatch === false;
       setBanner({
-        tone: issueOutgoingCount > 0 ? "info" : "success",
-        text: `${readyCount} receipt row(s) matched with open bills. ${foundOutgoingCount} outgoing row(s) found in Tally${issueOutgoingCount > 0 ? `, ${issueOutgoingCount} need review` : ""}.`,
+        tone: hasReviewIssues ? "info" : "success",
+        text: `Statement checked. ${missingReceiptRows > 0
+          ? `${missingReceiptRows} receipt${missingReceiptRows === 1 ? " is" : "s are"} ready to post.`
+          : "No new receipts to post."}${hasReviewIssues ? " Review the highlighted issues." : ""}`,
       });
     } catch (error) {
       setBanner({
@@ -3394,8 +4496,17 @@ export function BankStatementsPage() {
     }
   }
 
-  async function sendToTally() {
+  async function sendToTally(mode: TallySendMode) {
     if (!preview) return;
+    const selectedTallyWorkTransactions =
+      mode === "post_receipts" ? receiptTransactionsNeedingPost : outgoingTransactionsNeedingCheck;
+    if (selectedTallyWorkTransactions.length === 0) {
+      showToast(
+        "info",
+        mode === "post_receipts" ? "No new receipts to post." : "No missing payments to check."
+      );
+      return;
+    }
     if (!tallyConnectionId) {
       showToast("error", "Select a Tally connection.");
       return;
@@ -3416,12 +4527,32 @@ export function BankStatementsPage() {
       showToast("error", "Select a ledger for every row before sending to Tally.");
       return;
     }
-    if (blockingBillAllocationCount > 0) {
+    if (pendingLedgerReviewCount > 0) {
+      showToast("error", "Review and confirm close ledger matches before sending to Tally.");
+      return;
+    }
+    if (uncheckedTallyPresenceCount > 0) {
+      showToast("error", "Check the full statement against Tally before sending anything.");
+      return;
+    }
+    if (ambiguousTallyPresenceCount > 0) {
+      showToast("error", "Review ambiguous Tally matches before sending anything.");
+      return;
+    }
+    if (transactionsNeedingTallyWork.length === 0) {
+      setStatementDoneSummary({
+        tone: "info",
+        title: "Nothing new to send.",
+        text: "Every statement row already has a unique matching voucher in live Tally.",
+      });
+      return;
+    }
+    if (mode === "post_receipts" && blockingReceiptBillAllocationCount > 0) {
       setBanner({
         tone: "error",
-        text: `${blockingBillAllocationCount} party row(s) need bill allocation review before sending to Tally.`,
+        text: `${blockingReceiptBillAllocationCount} party row(s) need bill allocation review before posting receipts to Tally.`,
       });
-      showToast("error", "Match or review open bills before sending to Tally.");
+      showToast("error", "Match or review open bills before posting receipts to Tally.");
       return;
     }
     try {
@@ -3438,7 +4569,8 @@ export function BankStatementsPage() {
             ...account,
             tallyLedgerName: bankLedgerName,
           },
-          transactions: validTransactions.map((transaction) => ({
+          reconcileAgainstLiveTally: true,
+          transactions: selectedTallyWorkTransactions.map((transaction) => ({
             transactionDate: transaction.transactionDate,
             valueDate: transaction.valueDate || transaction.transactionDate,
             description: transaction.description,
@@ -3482,9 +4614,12 @@ export function BankStatementsPage() {
       }
 
       const queuePayload = (await transactionsResponse.json()) as { transactions?: QueueTransaction[] };
-      const queueRows = queuePayload.transactions ?? [];
+      const selectedQueueKeys = new Set(selectedTallyWorkTransactions.map(transactionQueueKey));
+      const queueRows = (queuePayload.transactions ?? []).filter((transaction) =>
+        selectedQueueKeys.has(transactionQueueKey(transaction))
+      );
       const reviewedTransactionsByKey = new Map(
-        validTransactions.map((transaction) => [transactionQueueKey(transaction), transaction])
+        selectedTallyWorkTransactions.map((transaction) => [transactionQueueKey(transaction), transaction])
       );
       if (queueRows.length === 0) {
         if (confirmPayload.importedTransactionCount <= 0) {
@@ -3517,6 +4652,7 @@ export function BankStatementsPage() {
         body: JSON.stringify({
           connectionId: tallyConnectionId,
           companyName: selectedCompanyName,
+          async: true,
           accountId: confirmPayload.account.id,
           transactionIds: queueRows.map((transaction) => transaction.id),
           bankLedgerName,
@@ -3554,11 +4690,15 @@ export function BankStatementsPage() {
         throw new Error(await readError(queueResponse));
       }
 
-      const queuedPayload = (await queueResponse.json()) as {
-        queuedCount?: number;
-        verificationCount?: number;
-        commands?: TallyCommand[];
-      };
+      const queueResponsePayload = (await queueResponse.json()) as TallyQueueJobResponse & TallyQueueResult;
+      const queuedPayload = queueResponsePayload.jobId
+        ? await pollTallyQueueJob(queueResponsePayload.jobId)
+        : {
+            queuedCount: queueResponsePayload.queuedCount,
+            verificationCount: queueResponsePayload.verificationCount,
+            commands: queueResponsePayload.commands,
+            diagnostics: queueResponsePayload.diagnostics,
+          };
       const queuedCommands = queuedPayload.commands ?? [];
       const commandIds = queuedCommands.map((command) => command.id).filter(Boolean);
       const postingConnectionId =
@@ -3572,23 +4712,72 @@ export function BankStatementsPage() {
         const paymentCheckCount = queuedPayload.verificationCount ?? 0;
         setBanner({
           tone: "info",
-          text: `${voucherCount} Tally voucher(s) queued, ${paymentCheckCount} payment check(s) queued. Keep this page open while Tally works.`,
+          text: voucherCount > 0 && paymentCheckCount > 0
+            ? `Creating ${voucherCount} receipt voucher(s) and checking ${paymentCheckCount} outgoing payment(s). Keep this page open while Tally works.`
+            : voucherCount > 0
+              ? `Creating ${voucherCount} receipt voucher(s). Keep this page open while Tally works.`
+              : `Checking ${paymentCheckCount} outgoing payment(s) against Tally. No receipt vouchers will be created.`,
         });
-        void pollTallyPostingStatus(postingConnectionId, commandIds).catch((pollError) => {
-          showToast(
-            "error",
-            pollError instanceof Error ? pollError.message : "Could not refresh Tally posting status."
-          );
-        });
+        void pollTallyPostingStatus(postingConnectionId, commandIds)
+          .then(async (finalStatus) => {
+            if (!finalStatus?.finished || finalStatus.failed > 0 || finalStatus.canceled > 0 || !commandConnection) return;
+            setBanner({ tone: "info", text: "Tally actions completed. Verifying the statement against live Tally..." });
+            const { drafts, balanceProof } = await verifyBankStatementPresence(commandConnection, validTransactions);
+            const remainingReceipts = validTransactions.filter(
+              (transaction) => isIncomingReceiptRow(transaction) && drafts[transaction.id]?.status !== "found"
+            ).length;
+            const foundRows = Object.values(drafts).filter((draft) => draft.status === "found").length;
+            if (remainingReceipts > 0) {
+              setStatementDoneSummary({
+                tone: "error",
+                title: "Posting verification failed.",
+                text: `${remainingReceipts} receipt(s) are still not present in live Tally. They were not treated as completed.`,
+              });
+              setBanner({
+                tone: "error",
+                text: `${remainingReceipts} receipt(s) are still missing after posting. Review the failed rows before retrying.`,
+              });
+              return;
+            }
+            const checksOnly = finalStatus.voucherTotal === 0;
+            setStatementDoneSummary({
+              tone: "success",
+              title: checksOnly ? "Statement verified against Tally." : "Posted and verified in Tally.",
+              text: checksOnly
+                ? `All incoming receipts were already present. ${finalStatus.paymentCheckCompleted} outgoing payment check(s) completed and no Tally entries were created.`
+                : `All incoming receipts are present in live Tally. ${foundRows} statement row(s) currently have matching Tally vouchers.`,
+            });
+            setBanner({
+              tone: balanceProof?.balancesMatch === false ? "info" : "success",
+              text: `${checksOnly ? "No entries were created; all incoming receipts were already present." : "All incoming receipts were verified in live Tally."}${balanceProof?.balancesMatch === false ? " Opening/closing balance still needs review." : ""}`,
+            });
+          })
+          .catch((pollError) => {
+            showToast(
+              "error",
+              pollError instanceof Error ? pollError.message : "Could not refresh Tally posting status."
+            );
+          });
       } else {
         setBanner(null);
       }
       showToast(
-        "success",
-        `${confirmPayload.importedTransactionCount} transactions imported. ${queuedPayload.queuedCount ?? 0} Tally voucher(s) queued and ${queuedPayload.verificationCount ?? 0} payment check(s) queued.`
+        "info",
+        (queuedPayload.queuedCount ?? 0) > 0 && (queuedPayload.verificationCount ?? 0) > 0
+          ? `${queuedPayload.queuedCount ?? 0} receipt voucher(s) will be created; ${queuedPayload.verificationCount ?? 0} outgoing payment(s) will be checked.`
+          : (queuedPayload.queuedCount ?? 0) > 0
+            ? `${queuedPayload.queuedCount ?? 0} receipt voucher(s) will be created.`
+            : `${queuedPayload.verificationCount ?? 0} outgoing payment check(s) started. No receipt vouchers will be created.`
       );
     } catch (error) {
-      showToast("error", error instanceof Error ? error.message : "Could not send bank statement to Tally.");
+      showToast(
+        "error",
+        error instanceof Error
+          ? error.message
+          : mode === "post_receipts"
+            ? "Could not post receipts to Tally."
+            : "Could not check payments in Tally."
+      );
     } finally {
       setSending(false);
     }
@@ -3626,9 +4815,9 @@ export function BankStatementsPage() {
           </div>
         ))}
       </div>
-      <div className={`min-h-screen bg-[#f7f7f5] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-40" : ""}`}>
-        <div className="mx-auto flex max-w-7xl flex-col gap-6">
-          <header className={`flex flex-col gap-3 md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "pb-3" : "pb-6"}`}>
+      <div className={`bank-statements-workflow min-h-screen bg-[#f7f7f5] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-40" : ""}`}>
+        <div className="mx-auto flex max-w-7xl flex-col gap-4">
+          <header className={`flex flex-col gap-3 md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "pb-3" : "pb-4"}`}>
             <div>
               {!preview && (
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800 mb-2">
@@ -3636,7 +4825,7 @@ export function BankStatementsPage() {
                   ERP Reconciliation
                 </div>
               )}
-              <h1 className={`${preview ? "text-xl sm:text-2xl" : "text-3xl"} font-black tracking-tight text-[#1a1a1a] flex items-center gap-2`}>
+              <h1 className={`${preview ? "text-xl sm:text-2xl" : "text-2xl sm:text-[28px]"} font-black tracking-tight text-[#1a1a1a] flex items-center gap-2`}>
                 Bank Statements
                 {preview && (
                   <span
@@ -3665,7 +4854,9 @@ export function BankStatementsPage() {
                 )}
                 <div className="min-w-0">
                   <div className="text-xs font-bold text-[#1a1a1a]">
-                    {!tallyConnected
+                    {!selectedCompanyName
+                      ? "Select Tally company"
+                      : !tallyConnected
                       ? "Tally unavailable"
                       : checkingLiveTallyCompany
                         ? "Checking Tally company"
@@ -3712,6 +4903,40 @@ export function BankStatementsPage() {
             </div>
           </header>
 
+          {!preview ? (
+            <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[#e5ddd0] bg-white px-3 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              {["Upload statement", "Review file", "Analyze", "Match transactions"].map((step, index) => {
+                const complete = workflowStep > index;
+                const current = workflowStep === index;
+                return (
+                  <div
+                    key={step}
+                    className={`flex items-center gap-2 rounded-xl px-2.5 py-1.5 text-[11px] font-extrabold ${
+                      complete
+                        ? "bg-emerald-50 text-emerald-800"
+                        : current
+                          ? "bg-[#fff7e8] text-amber-900"
+                          : "text-slate-400"
+                    }`}
+                  >
+                    <span
+                      className={`grid h-5 w-5 place-items-center rounded-full text-[10px] ${
+                        complete
+                          ? "bg-emerald-600 text-white"
+                          : current
+                            ? "bg-amber-500 text-white"
+                            : "bg-slate-100 text-slate-400"
+                      }`}
+                    >
+                      {complete ? <CheckCircle2 className="h-3.5 w-3.5" /> : index + 1}
+                    </span>
+                    {step}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+
           {banner && (!preview || banner.tone !== "success") && (
             <div
               className={`flex items-start gap-2 rounded-xl border px-4 py-3 text-sm font-semibold ${
@@ -3730,6 +4955,40 @@ export function BankStatementsPage() {
               <span>{banner.text}</span>
             </div>
           )}
+
+          {postUploadSyncImportId && (postUploadSyncError || syncingMasters) ? (
+            <div className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-start gap-2">
+                {syncingMasters ? (
+                  <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-700" />
+                ) : (
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                )}
+                <div className="min-w-0">
+                  <div className="font-extrabold">
+                    {syncingMasters ? "Tally sync is running" : "Tally sync needed for ledger matching"}
+                  </div>
+                  <div className="mt-0.5 text-xs font-semibold leading-5 text-amber-900">
+                    {postUploadSyncError ||
+                      "Statement analysis can continue. Ledger matching will update after Tally sync completes."}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={retryPostUploadSync}
+                disabled={!tallyCompanyContextVerified || loading || syncingMasters}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {loading || syncingMasters ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                {syncingMasters ? "Syncing..." : "Retry sync"}
+              </button>
+            </div>
+          ) : null}
 
           {preview && statementDoneSummary ? (
             <div
@@ -3751,7 +5010,7 @@ export function BankStatementsPage() {
                 </div>
                 <button
                   className="inline-flex h-9 items-center justify-center rounded-xl bg-white px-4 text-xs font-bold text-[#2d2d2d] shadow-sm ring-1 ring-black/5 transition hover:bg-[#faf8f4]"
-                  onClick={clearStatementReview}
+                  onClick={() => clearStatementReview()}
                   type="button"
                 >
                   Upload Another
@@ -3761,17 +5020,29 @@ export function BankStatementsPage() {
           ) : null}
 
           {!preview ? (
-            <section className="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
-              <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+            <section
+              className={`grid gap-5 ${
+                documentPreview || documentPreviewLoading
+                  ? ""
+                  : "lg:grid-cols-[0.95fr_1.05fr]"
+              }`}
+            >
+              <div
+                className={`rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)] ${
+                  documentPreview || documentPreviewLoading ? "hidden" : ""
+                }`}
+              >
                 <div className="space-y-4">
                   <label className="block">
                     <span className="text-xs font-bold text-[#5a5046]">Company</span>
                     <select
                       className="mt-1.5 h-11 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                       onChange={(event) => updateStatementContext(event.target.value)}
-                      value={selectedCompany?.id || selectedCompanyId}
+                      value={selectedCompanyId}
                     >
-                      {companyOptions.length === 0 ? <option value="">No connected Tally company</option> : null}
+                      <option value="" disabled>
+                        {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
+                      </option>
                       {companyOptions.map((company) => (
                         <option key={company.id} value={company.id}>
                           {formatCompanyOptionLabel(company)}
@@ -3780,31 +5051,55 @@ export function BankStatementsPage() {
                     </select>
                   </label>
 
-                      <label className="flex items-center justify-between gap-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/60 px-4 py-3">
-                    <span className="min-w-0">
-                      <span className="block text-xs font-bold text-[#1a1a1a]">Sync current Tally company before analysis</span>
+                  <div
+                    className="block rounded-xl border border-amber-250 bg-[#fffaf2] px-4 py-3.5 transition"
+                    aria-describedby="bank-statement-sync-mode-status"
+                  >
+                    <span className="flex items-start justify-between gap-4">
+                      <span className="min-w-0">
+                        <span className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-extrabold text-[#1a1a1a]">
+                            Auto-sync Tally company after upload
+                          </span>
+                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-amber-800">
+                            Auto
+                          </span>
+                        </span>
+                        <span
+                          id="bank-statement-sync-mode-status"
+                          className="mt-1.5 block text-xs font-semibold leading-5 text-[#6f6256]"
+                        >
+                          {syncModeStatus.tone === "warning"
+                            ? "Sync will run after upload once the selected Tally company is verified."
+                            : syncModeStatus.text}
+                        </span>
+                      </span>
+                      <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
                     </span>
-                    <input
-                      checked={syncBeforeAnalysis}
-                      className="h-5 w-5 shrink-0 rounded border-[#e5ddd0] accent-amber-600 focus:ring-amber-500"
-                      onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
-                      type="checkbox"
-                    />
-                  </label>
+                  </div>
 
-                  {setupErrorMessage ? (
-                    <div className="rounded-xl border border-amber-250 bg-amber-50 px-3.5 py-2.5 text-xs font-bold text-amber-800">
-                      {setupErrorMessage}
+                  {syncModeStatus.tone === "warning" ? (
+                    <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                      <span>
+                        <span className="block font-extrabold">{syncModeStatus.title}</span>
+                        <span className="mt-0.5 block leading-5">{syncModeStatus.text}</span>
+                      </span>
                     </div>
-                  ) : (
-                    <div className="rounded-xl border border-emerald-250 bg-emerald-50 px-3.5 py-2.5 text-xs font-bold text-emerald-800">
+                  ) : !documentPreview && !documentPreviewLoading ? (
+                    <div className="flex items-center gap-2 px-1 text-xs font-bold text-emerald-800">
+                      <CheckCircle2 className="h-4 w-4 shrink-0" />
                       Ready to upload.
                     </div>
-                  )}
+                  ) : null}
                 </div>
               </div>
 
-              <section className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              <section
+                className={`rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)] ${
+                  documentPreview || documentPreviewLoading ? "p-3 sm:p-4" : "p-6"
+                }`}
+              >
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -3815,74 +5110,343 @@ export function BankStatementsPage() {
                   }}
                   onChange={(event) => {
                     const nextFile = event.target.files?.[0] ?? null;
-                    if (nextFile) void analyzeFile(nextFile);
+                    if (nextFile) void handleSelectedStatementFile(nextFile);
                   }}
                 />
-                <button
-                  type="button"
-                  aria-disabled={!uploadContextReady || loading}
-                  onClick={() => {
-                    if (!uploadContextReady) {
-                      setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
-                      return;
-                    }
-                    fileInputRef.current?.click();
-                  }}
-                  onDragEnter={(event) => {
-                    event.preventDefault();
-                    if (uploadContextReady) setDragActive(true);
-                  }}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    if (uploadContextReady) setDragActive(true);
-                  }}
-                  onDragLeave={(event) => {
-                    event.preventDefault();
-                    setDragActive(false);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    setDragActive(false);
-                    const nextFile = event.dataTransfer.files?.[0] ?? null;
-                    if (!nextFile) return;
-                    if (!uploadContextReady) {
-                      setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
-                      return;
-                    }
-                    void analyzeFile(nextFile);
-                  }}
-                  className={`flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all duration-300 ${
-                    dragActive
-                      ? "border-amber-500 bg-amber-50/40"
-                      : uploadContextReady
-                        ? "border-amber-200 bg-amber-50/10 hover:border-amber-400 hover:bg-amber-50/30"
-                        : "border-[#e5ddd0] bg-white opacity-70 cursor-not-allowed"
-                  }`}
-                >
-                  <div className={`mb-5 flex h-14 w-14 items-center justify-center rounded-xl transition-colors ${
-                    uploadContextReady ? "bg-[#2d2d2d] text-white" : "bg-slate-100 text-slate-400"
-                  } shadow-sm`}>
-                    {loading ? <Loader2 className="h-6 w-6 animate-spin" /> : <UploadCloud className="h-6 w-6" />}
-                  </div>
-                  <div className="text-lg font-extrabold text-[#1a1a1a]">
-                    {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Connect Tally company"}
-                  </div>
-                  <div className="text-xs font-semibold text-slate-400 mt-1">
-                    Supports CSV, TXT, PDF or scanned statement images
-                  </div>
-                  {file ? (
-                    <div className="mt-5 rounded-full border border-amber-200 bg-amber-50 px-4 py-1.5 text-xs font-bold text-amber-800 shadow-sm animate-pulse">
-                      {file.name}
+                {!documentPreview && !documentPreviewLoading ? (
+                  <button
+                    type="button"
+                    aria-disabled={!uploadContextReady || loading}
+                    onClick={() => {
+                      if (!uploadContextReady) {
+                        setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
+                        return;
+                      }
+                      fileInputRef.current?.click();
+                    }}
+                    onDragEnter={(event) => {
+                      event.preventDefault();
+                      if (uploadContextReady) setDragActive(true);
+                    }}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      if (uploadContextReady) setDragActive(true);
+                    }}
+                    onDragLeave={(event) => {
+                      event.preventDefault();
+                      setDragActive(false);
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      setDragActive(false);
+                      const nextFile = event.dataTransfer.files?.[0] ?? null;
+                      if (!nextFile) return;
+                      if (!uploadContextReady) {
+                        setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
+                        return;
+                      }
+                      void handleSelectedStatementFile(nextFile);
+                    }}
+                    className={`flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all duration-300 ${
+                      dragActive
+                        ? "border-amber-500 bg-amber-50/40"
+                        : uploadContextReady
+                          ? "border-amber-200 bg-amber-50/10 hover:border-amber-400 hover:bg-amber-50/30"
+                          : "border-[#e5ddd0] bg-white opacity-70 cursor-not-allowed"
+                    }`}
+                  >
+                    <div className={`mb-5 flex h-14 w-14 items-center justify-center rounded-xl transition-colors ${
+                      uploadContextReady ? "bg-[#2d2d2d] text-white" : "bg-slate-100 text-slate-400"
+                    } shadow-sm`}>
+                      {loading ? <Loader2 className="h-6 w-6 animate-spin" /> : <UploadCloud className="h-6 w-6" />}
                     </div>
-                  ) : null}
-                </button>
+                    <div className="text-lg font-extrabold text-[#1a1a1a]">
+                      {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Connect Tally company"}
+                    </div>
+                    <div className="mt-1 text-xs font-semibold text-slate-400">
+                      Supports CSV, TXT, PDF or scanned statement images
+                    </div>
+                  </button>
+                ) : null}
+                {documentPreviewLoading ? (
+                  <div className="flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] px-6 py-10 text-center">
+                    <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-[#2d2d2d] text-white shadow-sm">
+                      <Loader2 className="h-6 w-6 animate-spin" />
+                    </div>
+                    <div className="text-lg font-extrabold text-[#1a1a1a]">Reading file...</div>
+                    <div className="mt-1 text-xs font-semibold text-slate-400">Preparing preview before analysis</div>
+                  </div>
+                ) : null}
+                {documentPreview ? (
+                  <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] shadow-[0_8px_24px_rgba(45,45,45,0.06)]">
+                    <div className="grid gap-3 border-b border-[#eee5d8] bg-white px-4 py-3 lg:grid-cols-[minmax(220px,0.7fr)_minmax(240px,0.75fr)_auto] lg:items-end">
+                      <label className="block min-w-0">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-[#8b7a68]">Company</span>
+                        <select
+                          className="mt-1 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                          onChange={(event) => updateStatementContext(event.target.value)}
+                          value={selectedCompanyId}
+                        >
+                          <option value="" disabled>
+                            {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
+                          </option>
+                          {companyOptions.map((company) => (
+                            <option key={company.id} value={company.id}>
+                              {formatCompanyOptionLabel(company)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <div
+                        className="flex min-h-9 items-center justify-between gap-3 rounded-xl border border-amber-200 bg-[#fffaf2] px-3 py-2 transition"
+                        aria-describedby="bank-statement-sync-mode-status-preview"
+                      >
+                        <span className="min-w-0">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-extrabold text-[#1a1a1a]">Sync after upload</span>
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-amber-800">
+                              Auto
+                            </span>
+                          </span>
+                          <span
+                            id="bank-statement-sync-mode-status-preview"
+                            className="sr-only"
+                          >
+                            {syncModeStatus.text}
+                          </span>
+                        </span>
+                        <CheckCircle2 className="h-4 w-4 shrink-0 text-amber-700" />
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 lg:justify-end">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            clearSelectedStatementFile();
+                            fileInputRef.current?.click();
+                          }}
+                          className="inline-flex h-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                        >
+                          Upload another
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            Boolean(documentPreview.error) ||
+                            loading ||
+                            !file ||
+                            (statementPasswordRequired && !statementPassword.trim()) ||
+                            Boolean(statementPasswordError && !statementPasswordRequired)
+                          }
+                          onClick={() => {
+                            if (file) void analyzeFile(file);
+                          }}
+                          className="inline-flex h-9 items-center justify-center rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Analyze file
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-3 border-b border-[#eee5d8] bg-[#fffaf2] px-4 py-3">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#2d2d2d] text-white">
+                          <UploadCloud className="h-4.5 w-4.5" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={documentPreview.fileName}>
+                            {documentPreview.fileName}
+                          </div>
+                          <div className="mt-0.5 text-xs font-semibold text-[#7a6c5f]">
+                            {documentPreview.error ? (
+                              "Preview needs attention"
+                            ) : documentPreview.kind === "csv" ? (
+                              `${formatFileSize(file?.size)} - ${documentPreview.totalRows} transaction row${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.rows.length}.`
+                            ) : documentPreview.kind === "text" ? (
+                              `${formatFileSize(file?.size)} - ${documentPreview.totalRows} readable line${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.textLines.length}.`
+                            ) : documentPreview.kind === "pdf" ? (
+                              `${formatFileSize(file?.size)} - PDF selected. Review it below before analysis.`
+                            ) : documentPreview.kind === "image" ? (
+                              `${formatFileSize(file?.size)} - Image selected. Review it below before analysis.`
+                            ) : (
+                              "Review the selected file before analysis."
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      {documentPreview.kind === "pdf" && (statementPasswordRequired || statementPasswordError) ? (
+                        <div className="rounded-xl border border-amber-200 bg-white px-3 py-3">
+                          <label className="block">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">
+                              Statement password
+                            </span>
+                            {statementPasswordRequired ? (
+                              <input
+                                autoComplete="off"
+                                className="mt-2 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-sm font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-300 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                                onChange={(event) => {
+                                  setStatementPassword(event.target.value);
+                                  setStatementPasswordError(null);
+                                  setBanner(null);
+                                }}
+                                placeholder="Enter PDF password"
+                                type="password"
+                                value={statementPassword}
+                              />
+                            ) : null}
+                          </label>
+                          <div className={`mt-2 flex items-start gap-2 text-xs font-semibold ${statementPasswordError ? "text-amber-900" : "text-[#7a6c5f]"}`}>
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                            <span>
+                              {statementPasswordError ||
+                                "Password is used only for this upload attempt and is not stored."}
+                            </span>
+                          </div>
+                          {statementPasswordRequired ? (
+                            <div className="mt-1 text-[11px] font-semibold text-[#7a6c5f]">
+                              The password is used only to unlock this PDF for analysis. It is not saved.
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="grid gap-4 bg-white p-4 xl:grid-cols-[minmax(0,1fr)_280px]">
+                      <div className="overflow-hidden rounded-xl border border-[#e5ddd0] bg-white">
+                        {documentPreview.error ? (
+                          <div className="flex items-start gap-2 px-5 py-4 text-xs font-semibold text-rose-800">
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                            <span>{documentPreview.error}</span>
+                          </div>
+                        ) : documentPreview.kind === "csv" ? (
+                          <div className="max-h-[560px] overflow-auto bg-white">
+                            <table className="min-w-full border-collapse text-left text-xs">
+                              <thead className="sticky top-0 bg-[#f7f2ea] text-[#5a5046]">
+                                <tr>
+                                  {documentPreview.headers.map((header, index) => (
+                                    <th
+                                      key={`${header}-${index}`}
+                                      className="max-w-[220px] border-b border-[#e5ddd0] px-3 py-2 font-extrabold"
+                                      title={header}
+                                    >
+                                      <span className="block truncate">{header}</span>
+                                    </th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody className="bg-white text-[#2b241d]">
+                                {documentPreview.rows.map((row, rowIndex) => (
+                                  <tr key={`csv-row-${rowIndex}`} className="border-b border-[#f0e8dc] last:border-b-0">
+                                    {row.map((value, cellIndex) => (
+                                      <td
+                                        key={`csv-cell-${rowIndex}-${cellIndex}`}
+                                        className="max-w-[220px] px-3 py-2 font-semibold"
+                                        title={value}
+                                      >
+                                        <span className="block truncate">{value || "-"}</span>
+                                      </td>
+                                    ))}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : documentPreview.kind === "text" ? (
+                          <pre className="max-h-[560px] overflow-auto whitespace-pre-wrap bg-white px-5 py-4 text-xs font-semibold leading-5 text-[#2b241d]">
+                            {documentPreview.textLines.join("\n")}
+                          </pre>
+                        ) : documentPreview.kind === "pdf" && documentPreview.objectUrl ? (
+                          <iframe
+                            src={getPdfPreviewUrl(documentPreview.objectUrl)}
+                            title={`Preview of ${documentPreview.fileName}`}
+                            className="h-[680px] w-full bg-white"
+                          />
+                        ) : documentPreview.kind === "image" && documentPreview.objectUrl ? (
+                          <div className="flex max-h-[640px] items-center justify-center overflow-auto bg-white p-5">
+                            {/* eslint-disable-next-line @next/next/no-img-element -- Local object URLs cannot be optimized by next/image. */}
+                            <img
+                              src={documentPreview.objectUrl}
+                              alt={`Preview of ${documentPreview.fileName}`}
+                              className="max-h-[600px] max-w-full rounded-xl object-contain"
+                            />
+                          </div>
+                        ) : (
+                          <div className="px-5 py-4 text-xs font-semibold text-[#7a6c5f]">
+                            No preview is available for this file.
+                          </div>
+                        )}
+                      </div>
+                      <aside className="rounded-xl border border-[#e5ddd0] bg-[#fffdf9] p-4">
+                        <div className="text-xs font-extrabold uppercase tracking-wider text-[#8b7a68]">
+                          Analysis readiness
+                        </div>
+                        <div className="mt-3 space-y-3">
+                          {[
+                            {
+                              label: "Tally company verified",
+                              ready: tallyCompanyContextVerified,
+                              detail: selectedCompanyName || "Select a company",
+                            },
+                            {
+                              label: "Bank statement selected",
+                              ready: Boolean(file && !documentPreview.error && !statementPasswordError),
+                              detail: statementPasswordRequired
+                                ? "Password required"
+                                : statementPasswordError
+                                  ? "Needs attention"
+                                  : file
+                                    ? formatFileSize(file.size)
+                                    : "No file selected",
+                            },
+                            {
+                              label: "Tally sync after upload",
+                              ready: syncModeStatus.tone !== "warning",
+                              detail: "Ledger matching waits for sync",
+                            },
+                            {
+                              label: "Ready to analyze",
+                              ready: Boolean(
+                                tallyCompanyContextVerified &&
+                                  file &&
+                                  !documentPreview.error &&
+                                  !statementPasswordError &&
+                                  (!statementPasswordRequired || statementPassword.trim())
+                              ),
+                              detail: documentPreview.error
+                                ? "Fix preview issue"
+                                : statementPasswordRequired && !statementPassword.trim()
+                                  ? "Enter statement password"
+                                  : statementPasswordError
+                                    ? "Resolve password issue"
+                                    : "All required inputs set",
+                            },
+                          ].map((item) => (
+                            <div key={item.label} className="flex items-start gap-2">
+                              {item.ready ? (
+                                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
+                              ) : (
+                                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                              )}
+                              <div className="min-w-0">
+                                <div className="text-xs font-extrabold text-[#1a1a1a]">{item.label}</div>
+                                <div className="mt-0.5 text-[11px] font-semibold leading-4 text-[#7a6c5f]">
+                                  {item.detail}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </aside>
+                    </div>
+                  </div>
+                ) : null}
               </section>
             </section>
           ) : (
             <section className="space-y-4">
-              <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-                <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                  <div className="grid min-w-0 flex-1 items-center gap-4 sm:grid-cols-2 xl:grid-cols-[0.72fr_0.9fr_1.45fr_auto_minmax(240px,1.35fr)]">
+              <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-3 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+                <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.62fr)] xl:items-start">
+                  <div className="grid min-w-0 gap-4 sm:grid-cols-3">
                     <div className="min-w-0">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Company</div>
                       <div className="mt-1 truncate text-sm font-extrabold text-[#1a1a1a]" title={selectedCompanyName}>
@@ -3898,129 +5462,135 @@ export function BankStatementsPage() {
                       </div>
                     </div>
                     <div className="min-w-0">
-                      <div className="text-[9px] font-bold uppercase tracking-wider text-sky-700">Statement account</div>
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-sky-700">Statement account</div>
                       <div className="mt-1 truncate text-sm font-extrabold text-[#1a1a1a]" title={`${account.bankName || ""} ${account.accountNumber || ""}`}>
                         {account.bankName || "Account not detected"}
                         {account.accountNumber ? ` - ${maskAccountNumber(account.accountNumber)}` : ""}
                       </div>
-                      <div className="hidden 2xl:block truncate text-[10px] font-semibold text-slate-400 mt-0.5">
+                      <div className="mt-0.5 truncate text-[10px] font-semibold text-slate-400">
                         {account.accountHolderName || "Holder not found"}
                         {account.ifscCode ? ` - ${account.ifscCode}` : ""}
                       </div>
                     </div>
-                    <div className="hidden xl:flex items-center justify-center px-0.5">
-                      <ArrowRight aria-label="Statement to Tally ledger" className={`h-3.5 w-3.5 ${bankLedgerVerified ? "text-emerald-600" : "text-amber-600"}`} />
+                  </div>
 
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[9px] font-bold uppercase tracking-wider text-emerald-700">
-                        {bankLedgerChangeMode ? "Replace Tally ledger" : "Tally posting ledger"}
-                      </div>
-                      {bankLedgerChangeMode || !bankLedgerName ? (
-                        <div className="mt-1">
-                          <LedgerSearchSelect
-                            onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
-                            options={bankLedgerOptions.map((ledger) => ledger.name)}
-                            placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
-                            value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
-                          />
-                          {bankLedgerChangeMode ? (
-                            <div className="mt-2 flex flex-wrap items-center gap-2">
-                              <button
-                                className="inline-flex h-7 items-center rounded-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white transition hover:bg-[#1a1a1a]"
-                                onClick={confirmBankLedgerChange}
-                                type="button"
-                              >
-                                Use selected ledger
-                              </button>
-                              <button
-                                className="inline-flex h-7 items-center rounded-lg px-2 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
-                                onClick={cancelBankLedgerChange}
-                                type="button"
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          ) : (
-                            <div className="mt-1 flex items-center gap-1.5 text-[10px] font-semibold text-amber-700">
-                              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                              Choose the intended ledger - no exact account match was found.
-                            </div>
-                          )}
-                        </div>                      ) : (
-                        <div className="mt-1 flex min-w-0 items-center gap-2">
-                          {bankLedgerVerified ? (
-                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
-                          ) : (
-                            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-                          )}
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={bankLedgerName}>
-                              {bankLedgerName}
-                            </div>
-                            <div className={`truncate text-[10px] font-bold ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`}>
-                              {bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}
-                            </div>
+                  <div className="min-w-0 rounded-xl border border-[#f0e8dc] bg-[#fcfbfa] px-3 py-2.5">
+                    <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <ArrowRight aria-label="Statement to Tally ledger" className={`hidden h-3.5 w-3.5 shrink-0 xl:block ${bankLedgerVerified ? "text-emerald-600" : "text-amber-600"}`} />
+                          <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                            {bankLedgerChangeMode ? "Replace Tally ledger" : "Tally posting ledger"}
                           </div>
                         </div>
-                      )}
+                        {bankLedgerChangeMode || !bankLedgerName ? (
+                          <div className="mt-1.5">
+                            <LedgerSearchSelect
+                              onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
+                              options={bankLedgerOptions.map((ledger) => ledger.name)}
+                              placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
+                              value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
+                            />
+                            {bankLedgerChangeMode ? (
+                              <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <button
+                                  className="inline-flex h-7 items-center rounded-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white transition hover:bg-[#1a1a1a]"
+                                  onClick={confirmBankLedgerChange}
+                                  type="button"
+                                >
+                                  Use selected ledger
+                                </button>
+                                <button
+                                  className="inline-flex h-7 items-center rounded-lg px-2 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
+                                  onClick={cancelBankLedgerChange}
+                                  type="button"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="mt-1 flex items-start gap-1.5 text-[10px] font-semibold text-amber-700">
+                                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                <span>Choose the intended ledger - no exact account match was found.</span>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="mt-1.5 flex min-w-0 items-start gap-2">
+                            {bankLedgerVerified ? (
+                              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                            ) : (
+                              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+                            )}
+                            <div className="min-w-0">
+                              <div className="whitespace-normal break-words text-sm font-extrabold leading-5 text-[#1a1a1a]" title={bankLedgerName}>
+                                {bankLedgerName}
+                              </div>
+                              <div className={`text-[10px] font-bold leading-4 ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`}>
+                                {bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
+                        {preview.candidates.length > 1 ? (
+                          <select
+                            value={selectedAccountId || "new"}
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              setSelectedAccountId(value === "new" ? "" : value);
+                              const candidate = preview.candidates.find((item) => item.id === value);
+                              if (candidate) {
+                                setAccount({
+                                  bankName: candidate.bankName || account.bankName,
+                                  accountNumber: candidate.accountNumber || account.accountNumber,
+                                  accountHolderName: candidate.accountHolderName || account.accountHolderName,
+                                  ifscCode: candidate.ifscCode || account.ifscCode,
+                                  tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
+                                });
+                                if (candidate.tallyLedgerName) {
+                                  setBankLedgerName(candidate.tallyLedgerName);
+                                  setBankLedgerVerified(false);
+                                  setBankLedgerManuallyConfirmed(false);
+                                }
+                              }
+                            }}
+                            className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
+                          >
+                            <option value="new">Extracted account</option>
+                            {preview.candidates.map((candidate) => (
+                              <option key={candidate.id} value={candidate.id}>
+                                {candidate.accountHolderName || "Saved account"} - {candidate.accountNumberMasked}
+                              </option>
+                            ))}
+                          </select>
+                        ) : null}
+                        {!bankLedgerChangeMode && bankLedgerName ? (
+                          <button
+                            type="button"
+                            onClick={beginBankLedgerChange}
+                            className="inline-flex h-8.5 items-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                          >
+                            Change ledger
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={handleSyncLedgerMasters}
+                          disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
+                          className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {syncingMasters || loadingBankLedgers ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="h-3.5 w-3.5" />
+                          )}
+                          Sync
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap items-center gap-2">
-                    {preview.candidates.length > 1 ? (
-                      <select
-                        value={selectedAccountId || "new"}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setSelectedAccountId(value === "new" ? "" : value);
-                          const candidate = preview.candidates.find((item) => item.id === value);
-                          if (candidate) {
-                            setAccount({
-                              bankName: candidate.bankName || account.bankName,
-                              accountNumber: candidate.accountNumber || account.accountNumber,
-                              accountHolderName: candidate.accountHolderName || account.accountHolderName,
-                              ifscCode: candidate.ifscCode || account.ifscCode,
-                              tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
-                            });
-                            if (candidate.tallyLedgerName) {
-                              setBankLedgerName(candidate.tallyLedgerName);
-                              setBankLedgerVerified(false);
-                              setBankLedgerManuallyConfirmed(false);
-                            }
-                          }
-                        }}
-                        className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
-                      >
-                        <option value="new">Extracted account</option>
-                        {preview.candidates.map((candidate) => (
-                          <option key={candidate.id} value={candidate.id}>
-                            {candidate.accountHolderName || "Saved account"} - {candidate.accountNumberMasked}
-                          </option>
-                        ))}
-                      </select>
-                    ) : null}
-                    {!bankLedgerChangeMode && bankLedgerName ? (
-                      <button
-                        type="button"
-                        onClick={beginBankLedgerChange}
-                        className="inline-flex h-8.5 items-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all"
-                      >
-                        Change ledger
-                      </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      onClick={handleSyncLedgerMasters}
-                      disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
-                      className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50 transition-all"
-                    >
-                      {syncingMasters || loadingBankLedgers ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <RefreshCw className="h-3.5 w-3.5" />
-                      )}
-                      Sync
-                    </button>
                   </div>
                 </div>
               </div>
@@ -4031,7 +5601,79 @@ export function BankStatementsPage() {
                     This ledger has no exact verified account-number match to the uploaded statement. Choose it deliberately before posting.
                   </span>
                 </div>
-              ) : null}              <div className="hidden rounded-2xl border border-[#e3d6c6] bg-[#fffaf2] px-4 py-3 shadow-sm">
+              ) : null}
+              <section className="rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Transaction summary
+                    </div>
+                    <h2 className="mt-1 text-lg font-black text-[#1a1a1a]">
+                      {matchingBills
+                        ? "Checking statement against Tally"
+                        : uncheckedTallyPresenceCount > 0
+                          ? "Live Tally check pending"
+                        : statementReviewIssueCount > 0
+                          ? "Review needed before posting"
+                          : newReceiptCount > 0
+                            ? "Receipts ready to post"
+                            : "No new posting required"}
+                    </h2>
+                  </div>
+                  <div className="text-xs font-bold text-[#7a6c5f]">
+                    {filteredTransactions.length === validTransactions.length
+                      ? `${validTransactions.length} posting row${validTransactions.length === 1 ? "" : "s"} analyzed`
+                      : `${filteredTransactions.length} of ${validTransactions.length} posting row${validTransactions.length === 1 ? "" : "s"} shown`}
+                  </div>
+                </div>
+                <div className="mt-4 grid auto-cols-[minmax(180px,1fr)] grid-flow-col gap-3 overflow-x-auto pb-1 xl:grid-flow-row xl:grid-cols-5 xl:overflow-visible xl:pb-0">
+                  {[
+                    {
+                      label: "Posting rows",
+                      value: validTransactions.length,
+                      detail: ignoredStatementRowCount === 0
+                        ? "Ready for review"
+                        : `${ignoredStatementRowCount} statement header/summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored`,
+                      className: "border-slate-200 bg-slate-50 text-slate-800",
+                    },
+                    {
+                      label: "Already in Tally",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : alreadyInTallyCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Live check pending" : "Matched existing entries",
+                      className: "border-emerald-200 bg-emerald-50 text-emerald-800",
+                    },
+                    {
+                      label: "New receipts",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : newReceiptCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Live check pending" : "Can be posted to Tally",
+                      className: "border-blue-200 bg-blue-50 text-blue-800",
+                    },
+                    {
+                      label: "Payments missing",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : missingOutgoingCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Live check pending" : "Need payment verification",
+                      className: "border-rose-200 bg-rose-50 text-rose-800",
+                    },
+                    {
+                      label: "Needs review",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : statementReviewIssueCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Run Tally check first" : "Manual attention items",
+                      className: statementReviewIssueCount > 0
+                        ? "border-amber-200 bg-amber-50 text-amber-900"
+                        : "border-emerald-200 bg-emerald-50 text-emerald-800",
+                    },
+                  ].map((item) => (
+                    <div key={item.label} className={`min-w-[180px] rounded-2xl border px-4 py-3 xl:min-w-0 ${item.className}`}>
+                      <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                        {item.label}
+                      </div>
+                      <div className="mt-2 text-2xl font-black leading-none">{item.value}</div>
+                      <div className="mt-2 text-[11px] font-bold leading-4 opacity-80">{item.detail}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+              <div className="hidden rounded-2xl border border-[#e3d6c6] bg-[#fffaf2] px-4 py-3 shadow-sm">
                 <div className="grid gap-3 md:grid-cols-4">
                   <div>
                     <div className="text-[10px] uppercase tracking-[0.16em] text-[#9a8d7f]">Company</div>
@@ -4162,49 +5804,56 @@ export function BankStatementsPage() {
               <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
                 <div className="border-b border-[#e5ddd0] px-5 py-4">
                   <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                    <button
-                      className={`inline-flex h-9 w-fit items-center gap-2 rounded-xl border px-4 text-xs font-bold transition-all ${
-                        reviewFiltersOpen || activeReviewFilterCount > 0
-                          ? "border-amber-300 bg-amber-50 text-amber-800"
-                          : "border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
-                      }`}
-                      onClick={() => setReviewFiltersOpen((current) => !current)}
-                      type="button"
-                    >
-                      <Filter className="h-3.5 w-3.5" />
-                      Filters
-                      {activeReviewFilterCount > 0 ? (
-                        <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[#2d2d2d] px-1.5 text-[10px] text-white">
-                          {activeReviewFilterCount}
-                        </span>
-                      ) : null}
-                    </button>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="inline-flex items-center gap-1.5 rounded-full border border-[#e5ddd0] bg-white px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                        {transactions.length} total
-                      </span>
-                      <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-250 bg-emerald-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
-                        {matchedLedgerCount} matched
-                      </span>
-                      {needsReviewCount > 0 ? (
-                        <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-250 bg-amber-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-                          {needsReviewCount} needs review
-                        </span>
-                      ) : null}
-                      {suspenseLedgerCount > 0 ? (
-                        <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-250 bg-amber-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-                          {suspenseLedgerCount} in suspense
-                        </span>
-                      ) : null}
-                      <span
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
-                          missingLedgerCount === 0
-                            ? "border-emerald-250 bg-emerald-50 text-emerald-800"
-                            : "border-amber-250 bg-amber-50 text-amber-800"
+                    <div className="flex items-center gap-3">
+                      <button
+                        className={`inline-flex h-9 w-fit items-center gap-2 rounded-xl border px-4 text-xs font-bold transition-all ${
+                          reviewFiltersOpen || activeReviewFilterCount > 0
+                            ? "border-amber-300 bg-amber-50 text-amber-800"
+                            : "border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
                         }`}
+                        onClick={() => setReviewFiltersOpen((current) => !current)}
+                        type="button"
                       >
-                        {missingLedgerCount === 0 ? "Ready" : `${missingLedgerCount} need ledger`}
+                        <Filter className="h-3.5 w-3.5" />
+                        Filters
+                        {activeReviewFilterCount > 0 ? (
+                          <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[#2d2d2d] px-1.5 text-[10px] text-white">
+                            {activeReviewFilterCount}
+                          </span>
+                        ) : null}
+                      </button>
+                      <span className="text-xs font-bold text-slate-400">
+                        {validTransactions.length} transaction{validTransactions.length === 1 ? "" : "s"}
                       </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/70 px-3.5 py-2 text-[11px] font-bold">
+                      {uncheckedTallyPresenceCount === 0 ? (
+                        <>
+                          <span className="inline-flex items-center gap-1.5 text-emerald-800">
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                            {alreadyInTallyCount} in Tally
+                          </span>
+                          <span className="inline-flex items-center gap-1.5 text-blue-800">
+                            <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />
+                            {newReceiptCount} new receipt{newReceiptCount === 1 ? "" : "s"}
+                          </span>
+                          <span className="inline-flex items-center gap-1.5 text-rose-800">
+                            <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+                            {missingOutgoingCount} payment{missingOutgoingCount === 1 ? "" : "s"} missing
+                          </span>
+                          {ambiguousTallyPresenceCount > 0 ? (
+                            <span className="inline-flex items-center gap-1.5 text-amber-800">
+                              <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+                              {ambiguousTallyPresenceCount} match review
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 text-slate-600">
+                          <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
+                          Live Tally check pending
+                        </span>
+                      )}
                     </div>
                   </div>
                   {reviewFiltersOpen ? (
@@ -4300,26 +5949,26 @@ export function BankStatementsPage() {
                 </div>
 
                 <div className="max-h-[calc(100vh-470px)] overflow-auto [scrollbar-gutter:stable]">
-                  <table className="w-full min-w-[1180px] table-fixed border-collapse text-left">
+                  <table className="w-full min-w-[1320px] table-fixed border-collapse text-left">
                     <thead className="sticky top-0 z-20">
                       <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
                         <th className="w-20 px-3 py-3.5">Date</th>
-                        <th className="w-[22%] px-3 py-3.5">Narration</th>
+                        <th className="w-[30%] px-3 py-3.5">Narration</th>
                         <th className="w-20 px-3 py-3.5">Type</th>
-                        <th className="w-28 px-3 py-3.5">Ref / UTR</th>
+                        <th className="w-40 px-3 py-3.5">Ref / UTR</th>
                         <th className="w-28 px-3 py-3.5 text-right">Withdrawal</th>
                         <th className="w-28 px-3 py-3.5 text-right">Deposit</th>
-                        <th className="w-[19%] px-3 py-3.5">Tally ledger</th>
+                        <th className="w-[24%] px-3 py-3.5">Tally ledger</th>
                         <th className="w-44 px-3 py-3.5">Tally action</th>
                         <th className="w-32 px-3 py-3.5">Status</th>
                         <th className="w-16 px-3 py-3.5 text-right"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                      {transactions.length === 0 ? (
+                      {validTransactions.length === 0 ? (
                         <tr>
                           <td colSpan={10} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
-                            No rows were extracted. Upload another file or add rows after extraction support improves.
+                            No posting rows were extracted. Upload another file or add rows after extraction support improves.
                           </td>
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
@@ -4338,11 +5987,26 @@ export function BankStatementsPage() {
                           const reference = getTransactionReference(transaction);
                           const isEditingLedger = editingLedgerIds.has(transaction.id);
                           const showLedgerSelect = isEditingLedger;
+                          const ledgerDisplayName =
+                            transaction.selectedLedgerName ||
+                            transaction.suggestedLedgerName ||
+                            "-";
                           const billAllocation = billAllocationsByTransactionId[transaction.id];
                           const outgoingVerification = outgoingVerificationsByTransactionId[transaction.id];
+                          const tallyPresence = tallyPresenceByTransactionId[transaction.id];
                           const outgoingPayment = isOutgoingPaymentRow(transaction);
+                          const outgoingMissingInTally =
+                            outgoingPayment && outgoingVerification?.status === "missing";
                           const finalRowStatus =
-                            statementDoneSummary?.tone === "success"
+                            tallyPresence?.status === "found"
+                              ? tallyPresence.duplicateInTally
+                                ? "Tally duplicates"
+                                : "Already in Tally"
+                              : tallyPresence?.status === "ambiguous"
+                                ? "Review Match"
+                            : outgoingMissingInTally
+                              ? "Needs Review"
+                            : statementDoneSummary?.tone === "success"
                               ? outgoingPayment
                                 ? "Checked"
                                 : "Posted"
@@ -4350,7 +6014,15 @@ export function BankStatementsPage() {
                                 ? "Imported"
                                 : getReviewStatusLabel(transaction);
                           const finalRowStatusClass =
-                            statementDoneSummary?.tone === "success"
+                            tallyPresence?.status === "found"
+                              ? tallyPresence.duplicateInTally
+                                ? "border-amber-250 bg-amber-50 text-amber-800"
+                                : "border-emerald-250 bg-emerald-50 text-emerald-800"
+                              : tallyPresence?.status === "ambiguous"
+                                ? "border-amber-250 bg-amber-50 text-amber-800"
+                            : outgoingMissingInTally
+                              ? "border-amber-200 bg-amber-50 text-amber-800"
+                            : statementDoneSummary?.tone === "success"
                               ? "border-emerald-250 bg-emerald-50 text-emerald-800"
                               : statementDoneSummary?.tone === "info"
                                 ? "border-blue-200 bg-blue-50 text-blue-800"
@@ -4361,11 +6033,11 @@ export function BankStatementsPage() {
                               <td className="px-3 py-4 text-xs font-bold text-slate-500">
                                 {formatShortDate(transaction.transactionDate)}
                               </td>
-                              <td className="px-3 py-4">
-                                <div className="truncate text-sm font-bold text-[#1a1a1a]" title={partyTitle}>
+                              <td className="px-3 py-4 align-top">
+                                <div className="whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={partyTitle}>
                                   {partyTitle}
                                 </div>
-                                <div className="mt-1 truncate text-xs font-semibold text-slate-400" title={transaction.description}>
+                                <div className="mt-1 whitespace-normal break-words text-xs font-semibold leading-5 text-slate-500" title={transaction.description}>
                                   {transaction.description || "Narration not found"}
                                 </div>
                               </td>
@@ -4380,11 +6052,11 @@ export function BankStatementsPage() {
                                   {direction}
                                 </span>
                               </td>
-                              <td className="px-3 py-4">
-                                <div className="truncate text-xs font-bold text-[#1a1a1a]" title={mode}>
+                              <td className="px-3 py-4 align-top">
+                                <div className="whitespace-normal break-words text-xs font-bold leading-5 text-[#1a1a1a]" title={mode}>
                                   {mode || "-"}
                                 </div>
-                                <div className="mt-1 truncate text-xs font-semibold text-slate-400" title={reference}>
+                                <div className="mt-1 whitespace-normal text-xs font-semibold leading-5 text-slate-500 [overflow-wrap:anywhere]" title={reference}>
                                   {reference || "-"}
                                 </div>
                               </td>
@@ -4394,7 +6066,7 @@ export function BankStatementsPage() {
                               <td className="px-3 py-4 text-right text-xs font-bold text-emerald-700">
                                 {credit || "-"}
                               </td>
-                              <td className="px-3 py-4">
+                              <td className="px-3 py-4 align-top">
                                 {showLedgerSelect ? (
                                   <LedgerReviewSelect
                                     ledgerMasters={ledgerMasters}
@@ -4410,23 +6082,45 @@ export function BankStatementsPage() {
                                   />
                                 ) : (
                                   <div className="block max-w-full text-left">
-                                    <span className="block truncate text-sm font-bold text-[#1a1a1a]" title={transaction.selectedLedgerName}>
-                                      {transaction.selectedLedgerName}
+                                    <span className="block whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={ledgerDisplayName}>
+                                      {ledgerDisplayName}
                                     </span>
-                                    <span className="mt-1 block truncate text-xs font-semibold text-slate-400">
+                                    <span className="mt-1 block whitespace-normal break-words text-xs font-semibold leading-5 text-slate-500">
                                       {getLedgerGroupLabel(transaction, ledgerMasters)}
                                     </span>
                                   </div>
                                 )}
                               </td>
                               <td className="px-3 py-4">
-                                {outgoingPayment ? (
+                                {tallyPresence?.status === "found" ? (
+                                  <button
+                                    className="flex max-w-full flex-col gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
+                                    onClick={() => setOutgoingReviewTransactionId(transaction.id)}
+                                    title="View matching Tally voucher details"
+                                    type="button"
+                                  >
+                                    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
+                                      tallyPresence.duplicateInTally
+                                        ? "border-amber-250 bg-amber-50 text-amber-800"
+                                        : "border-emerald-250 bg-emerald-50 text-emerald-800"
+                                    }`}>
+                                      {tallyPresence.duplicateInTally ? "Already posted - duplicates" : "Already in Tally"}
+                                    </span>
+                                    <span className="truncate text-[10px] font-bold text-slate-400" title={tallyPresence.reason}>
+                                      {tallyPresence.duplicateInTally
+                                        ? `Tally vouchers ${tallyPresence.matches?.map((match) => match.voucherNumber).filter(Boolean).join(", ") || "need review"}`
+                                        : tallyPresence.voucherNumber
+                                          ? `Voucher ${tallyPresence.voucherNumber}`
+                                          : "Unique live match"}
+                                    </span>
+                                  </button>
+                                ) : outgoingPayment ? (
                                   <button
                                     className={`flex max-w-full flex-col gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition ${
-                                      statementReviewLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
+                                      statementReviewDrawerLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
                                     }`}
                                     onClick={() => {
-                                      if (!statementReviewLocked) setOutgoingReviewTransactionId(transaction.id);
+                                      if (!statementReviewDrawerLocked) setOutgoingReviewTransactionId(transaction.id);
                                     }}
                                     title="Review outgoing payment check"
                                     type="button"
@@ -4446,10 +6140,10 @@ export function BankStatementsPage() {
                                 ) : (
                                   <button
                                     className={`flex max-w-full flex-col gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition ${
-                                      statementReviewLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
+                                      statementReviewDrawerLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
                                     }`}
                                     onClick={() => {
-                                      if (!statementReviewLocked) setBillAllocationReviewTransactionId(transaction.id);
+                                      if (!statementReviewDrawerLocked) setBillAllocationReviewTransactionId(transaction.id);
                                     }}
                                     title="Review bill allocation"
                                     type="button"
@@ -4525,6 +6219,9 @@ export function BankStatementsPage() {
                   <div>
                     Showing {visibleReviewTransactions.length === 0 ? 0 : 1}-
                     {visibleReviewTransactions.length} of {filteredTransactions.length}
+                    {ignoredStatementRowCount > 0
+                      ? ` (${ignoredStatementRowCount} statement header/summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored)`
+                      : ""}
                   </div>
                 </div>
               </div>
@@ -4725,19 +6422,16 @@ export function BankStatementsPage() {
                                           <td className="px-4 py-3 font-bold text-[#1a1a1a]">{bill.referenceName}</td>
                                           <td className="px-4 py-3 text-right">{formatCurrencyAmount(bill.pendingAmount)}</td>
                                           <td className="px-4 py-3 text-right">
-                                            <input
-                                              className="h-8.5 w-32 rounded-xl border border-[#e5ddd0] bg-white px-3 text-right text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                                              min={0}
+                                            <CurrencyAmountInput
                                               max={bill.pendingAmount}
-                                              onChange={(event) =>
+                                              min={0}
+                                              onChange={(value) =>
                                                 updateManualBillAmount(
                                                   billAllocationReviewTransaction,
                                                   bill.referenceName,
-                                                  event.target.value
+                                                  value
                                                 )
                                               }
-                                              step="0.01"
-                                              type="number"
                                               value={currentAmount}
                                             />
                                           </td>
@@ -4749,14 +6443,11 @@ export function BankStatementsPage() {
                                     <td className="px-4 py-3 font-bold text-[#1a1a1a]">New Advance</td>
                                     <td className="px-4 py-3 text-right">-</td>
                                     <td className="px-4 py-3 text-right">
-                                      <input
-                                        className="h-8.5 w-32 rounded-xl border border-[#e5ddd0] bg-white px-3 text-right text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                                      <CurrencyAmountInput
                                         min={0}
-                                        onChange={(event) =>
-                                          updateManualAdvanceAmount(billAllocationReviewTransaction, event.target.value)
+                                        onChange={(value) =>
+                                          updateManualAdvanceAmount(billAllocationReviewTransaction, value)
                                         }
-                                        step="0.01"
-                                        type="number"
                                         value={billAllocationReviewDraft.newAdvanceAmount}
                                       />
                                     </td>
@@ -4800,6 +6491,18 @@ export function BankStatementsPage() {
                           ) : null}
                         </>
                       )}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#e5ddd0] bg-white px-5 py-4">
+                      <span className="text-xs font-semibold text-slate-500">
+                        Changes are saved automatically.
+                      </span>
+                      <Button
+                        className="bg-[#2d2d2d] text-white text-xs font-bold hover:bg-[#1a1a1a] shadow-sm transition-all rounded-xl h-10"
+                        onClick={() => setBillAllocationReviewTransactionId(null)}
+                        type="button"
+                      >
+                        Done
+                      </Button>
                     </div>
                   </aside>
                 </div>
@@ -4878,7 +6581,29 @@ export function BankStatementsPage() {
                       </div>
 
                       <section className={outgoingReviewDraft?.matches?.length ? "mt-5" : "hidden"}>
-                        <h3 className="text-sm font-bold text-[#1a1a1a]">Possible vouchers</h3>
+                        <div className="flex flex-wrap items-end justify-between gap-2">
+                          <div>
+                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                              Tally evidence
+                            </div>
+                            <h3 className="mt-1 text-sm font-bold text-[#1a1a1a]">
+                              {outgoingReviewDraft?.status === "found"
+                                ? outgoingReviewDraft.duplicateInTally
+                                  ? "Matching Tally vouchers"
+                                  : "Matched Tally voucher"
+                                : "Possible Tally vouchers"}
+                            </h3>
+                          </div>
+                          {outgoingReviewDraft?.status === "found" ? (
+                            <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${
+                              outgoingReviewDraft.duplicateInTally
+                                ? "border-amber-200 bg-amber-50 text-amber-800"
+                                : "border-emerald-200 bg-emerald-50 text-emerald-800"
+                            }`}>
+                              {outgoingReviewDraft.duplicateInTally ? "Posted with duplicates" : "Verified match"}
+                            </span>
+                          ) : null}
+                        </div>
                         <div className="mt-2 space-y-3">
                           {outgoingReviewDraft?.matches?.length ? (
                             outgoingReviewDraft.matches.map((match, index) => (
@@ -4889,7 +6614,11 @@ export function BankStatementsPage() {
                                 <div className="flex flex-wrap items-start justify-between gap-3">
                                   <div>
                                     <div className="text-sm font-bold text-[#1a1a1a]">
-                                      {match.voucherNumber || match.masterId || `Candidate ${index + 1}`}
+                                      {match.voucherNumber
+                                        ? `Voucher ${match.voucherNumber}`
+                                        : match.masterId
+                                          ? `Voucher ${match.masterId}`
+                                          : `Candidate ${index + 1}`}
                                     </div>
                                     <div className="mt-1 text-xs font-semibold text-slate-400">
                                       {[match.voucherType, match.date ? formatShortDate(match.date) : null, match.reference]
@@ -4949,9 +6678,37 @@ export function BankStatementsPage() {
               <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-[#e5ddd0] bg-white/95 px-4 py-4 shadow-[0_-8px_24px_rgba(0,0,0,0.04)] backdrop-blur sm:left-[224px] sm:px-8">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="space-y-1.5">
-                  <div className="text-xs font-bold text-slate-500">
-                    {incomingReceiptCount} receipt(s) to post, {outgoingPaymentCheckCount} payment check(s).
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-bold">
+                    <span className={newReceiptCount > 0 ? "text-blue-800" : "text-emerald-700"}>
+                    {matchingBills
+                      ? "Checking statement"
+                      : uncheckedTallyPresenceCount > 0
+                        ? "Tally check pending"
+                      : newReceiptCount > 0
+                        ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} ready to post`
+                        : "Nothing to post"}
+                    </span>
+                    {uncheckedTallyPresenceCount === 0 && statementReviewIssueCount > 0 ? (
+                      <span className="font-semibold text-amber-700">
+                        {statementReviewIssueCount} item{statementReviewIssueCount === 1 ? "" : "s"} need review
+                      </span>
+                    ) : null}
                   </div>
+                  {tallyBalanceProof ? (
+                    <div className={`text-[11px] font-semibold ${
+                      tallyBalanceProof.balancesMatch === true
+                        ? "text-emerald-700"
+                        : tallyBalanceProof.balancesMatch === false
+                          ? "text-amber-700"
+                          : "text-slate-400"
+                    }`}>
+                      {tallyBalanceProof.balancesMatch === true
+                        ? "Balance matched"
+                        : tallyBalanceProof.balancesMatch === false
+                          ? "Balance mismatch"
+                          : tallyBalanceProof.warning || "Balance not verified"}
+                    </div>
+                  ) : null}
                   {tallyPostingStatus ? (
                     <div
                       className="flex flex-wrap items-center gap-2 text-xs font-bold"
@@ -4960,15 +6717,20 @@ export function BankStatementsPage() {
                       aria-valuemax={tallyPostingStatus.total}
                       aria-valuenow={tallyPostingStatus.completed + tallyPostingStatus.failed + tallyPostingStatus.canceled}
                     >
-                      <span className="inline-flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-white px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600">
-                        {tallyPostingStatus.total} enqueued
-                      </span>
-                      <span className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-800">
-                        {tallyPostingStatus.waiting + tallyPostingStatus.sent} pending
-                      </span>
-                      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-250 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
-                        {tallyPostingStatus.completed} completed
-                      </span>
+                      {tallyPostingStatus.voucherTotal > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                          Receipt posting {tallyPostingStatus.voucherCompleted}/{tallyPostingStatus.voucherTotal}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-white px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                          No entries to create
+                        </span>
+                      )}
+                      {tallyPostingStatus.paymentCheckTotal > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-800">
+                          Payment checks {tallyPostingStatus.paymentCheckCompleted}/{tallyPostingStatus.paymentCheckTotal}
+                        </span>
+                      ) : null}
                       {(tallyPostingStatus.failed > 0 || tallyPostingStatus.canceled > 0) ? (
                         <span className="inline-flex items-center gap-1 rounded-full border border-red-250 bg-red-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-red-800">
                           {tallyPostingStatus.failed + tallyPostingStatus.canceled} failed
@@ -4977,7 +6739,9 @@ export function BankStatementsPage() {
                       {!tallyPostingStatus.finished ? (
                         <span className="inline-flex items-center gap-1 text-slate-400 text-xs font-semibold">
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          Working in Tally
+                          {tallyPostingStatus.voucherWaiting > 0
+                            ? "Creating receipt vouchers"
+                            : "Checking outgoing payments only"}
                         </span>
                       ) : null}
                       {tallyPostingStatus.errors[0] ? (
@@ -4991,7 +6755,7 @@ export function BankStatementsPage() {
                 <div className="flex flex-wrap gap-2">
                   <Button
                     className="border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all rounded-xl h-10 text-xs font-bold"
-                    onClick={clearStatementReview}
+                    onClick={() => clearStatementReview()}
                     disabled={sending || matchingBills || tallyPostingInProgress}
                     type="button"
                     variant="outline"
@@ -5007,29 +6771,56 @@ export function BankStatementsPage() {
                           sending ||
                           matchingBills ||
                           tallyPostingInProgress ||
-                          (pendingBillEligibleTransactions.length === 0 && outgoingPaymentCheckCount === 0)
+                          validTransactions.length === 0
                         }
                         type="button"
                         variant="outline"
                       >
                         {matchingBills ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                        Check Tally Matches ({pendingBillEligibleTransactions.length + outgoingPaymentCheckCount})
+                        Check Tally Matches ({validTransactions.length})
                       </Button>
-                      <Button
-                        className="bg-[#2d2d2d] text-white text-xs font-bold hover:bg-[#1a1a1a] shadow-sm transition-all rounded-xl h-10"
-                        onClick={sendToTally}
-                        disabled={
-                          sending ||
-                          matchingBills ||
-                          tallyPostingInProgress ||
-                          validTransactions.length === 0 ||
-                          blockingBillAllocationCount > 0 ||
-                          (!bankLedgerVerified && !bankLedgerManuallyConfirmed)
-                        }
-                      >
-                        {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
-                        {tallyPostingInProgress ? "Working In Tally" : "Send to Tally"}
-                      </Button>
+                      {missingOutgoingCount > 0 ? (
+                        <Button
+                          className="border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100 hover:text-blue-900 transition-all rounded-xl h-10 text-xs font-bold"
+                          onClick={() => sendToTally("check_payments")}
+                          disabled={
+                            sending ||
+                            matchingBills ||
+                            tallyPostingInProgress ||
+                            validTransactions.length === 0 ||
+                            pendingLedgerReviewCount > 0 ||
+                            uncheckedTallyPresenceCount > 0 ||
+                            ambiguousTallyPresenceCount > 0 ||
+                            (!bankLedgerVerified && !bankLedgerManuallyConfirmed)
+                          }
+                          type="button"
+                          variant="outline"
+                        >
+                          {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                          {checkPaymentsButtonLabel}
+                        </Button>
+                      ) : null}
+                      {newReceiptCount > 0 ? (
+                        <Button
+                          className="bg-[#2d2d2d] text-white text-xs font-bold hover:bg-[#1a1a1a] shadow-sm transition-all rounded-xl h-10"
+                          onClick={() => sendToTally("post_receipts")}
+                          disabled={
+                            sending ||
+                            matchingBills ||
+                            tallyPostingInProgress ||
+                            validTransactions.length === 0 ||
+                            blockingReceiptBillAllocationCount > 0 ||
+                            pendingLedgerReviewCount > 0 ||
+                            uncheckedTallyPresenceCount > 0 ||
+                            ambiguousTallyPresenceCount > 0 ||
+                            (!bankLedgerVerified && !bankLedgerManuallyConfirmed)
+                          }
+                          type="button"
+                        >
+                          {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                          {postReceiptsButtonLabel}
+                        </Button>
+                      ) : null}
                     </>
                   ) : null}
                 </div>
