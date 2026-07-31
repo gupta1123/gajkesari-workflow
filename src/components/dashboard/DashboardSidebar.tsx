@@ -69,7 +69,7 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
       {/* ── BRAND ── */}
       <div className={`${styles.brandRow} ${collapsed ? styles.collapsed : ""}`}>
         <div className={styles.brandLeft}>
-          <div className={styles.brandLogoMark}>P</div>
+          <div className={styles.brandLogoMark}>G</div>
           <span className={styles.brandTitle}>Gajkesari</span>
         </div>
         <button
