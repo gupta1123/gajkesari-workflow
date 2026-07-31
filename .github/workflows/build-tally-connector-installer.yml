@@ -58,10 +58,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "gajkesari-tally-connector-v0.1.0"
+          $tag = "gajkesari-tally-connector-v0.1.32"
           $installer = "installer\tally-bridge\output\GajkesariTallyConnectorSetup.exe"
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target $env:GITHUB_SHA --title "Gajkesari Tally Connector v0.1.0" --notes "Windows installer for the Gajkesari Tally Connector. Registers the gajkesari-tally protocol and installs separately under C:\Gajkesari\tally-bridge."
+            gh release create $tag --target $env:GITHUB_SHA --title "Gajkesari Tally Connector v0.1.32" --notes "Windows installer for the Gajkesari Tally Connector. Registers the gajkesari-tally protocol, installs separately under C:\Gajkesari\tally-bridge, and supports durable connector session control."
           }
           gh release upload $tag $installer --clobber

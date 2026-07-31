@@ -9,6 +9,7 @@ import {
   ChevronsUpDown,
   Settings,
   ChevronLeft,
+  PlugZap,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
@@ -22,11 +23,19 @@ const SIDEBAR_SECTIONS = [
       { href: "/bank-statements", label: "Bank Statement", icon: Landmark },
     ],
   },
+  {
+    id: "system",
+    title: "System",
+    items: [
+      { href: "/tally-prime?view=connection", label: "Tally Connector", icon: PlugZap },
+    ],
+  },
 ];
 
 function isActivePath(pathname: string, href: string) {
-  if (href === "/") return pathname === "/";
-  return pathname === href || pathname.startsWith(`${href}/`);
+  const hrefPath = href.split("?")[0];
+  if (hrefPath === "/") return pathname === "/";
+  return pathname === hrefPath || pathname.startsWith(`${hrefPath}/`);
 }
 
 interface UserInfo {
