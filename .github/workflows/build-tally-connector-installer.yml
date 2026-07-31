@@ -28,6 +28,7 @@ jobs:
           Push-Location $runtimeRoot
           npm init --yes
           npm install --save-exact electron@43.2.0
+          npx install-electron
           Pop-Location
           $electronDist = Join-Path $runtimeRoot "node_modules\electron\dist"
           if (-not (Test-Path (Join-Path $electronDist "electron.exe"))) {
