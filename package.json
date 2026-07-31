@@ -10,6 +10,8 @@
     "dev": "next dev --turbopack --port 3001",
     "build": "next build",
     "start": "next start",
+    "installer:tally-bridge": "node scripts/build-tally-connector-installer.mjs",
+    "installer:tally-bridge:validate": "node scripts/build-tally-connector-installer.mjs --validate",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

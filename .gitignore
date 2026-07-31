@@ -7,6 +7,11 @@
 /.next/
 /out/
 /build/
+installer/**/output/
+installer/**/payload/
+installer/**/payload-clean/
+installer/**/release/
+installer/**/.cache/
 
 # Local environment files
 .env*
