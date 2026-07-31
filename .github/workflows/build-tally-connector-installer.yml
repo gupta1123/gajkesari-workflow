@@ -24,8 +24,16 @@ jobs:
         shell: pwsh
         run: |
           $runtimeRoot = Join-Path $env:RUNNER_TEMP "gajkesari-electron-runtime"
-          npm install --prefix $runtimeRoot --no-save --no-package-lock electron@43.2.0
-          "GAJKESARI_CONNECTOR_RUNTIME=$runtimeRoot\node_modules\electron\dist" | Out-File -FilePath $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+          Push-Location $runtimeRoot
+          npm init --yes
+          npm install --save-exact electron@43.2.0
+          Pop-Location
+          $electronDist = Join-Path $runtimeRoot "node_modules\electron\dist"
+          if (-not (Test-Path (Join-Path $electronDist "electron.exe"))) {
+            throw "Electron runtime was not downloaded to $electronDist"
+          }
+          "GAJKESARI_CONNECTOR_RUNTIME=$electronDist" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Validate installer identity
         run: npm run installer:tally-bridge:validate
