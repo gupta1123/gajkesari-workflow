@@ -143,6 +143,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  position: relative;
   border-radius: 8px;
   padding: 0.5rem 0.55rem;
   text-decoration: none;
@@ -181,6 +182,21 @@
   display: none;
 }
 
+.sidebar.collapsed .navItem {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.sidebar.collapsed .navItemLeft {
+  justify-content: center;
+  width: 100%;
+  gap: 0;
+}
+
+.sidebar.collapsed .sectionGroup {
+  margin-bottom: 0.8rem;
+}
+
 /* Hover */
 .navItem:hover:not(.navItemActive) {
   background: #ede6d9;
@@ -196,25 +212,29 @@
 
 /* Active */
 .navItemActive {
-  background: #e8ddd0;
+  background: linear-gradient(90deg, rgba(34, 197, 94, 0.14), #e8ddd0 38%);
+  box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.12);
 }
 
 .navItemActive .navIcon {
-  color: #1a1a1a;
+  color: #15803d;
 }
 
 .navItemActive .navTitle {
   color: #1a1a1a;
-  font-weight: 600;
+  font-weight: 800;
 }
 
 /* Active indicator bar */
 .activeBar {
-  width: 3px;
-  height: 16px;
+  position: absolute;
+  left: 0.25rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 4px;
+  height: 22px;
   border-radius: 2px;
-  background-color: #22c55e;
-  flex-shrink: 0;
+  background-color: #16a34a;
 }
 
 /* =========================================
@@ -439,8 +459,31 @@
   flex-shrink: 0;
 }
 
+.sidebar.collapsed .userRow {
+  justify-content: center;
+  padding-inline: 0.5rem;
+}
+
+.sidebar.collapsed .userLeft {
+  justify-content: center;
+  width: 100%;
+  gap: 0;
+}
+
+.sidebar.collapsed .userInfo,
+.sidebar.collapsed .userChevron {
+  display: none;
+}
+
+.sidebar.collapsed .popover {
+  left: 0.75rem;
+  right: auto;
+  width: min(260px, calc(100vw - 5.25rem));
+}
+
 @media (max-width: 768px) {
-  .sidebar {
+  .sidebar,
+  .sidebar.collapsed {
     position: fixed;
     inset: auto 0 0 0;
     width: 100%;
@@ -522,6 +565,18 @@
     text-align: center;
   }
 
+  .sidebar.collapsed .navTitle {
+    display: block;
+  }
+
+  .sidebar.collapsed .navItem {
+    padding: 0.42rem 0.2rem;
+  }
+
+  .sidebar.collapsed .navItemLeft {
+    gap: 0.28rem;
+  }
+
   .navItemActive {
     background: #2d2d2d;
     box-shadow: 0 10px 20px rgba(45, 45, 45, 0.16);
@@ -545,5 +600,13 @@
   .mobileLogoutButton .navIcon,
   .mobileLogoutButton .navTitle {
     color: #9f3a2f;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .brandTitle,
+  .navTitle {
+    transition: none;
   }
 }

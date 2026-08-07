@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.32";
+const BRIDGE_VERSION = "0.1.41";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -17,6 +17,13 @@ const CONFIG_DIR = path.join(os.homedir(), ".gajkesari-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
 const MAX_NATIVE_DEBIT_NOTE_PDF_BYTES = 5 * 1024 * 1024;
+const MAX_PURCHASE_SOURCE_PDF_BYTES = 25 * 1024 * 1024;
+const PURCHASE_DOCUMENT_UDFS = {
+  path: { name: "GajkesariSourceDocumentPath", index: 30001 },
+  name: { name: "GajkesariSourceDocumentName", index: 30002 },
+  sha256: { name: "GajkesariSourceDocumentSha256", index: 30003 },
+  id: { name: "GajkesariSourceDocumentId", index: 30004 },
+};
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 
@@ -185,6 +192,13 @@ function getTagText(block, tagName) {
   return match ? cleanXmlText(match[1]) : null;
 }
 
+function getUdfTagText(block, tagName) {
+  const match = block.match(
+    new RegExp(`<(?:UDF:)?${tagName}\\b[^>]*>([\\s\\S]*?)<\\/(?:UDF:)?${tagName}>`, "i")
+  );
+  return match ? cleanXmlText(match[1]) : null;
+}
+
 function getTagTexts(block, tagName) {
   const matches = [...block.matchAll(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "gi"))];
   return matches.map((match) => cleanXmlText(match[1])).filter(Boolean);
@@ -219,7 +233,7 @@ function buildTallyReadinessXml(companyName) {
     "<VERSION>1</VERSION>",
     "<TALLYREQUEST>Export</TALLYREQUEST>",
     "<TYPE>Collection</TYPE>",
-    "<ID>Autodealer Ledgers Probe</ID>",
+    "<ID>Gajkesari Ledgers Probe</ID>",
     "</HEADER>",
     "<BODY>",
     "<DESC>",
@@ -229,7 +243,7 @@ function buildTallyReadinessXml(companyName) {
     "</STATICVARIABLES>",
     "<TDL>",
     "<TDLMESSAGE>",
-    '<COLLECTION NAME="Autodealer Ledgers Probe" ISMODIFY="No">',
+    '<COLLECTION NAME="Gajkesari Ledgers Probe" ISMODIFY="No">',
     "<TYPE>Ledger</TYPE>",
     "<FETCH>Name,Parent,GUID</FETCH>",
     "</COLLECTION>",
@@ -312,63 +326,6 @@ function buildLedgerBalanceExportXml({ companyName, ledgerName, dateFrom, dateTo
     "<FETCH>Name</FETCH>",
     "<FETCH>ClosingBalance</FETCH>",
     "</FETCHLIST>",
-    "</DESC>",
-    "</BODY>",
-    "</ENVELOPE>",
-  ].join("");
-}
-
-function buildBankLedgersExportXml(companyName) {
-  const companyVariable = companyName
-    ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
-    : "";
-  const nativeMethods = [
-    "Name",
-    "Parent",
-    "GUID",
-    "BankName",
-    "Bank",
-    "BankerName",
-    "BankAccountNumber",
-    "AccountNumber",
-    "BankAccountNo",
-    "BankAcNo",
-    "AcNumber",
-    "IFSCCODE",
-    "IFSCODE",
-    "IFSC",
-    "BankIFSCCODE",
-    "BranchName",
-    "BankBranchName",
-    "Branch",
-    "BankAccHolderName",
-    "BankAccountName",
-    "BankAccountHolderName",
-    "AccountHolderName",
-  ];
-
-  return [
-    "<ENVELOPE>",
-    "<HEADER>",
-    "<VERSION>1</VERSION>",
-    "<TALLYREQUEST>Export</TALLYREQUEST>",
-    "<TYPE>Collection</TYPE>",
-    "<ID>List of Ledgers</ID>",
-    "</HEADER>",
-    "<BODY>",
-    "<DESC>",
-    "<STATICVARIABLES>",
-    companyVariable,
-    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
-    "</STATICVARIABLES>",
-    "<TDL>",
-    "<TDLMESSAGE>",
-    '<COLLECTION NAME="List of Ledgers" ISMODIFY="Yes">',
-    "<ADD>CHILD OF : Bank Accounts</ADD>",
-    ...nativeMethods.map((method) => `<NATIVEMETHOD>${escapeXml(method)}</NATIVEMETHOD>`),
-    "</COLLECTION>",
-    "</TDLMESSAGE>",
-    "</TDL>",
     "</DESC>",
     "</BODY>",
     "</ENVELOPE>",
@@ -546,6 +503,9 @@ function buildDebitNoteXml(payload, fallbackCompanyName) {
 
 function toIsoLikeDate(value) {
   const raw = String(value || "").trim();
+  if (/^\d{8}$/.test(raw)) {
+    return raw;
+  }
   const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (match) {
     return `${match[1]}${match[2]}${match[3]}`;
@@ -628,10 +588,14 @@ function buildBillAllocationsXml({ allocations, isDebit }) {
       const amount = Number(allocation?.amount);
       if (!referenceName || !Number.isFinite(amount) || amount <= 0) return "";
       const signedAmount = isDebit ? `-${amount.toFixed(2)}` : amount.toFixed(2);
+      const billDate = allocation?.billDate
+        ? toIsoLikeDate(allocation.billDate)
+        : "";
       return [
         "<BILLALLOCATIONS.LIST>",
         `<NAME>${escapeXml(referenceName)}</NAME>`,
         `<BILLTYPE>${normalizeBillAllocationType(allocation?.referenceType)}</BILLTYPE>`,
+        billDate ? `<BILLDATE>${billDate}</BILLDATE>` : "",
         `<AMOUNT>${signedAmount}</AMOUNT>`,
         "</BILLALLOCATIONS.LIST>",
       ].join("");
@@ -646,10 +610,11 @@ function buildLedgerEntryXml({
   isPartyLedger = false,
   bankAllocation = null,
   billAllocations = null,
+  listTag = "ALLLEDGERENTRIES.LIST",
 }) {
   const signedAmount = isDebit ? `-${amount}` : amount;
   return [
-    "<ALLLEDGERENTRIES.LIST>",
+    `<${listTag}>`,
     `<LEDGERNAME>${escapeXml(ledgerName)}</LEDGERNAME>`,
     `<ISPARTYLEDGER>${isPartyLedger ? "Yes" : "No"}</ISPARTYLEDGER>`,
     "<REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>",
@@ -657,7 +622,7 @@ function buildLedgerEntryXml({
     `<AMOUNT>${signedAmount}</AMOUNT>`,
     billAllocations || "",
     bankAllocation || "",
-    "</ALLLEDGERENTRIES.LIST>",
+    `</${listTag}>`,
   ].join("");
 }
 
@@ -787,13 +752,41 @@ function buildCustomerAdvanceAdjustmentXml(payload, fallbackCompanyName) {
   });
 }
 
-function wrapVoucherMessagesXml({ companyName, voucherDate, messages, legacyHeader = false }) {
+function wrapVoucherMessagesXml({
+  companyName,
+  voucherDate,
+  messages,
+  legacyHeader = false,
+  legacyEnvelope = false,
+}) {
   const staticVariables = [
     companyName ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>` : "",
     `<SVFROMDATE>${voucherDate}</SVFROMDATE>`,
     `<SVTODATE>${voucherDate}</SVTODATE>`,
     `<SVCURRENTDATE>${voucherDate}</SVCURRENTDATE>`,
   ].filter(Boolean);
+  if (legacyEnvelope) {
+    return [
+      "<ENVELOPE>",
+      "<HEADER>",
+      "<VERSION>1</VERSION>",
+      "<TALLYREQUEST>Import</TALLYREQUEST>",
+      "<TYPE>Data</TYPE>",
+      "<ID>Vouchers</ID>",
+      "</HEADER>",
+      "<BODY>",
+      "<DESC>",
+      "<STATICVARIABLES>",
+      ...staticVariables,
+      "</STATICVARIABLES>",
+      "</DESC>",
+      "<DATA>",
+      ...messages,
+      "</DATA>",
+      "</BODY>",
+      "</ENVELOPE>",
+    ].join("");
+  }
   const header = legacyHeader
     ? [
         "<HEADER>",
@@ -924,6 +917,215 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
         partyLedgerName: voucherType === "Journal" ? null : partyLedgerName,
       }),
     ],
+  });
+}
+
+function toSignedMoney(value, label, options = {}) {
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
+  if (!Number.isFinite(parsed) || (!options.allowZero && parsed === 0)) {
+    throw new Error(`Purchase voucher command requires ${label}.`);
+  }
+  if (!options.allowNegative && parsed < 0) {
+    throw new Error(`Purchase voucher ${label} cannot be negative.`);
+  }
+  return parsed;
+}
+
+function buildPurchaseInventoryEntryXml(item) {
+  const stockItemName = String(item?.stockItemName || "").trim();
+  const purchaseLedgerName = String(item?.purchaseLedgerName || "").trim();
+  const description = String(item?.description || "").trim();
+  const hsn = String(item?.hsn || "").replace(/\D/g, "").slice(0, 8);
+  const unit = String(item?.unit || "").trim();
+  const quantity = toSignedMoney(item?.quantity, "a positive item quantity");
+  const rate = toSignedMoney(item?.rate, "a positive item rate");
+  const amount = toSignedMoney(item?.taxableAmount, "a positive item taxable amount");
+
+  if (!stockItemName || !purchaseLedgerName || !unit || !hsn) {
+    throw new Error("Purchase voucher items require stock item, purchase ledger, unit, and full HSN values.");
+  }
+
+  const formattedQuantity = `${quantity} ${unit}`;
+  const formattedRate = `${rate.toFixed(2)}/${unit}`;
+  const formattedAmount = amount.toFixed(2);
+  const godownName = String(item?.godownName || "Main Location").trim();
+  const batchName = String(item?.batchName || "Primary Batch").trim();
+
+  return [
+    "<ALLINVENTORYENTRIES.LIST>",
+    `<STOCKITEMNAME>${escapeXml(stockItemName)}</STOCKITEMNAME>`,
+    description ? `<DESCRIPTION>${escapeXml(description)}</DESCRIPTION>` : "",
+    "<GSTHSNINFERAPPLICABILITY>Specify Details Here</GSTHSNINFERAPPLICABILITY>",
+    `<GSTHSNNAME>${escapeXml(hsn)}</GSTHSNNAME>`,
+    description ? `<GSTHSNDESCRIPTION>${escapeXml(description)}</GSTHSNDESCRIPTION>` : "",
+    "<ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>",
+    `<RATE>${formattedRate}</RATE>`,
+    `<AMOUNT>-${formattedAmount}</AMOUNT>`,
+    `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
+    `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
+    "<BATCHALLOCATIONS.LIST>",
+    `<GODOWNNAME>${escapeXml(godownName)}</GODOWNNAME>`,
+    `<BATCHNAME>${escapeXml(batchName)}</BATCHNAME>`,
+    `<DESTINATIONGODOWNNAME>${escapeXml(godownName)}</DESTINATIONGODOWNNAME>`,
+    `<AMOUNT>-${formattedAmount}</AMOUNT>`,
+    `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
+    `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
+    "</BATCHALLOCATIONS.LIST>",
+    "<ACCOUNTINGALLOCATIONS.LIST>",
+    `<LEDGERNAME>${escapeXml(purchaseLedgerName)}</LEDGERNAME>`,
+    "<ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>",
+    `<AMOUNT>-${formattedAmount}</AMOUNT>`,
+    "</ACCOUNTINGALLOCATIONS.LIST>",
+    "</ALLINVENTORYENTRIES.LIST>",
+  ].join("");
+}
+
+function buildPurchaseDocumentUdfXml(payload) {
+  const values = [
+    [PURCHASE_DOCUMENT_UDFS.path, payload?.sourceDocumentPath],
+    [PURCHASE_DOCUMENT_UDFS.name, payload?.sourceDocumentName],
+    [PURCHASE_DOCUMENT_UDFS.sha256, payload?.sourceDocumentSha256],
+    [PURCHASE_DOCUMENT_UDFS.id, payload?.sourceDocumentId],
+  ];
+
+  if (values.every(([, value]) => !String(value || "").trim())) {
+    return "";
+  }
+  if (values.some(([, value]) => !String(value || "").trim())) {
+    throw new Error("Purchase source document metadata is incomplete.");
+  }
+
+  return values.map(([definition, value]) => {
+    const tag = definition.name.toUpperCase();
+    return [
+      `<UDF:${tag}.LIST DESC="'${definition.name}'" ISLIST="YES" TYPE="String" INDEX="${definition.index}">`,
+      `<UDF:${tag} DESC="'${definition.name}'">${escapeXml(String(value).trim())}</UDF:${tag}>`,
+      `</UDF:${tag}.LIST>`,
+    ].join("");
+  }).join("");
+}
+
+function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
+  const companyName = String(payload?.companyName || fallbackCompanyName || "").trim();
+  const voucherDate = toIsoLikeDate(payload?.voucherDate || payload?.supplierInvoiceDate);
+  const supplierInvoiceDate = toIsoLikeDate(payload?.supplierInvoiceDate);
+  const supplierInvoiceNumber = String(payload?.supplierInvoiceNumber || "").trim();
+  const supplierLedgerName = String(payload?.supplierLedgerName || "").trim();
+  const narration = [
+    String(payload?.narration || "").trim(),
+    payload?.vehicleNumber ? `Vehicle: ${String(payload.vehicleNumber).trim()}` : "",
+    payload?.sourceReferenceFallback && payload?.sourceDocumentReference
+      ? `Source: ${String(payload.sourceDocumentReference).trim()}`
+      : "",
+  ].filter(Boolean).join(" | ");
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  const charges = Array.isArray(payload?.charges) ? payload.charges : [];
+  const withholdings = Array.isArray(payload?.withholdings) ? payload.withholdings : [];
+  const ledgers = payload?.ledgers && typeof payload.ledgers === "object" ? payload.ledgers : {};
+  const finalPayable = toSignedMoney(payload?.finalPayableAmount, "a positive final payable amount");
+
+  if (!companyName || !supplierInvoiceNumber || !supplierLedgerName || items.length === 0) {
+    throw new Error("Purchase voucher command requires company, supplier invoice, supplier ledger, and item lines.");
+  }
+
+  const inventoryEntries = items.map(buildPurchaseInventoryEntryXml);
+  const ledgerEntries = [];
+  const debitCharges = charges.length > 0
+    ? charges
+    : ["cgst", "sgst", "igst", "tcs"].map((key) => ledgers[key]).filter(Boolean);
+  for (const ledger of debitCharges) {
+    if (!ledger) continue;
+    const name = String(ledger.name || "").trim();
+    const amount = toSignedMoney(ledger.amount, "purchase charge amount", { allowZero: true });
+    if (!name || amount === 0) continue;
+    ledgerEntries.push(buildLedgerEntryXml({
+      ledgerName: name,
+      amount: Math.abs(amount).toFixed(2),
+      isDebit: amount > 0,
+      listTag: "LEDGERENTRIES.LIST",
+    }));
+  }
+
+  const roundOff = ledgers.roundOff;
+  if (roundOff) {
+    const name = String(roundOff.name || "").trim();
+    const amount = toSignedMoney(roundOff.amount, "round-off amount", {
+      allowZero: true,
+      allowNegative: true,
+    });
+    if (name && amount !== 0) {
+      ledgerEntries.push(buildLedgerEntryXml({
+        ledgerName: name,
+        amount: Math.abs(amount).toFixed(2),
+        isDebit: amount > 0,
+        listTag: "LEDGERENTRIES.LIST",
+      }));
+    }
+  }
+
+  const deductionEntries = withholdings.length > 0
+    ? withholdings
+    : ledgers.tds ? [ledgers.tds] : [];
+  for (const deduction of deductionEntries) {
+    const name = String(deduction?.name || "").trim();
+    const amount = toSignedMoney(deduction?.amount, "withholding amount", { allowZero: true });
+    if (name && amount > 0) {
+      ledgerEntries.push(buildLedgerEntryXml({
+        ledgerName: name,
+        amount: amount.toFixed(2),
+        isDebit: false,
+        listTag: "LEDGERENTRIES.LIST",
+      }));
+    }
+  }
+
+  ledgerEntries.push(buildLedgerEntryXml({
+    ledgerName: supplierLedgerName,
+    amount: finalPayable.toFixed(2),
+    isDebit: false,
+    isPartyLedger: true,
+    listTag: "LEDGERENTRIES.LIST",
+    billAllocations: buildBillAllocationsXml({
+      allocations: [{
+        referenceType: "New Ref",
+        referenceName: supplierInvoiceNumber,
+        // Tally tracks a New Ref from the voucher date. The supplier's own
+        // invoice date remains independently preserved in REFERENCE DATE.
+        billDate: voucherDate,
+        amount: finalPayable,
+      }],
+      isDebit: false,
+    }),
+  }));
+
+  const message = [
+    '<TALLYMESSAGE xmlns:UDF="TallyUDF">',
+    '<VOUCHER VCHTYPE="Purchase" ACTION="Create" OBJVIEW="Invoice Voucher View">',
+    `<DATE>${voucherDate}</DATE>`,
+    `<EFFECTIVEDATE>${voucherDate}</EFFECTIVEDATE>`,
+    "<VOUCHERTYPENAME>Purchase</VOUCHERTYPENAME>",
+    `<REFERENCE>${escapeXml(supplierInvoiceNumber)}</REFERENCE>`,
+    `<REFERENCEDATE>${supplierInvoiceDate}</REFERENCEDATE>`,
+    `<PARTYLEDGERNAME>${escapeXml(supplierLedgerName)}</PARTYLEDGERNAME>`,
+    `<BASICBASEPARTYNAME>${escapeXml(supplierLedgerName)}</BASICBASEPARTYNAME>`,
+    "<PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>",
+    "<VCHENTRYMODE>Item Invoice</VCHENTRYMODE>",
+    "<ISINVOICE>Yes</ISINVOICE>",
+    "<ISOPTIONAL>No</ISOPTIONAL>",
+    "<DIFFACTUALQTY>No</DIFFACTUALQTY>",
+    `<NARRATION>${escapeXml(narration)}</NARRATION>`,
+    ...inventoryEntries,
+    ...ledgerEntries,
+    buildPurchaseDocumentUdfXml(payload),
+    "</VOUCHER>",
+    "</TALLYMESSAGE>",
+  ].join("");
+
+  return wrapVoucherMessagesXml({
+    companyName,
+    voucherDate,
+    messages: [message],
+    legacyEnvelope: true,
   });
 }
 
@@ -1094,7 +1296,7 @@ async function fetchAvailableCompanies(tallyUrl, activeCompanyName = null) {
 
   try {
     const xml = await exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Available Companies",
+      collectionName: "Gajkesari Available Companies",
       tallyType: "Company",
       fetchFields: "Name,Guid,StartingFrom,BooksFrom,FinancialYearFrom,CurrentPeriod,AlterID,MasterID",
       companyName: null,
@@ -1150,7 +1352,7 @@ function mergeCompanyNames(values) {
 
 function tallyDataRoots() {
   return mergeCompanyNames([
-    process.env.KALIKA_TALLY_DATA_ROOT,
+    process.env.GAJKESARI_TALLY_DATA_ROOT,
     process.env.TALLY_DATA_ROOT,
     process.env.TALLY_DATA_PATH,
     DEFAULT_TALLY_DATA_ROOT,
@@ -1221,14 +1423,26 @@ function parseTallyImportResult(text, httpStatus) {
   const errorsText = text.match(/<ERRORS[^>]*>([^<]+)<\/ERRORS>/i)?.[1]?.trim() ?? null;
   const alteredText = text.match(/<ALTERED[^>]*>([^<]+)<\/ALTERED>/i)?.[1]?.trim() ?? null;
   const createdText = text.match(/<CREATED[^>]*>([^<]+)<\/CREATED>/i)?.[1]?.trim() ?? null;
+  const ignoredText = text.match(/<IGNORED[^>]*>([^<]+)<\/IGNORED>/i)?.[1]?.trim() ?? null;
+  const cancelledText = text.match(/<CANCELLED[^>]*>([^<]+)<\/CANCELLED>/i)?.[1]?.trim() ?? null;
+  const exceptionsText = text.match(/<EXCEPTIONS[^>]*>([^<]+)<\/EXCEPTIONS>/i)?.[1]?.trim() ?? null;
   const lastVchId = getTagText(text, "LASTVCHID") || getTagText(text, "LASTVCHID.LIST");
   const errors = errorsText ? Number(errorsText) : null;
+  const exceptions = exceptionsText ? Number(exceptionsText) : null;
   const responseError =
     lineError ||
-    (statusText === "0" && dataText ? dataText.replace(/\s+/g, " ").trim() : null);
+    (statusText === "0" && dataText ? dataText.replace(/\s+/g, " ").trim() : null) ||
+    (Number(exceptions ?? 0) > 0
+      ? `Tally reported ${exceptions} import exception${exceptions === 1 ? "" : "s"}.`
+      : null);
 
   return {
-    success: httpStatus >= 200 && httpStatus < 300 && !responseError && (errors === null || errors === 0),
+    success:
+      httpStatus >= 200 &&
+      httpStatus < 300 &&
+      !responseError &&
+      (errors === null || errors === 0) &&
+      (exceptions === null || exceptions === 0),
     error: responseError,
     result: {
       httpStatus,
@@ -1236,6 +1450,9 @@ function parseTallyImportResult(text, httpStatus) {
       created: createdText ? Number(createdText) : null,
       lastVchId,
       errors,
+      exceptions,
+      ignored: ignoredText ? Number(ignoredText) : null,
+      cancelled: cancelledText ? Number(cancelledText) : null,
       response: text.slice(0, 4000),
     },
   };
@@ -1253,6 +1470,251 @@ function requireCreatedVoucher(outcome) {
     ...outcome,
     success: false,
     error: `Tally accepted the voucher import request but did not report a created voucher. CREATED=${created}, ALTERED=${altered}.`,
+  };
+}
+
+function purchaseVoucherReadbackComparison(voucher, payload) {
+  const differences = [];
+  const expectedItems = Array.isArray(payload?.items) ? payload.items : [];
+  const actualItems = Array.isArray(voucher?.inventoryEntries) ? voucher.inventoryEntries : [];
+  const expectedPayable = Number(payload?.finalPayableAmount);
+  const partyEntry = (voucher?.ledgerEntries || []).find(
+    (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(payload?.supplierLedgerName)
+  );
+  const expectedAllocations = [
+    ...(Array.isArray(payload?.charges) ? payload.charges : []),
+    ...(Array.isArray(payload?.withholdings) ? payload.withholdings : []),
+  ].filter((entry) => entry?.name && Number(entry?.amount) !== 0);
+
+  if (expectedItems.length !== actualItems.length) {
+    differences.push(`Expected ${expectedItems.length} item line(s), Tally returned ${actualItems.length}.`);
+  }
+
+  expectedItems.forEach((expected, index) => {
+    const actual = actualItems[index];
+    if (!actual) return;
+    if (normalizeLooseName(actual.stockItemName) !== normalizeLooseName(expected.stockItemName)) {
+      differences.push(`Line ${index + 1} stock item differs.`);
+    }
+    if (String(actual.hsn || "").replace(/\D/g, "") !== String(expected.hsn || "").replace(/\D/g, "")) {
+      differences.push(`Line ${index + 1} HSN differs.`);
+    }
+    const expectedAmount = Number(expected.taxableAmount);
+    if (Number.isFinite(expectedAmount) && Math.abs(Number(actual.amount || 0) - expectedAmount) > 0.01) {
+      differences.push(`Line ${index + 1} taxable amount differs.`);
+    }
+    if (normalizeLooseName(actual.purchaseLedgerName) !== normalizeLooseName(expected.purchaseLedgerName)) {
+      differences.push(`Line ${index + 1} purchase ledger differs.`);
+    }
+  });
+
+  if (!partyEntry) {
+    differences.push("Supplier ledger allocation was not returned by Tally.");
+  } else if (Number.isFinite(expectedPayable) && Math.abs(Math.abs(Number(partyEntry.amount || 0)) - expectedPayable) > 0.01) {
+    differences.push("Final supplier payable differs.");
+  }
+
+  for (const expected of expectedAllocations) {
+    const actual = (voucher?.ledgerEntries || []).find(
+      (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(expected.name)
+    );
+    if (!actual) {
+      differences.push(`${expected.name} allocation was not returned by Tally.`);
+      continue;
+    }
+    if (Math.abs(Math.abs(Number(actual.amount || 0)) - Math.abs(Number(expected.amount || 0))) > 0.01) {
+      differences.push(`${expected.name} amount differs.`);
+    }
+  }
+
+  if (
+    normalizeTallyDate(voucher?.date) !== normalizeTallyDate(payload?.voucherDate)
+  ) {
+    differences.push("Tally voucher date differs.");
+  }
+  if (
+    normalizeTallyDate(voucher?.referenceDate) !==
+    normalizeTallyDate(payload?.supplierInvoiceDate)
+  ) {
+    differences.push("Supplier invoice date differs.");
+  }
+  const supplierBillAllocation = (voucher?.billAllocations || []).find(
+    (allocation) =>
+      normalizeLooseName(allocation.referenceName) ===
+      normalizeLooseName(payload?.supplierInvoiceNumber)
+  );
+  if (!supplierBillAllocation) {
+    differences.push("Supplier invoice bill reference was not returned by Tally.");
+  } else {
+    if (
+      supplierBillAllocation.billDate &&
+      normalizeTallyDate(supplierBillAllocation.billDate) !==
+      normalizeTallyDate(payload?.voucherDate)
+    ) {
+      differences.push("Supplier outstanding bill date differs from the Tally voucher date.");
+    }
+    if (
+      Number.isFinite(expectedPayable) &&
+      Math.abs(Number(supplierBillAllocation.amount || 0) - expectedPayable) > 0.01
+    ) {
+      differences.push("Supplier outstanding bill amount differs.");
+    }
+  }
+  if (payload?.sourceDocumentPath) {
+    const expectedDocument = {
+      path: String(payload.sourceDocumentPath).trim(),
+      name: String(payload.sourceDocumentName || "").trim(),
+      sha256: String(payload.sourceDocumentSha256 || "").trim().toUpperCase(),
+      id: String(payload.sourceDocumentId || "").trim(),
+    };
+    const actualDocument = {
+      path: String(voucher?.sourceDocumentPath || "").trim(),
+      name: String(voucher?.sourceDocumentName || "").trim(),
+      sha256: String(voucher?.sourceDocumentSha256 || "").trim().toUpperCase(),
+      id: String(voucher?.sourceDocumentId || "").trim(),
+    };
+    if (!actualDocument.path || actualDocument.path.toLowerCase() !== expectedDocument.path.toLowerCase()) {
+      differences.push("Original invoice PDF path was not attached to the Tally voucher.");
+    }
+    if (!actualDocument.name || actualDocument.name !== expectedDocument.name) {
+      differences.push("Original invoice PDF name differs.");
+    }
+    if (!actualDocument.sha256 || actualDocument.sha256 !== expectedDocument.sha256) {
+      differences.push("Original invoice PDF checksum differs.");
+    }
+    if (!actualDocument.id || actualDocument.id !== expectedDocument.id) {
+      differences.push("Original invoice document identity differs.");
+    }
+  }
+
+  return differences;
+}
+
+async function verifyPurchaseVoucherInTally(config, payload = {}) {
+  const companyName = payload?.companyName || config?.companyName || null;
+  const tallyUrl = normalizeTallyUrl(payload?.tallyUrl || config?.tallyUrl);
+  const voucherDate = payload?.voucherDate || payload?.supplierInvoiceDate;
+  const supplierInvoiceNumber = String(payload?.supplierInvoiceNumber || "").trim();
+  const supplierLedgerName = String(payload?.supplierLedgerName || "").trim();
+
+  if (!companyName || !voucherDate || !supplierInvoiceNumber || !supplierLedgerName) {
+    throw new Error("Purchase voucher verification requires company, date, invoice number, and supplier ledger.");
+  }
+
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Gajkesari Purchase Voucher Verification",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,ReferenceDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,Narration,GajkesariSourceDocumentPath,GajkesariSourceDocumentName,GajkesariSourceDocumentSha256,GajkesariSourceDocumentId,AllLedgerEntries.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount,AllInventoryEntries.*",
+    companyName,
+    dateFrom: voucherDate,
+    dateTo: voucherDate,
+  });
+  const candidates = parseVoucherCollection(xml).filter((voucher) =>
+    /purchase/i.test(String(voucher.voucherType || "")) &&
+    normalizeLooseName(voucher.reference) === normalizeLooseName(supplierInvoiceNumber) &&
+    normalizeLooseName(voucher.partyLedgerName) === normalizeLooseName(supplierLedgerName)
+  );
+
+  if (candidates.length === 0) {
+    return {
+      success: true,
+      result: {
+        verificationStatus: "missing",
+        supplierInvoiceNumber,
+        supplierLedgerName,
+        candidates: [],
+      },
+    };
+  }
+
+  if (candidates.length > 1) {
+    return {
+      success: true,
+      result: {
+        verificationStatus: "ambiguous",
+        supplierInvoiceNumber,
+        supplierLedgerName,
+        candidates: candidates.slice(0, 10),
+      },
+    };
+  }
+
+  const voucher = candidates[0];
+  const differences = purchaseVoucherReadbackComparison(voucher, payload);
+  return {
+    success: true,
+    result: {
+      verificationStatus: differences.length === 0 ? "verified" : "mismatch",
+      differences,
+      voucherId: voucher.masterId || voucher.voucherNumber || null,
+      masterId: voucher.masterId || null,
+      voucherNumber: voucher.voucherNumber || null,
+      guid: voucher.guid || null,
+      voucherDate: normalizeTallyDate(voucher.date),
+      supplierInvoiceNumber,
+      supplierLedgerName,
+      voucher,
+    },
+  };
+}
+
+async function postPurchaseVoucher(tallyUrl, payload, companyName) {
+  const preflight = await verifyPurchaseVoucherInTally({ tallyUrl, companyName }, payload);
+  if (preflight.result?.verificationStatus === "verified") {
+    return {
+      outcome: {
+        success: true,
+        result: {
+          ...preflight.result,
+          alreadyInTally: true,
+          created: 0,
+          altered: 0,
+        },
+      },
+      xml: null,
+    };
+  }
+  if (["ambiguous", "mismatch"].includes(preflight.result?.verificationStatus)) {
+    return {
+      outcome: {
+        success: false,
+        error: "An existing purchase voucher with this supplier invoice needs review before posting.",
+        result: {
+          possibleDuplicateInTally: true,
+          verification: preflight.result,
+        },
+      },
+      xml: null,
+    };
+  }
+
+  const xml = buildPurchaseVoucherXml(payload, companyName);
+  const importOutcome = requireCreatedVoucher(await invokeTallyXml(tallyUrl, xml));
+  if (!importOutcome.success) return { outcome: importOutcome, xml };
+
+  const readback = await verifyPurchaseVoucherInTally({ tallyUrl, companyName }, payload);
+  const verified = readback.result?.verificationStatus === "verified";
+  return {
+    outcome: verified
+      ? {
+          success: true,
+          result: {
+            ...(importOutcome.result || {}),
+            ...readback.result,
+            verification: readback.result,
+          },
+        }
+      : {
+          success: false,
+          error: "Tally created the Purchase voucher, but read-back verification did not match the approved preview.",
+          result: {
+            ...(importOutcome.result || {}),
+            voucherCreatedButVerificationFailed: true,
+            verification: readback.result,
+          },
+        },
+    xml,
   };
 }
 
@@ -1410,6 +1872,12 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
 function toMaster(block, tagName) {
   const name = getAttribute(block, "NAME") || getTagText(block, "NAME");
   if (!name) return null;
+  const optionalMasterValue = (value) => {
+    const normalized = cleanXmlText(value);
+    return !normalized || /^(?:not\s+found|not\s+available|n\/?a|none|null|undefined|-+)$/i.test(normalized)
+      ? null
+      : normalized;
+  };
 
   const bankName =
     getTagText(block, "BANKNAME") ||
@@ -1468,7 +1936,12 @@ function toMaster(block, tagName) {
     name,
     guid: getTagText(block, "GUID"),
     parent: getTagText(block, "PARENT"),
-    gstin: getTagText(block, "PARTYGSTIN"),
+    gstin: optionalMasterValue(
+      getTagText(block, "PARTYGSTIN") ||
+      getTagText(block, "GSTIN") ||
+      getTagText(block, "GSTREGISTRATIONNUMBER") ||
+      getTagText(block, "GSTREGNUMBER")
+    ),
     bankName,
     bankAccountNumber,
     ifscCode,
@@ -1478,9 +1951,9 @@ function toMaster(block, tagName) {
     phone,
     contactPerson,
     address,
-    hsnCode: getTagText(block, "GSTHSNCODE") || getTagText(block, "HSNCODE"),
-    unitName: getTagText(block, "BASEUNITS") || getTagText(block, "ORIGINALBASEUNITS"),
-    taxRate,
+    hsnCode: optionalMasterValue(getTagText(block, "GSTHSNCODE") || getTagText(block, "HSNCODE")),
+    unitName: optionalMasterValue(getTagText(block, "BASEUNITS") || getTagText(block, "ORIGINALBASEUNITS")),
+    taxRate: optionalMasterValue(taxRate),
     raw: {
       tallyTag: tagName,
       reservedName: getAttribute(block, "RESERVEDNAME"),
@@ -1496,6 +1969,8 @@ function toMaster(block, tagName) {
       phone,
       contactPerson,
       address,
+      stateName: getTagText(block, "STATENAME") || getTagText(block, "STATE"),
+      countryName: getTagText(block, "COUNTRYNAME") || getTagText(block, "COUNTRY"),
     },
   };
 }
@@ -1538,6 +2013,33 @@ function toVoucher(block) {
       getTagText(entry, "NAME"),
     ])
     .filter(Boolean);
+  const inventoryEntries = extractBlocks(block, "ALLINVENTORYENTRIES.LIST")
+    .map((entry) => ({
+      stockItemName: getTagText(entry, "STOCKITEMNAME"),
+      description: getTagText(entry, "DESCRIPTION"),
+      hsn:
+        getTagText(entry, "HSNOVRDNCLASSIFICATION") ||
+        getTagText(entry, "GSTHSNNAME") ||
+        getTagText(entry, "GSTOVRDNHSNCODE") ||
+        getTagText(entry, "GSTHSNCODE") ||
+        getTagText(entry, "HSNCODE"),
+      quantity: getTagText(entry, "BILLEDQTY") || getTagText(entry, "ACTUALQTY"),
+      rate: getTagText(entry, "RATE"),
+      amount: Math.abs(parseTallyAmount(getTagText(entry, "AMOUNT")) ?? 0),
+      purchaseLedgerName:
+        extractBlocks(entry, "ACCOUNTINGALLOCATIONS.LIST")
+          .map((allocation) => getTagText(allocation, "LEDGERNAME"))
+          .find(Boolean) || null,
+    }))
+    .filter((entry) => entry.stockItemName);
+  const billAllocations = extractBlocks(block, "BILLALLOCATIONS.LIST")
+    .map((allocation) => ({
+      referenceName: getTagText(allocation, "NAME"),
+      billType: getTagText(allocation, "BILLTYPE") || getTagText(allocation, "TYPEOFREF"),
+      billDate: getTagText(allocation, "BILLDATE"),
+      amount: Math.abs(parseTallyAmount(getTagText(allocation, "AMOUNT")) ?? 0),
+    }))
+    .filter((allocation) => allocation.referenceName && allocation.amount > 0);
 
   return {
     date: getTagText(block, "DATE"),
@@ -1545,15 +2047,22 @@ function toVoucher(block) {
     voucherType: getTagText(block, "VOUCHERTYPENAME") || getAttribute(block, "VCHTYPE"),
     voucherNumber: getTagText(block, "VOUCHERNUMBER"),
     reference: getTagText(block, "REFERENCE"),
+    referenceDate: getTagText(block, "REFERENCEDATE"),
     narration: getTagText(block, "NARRATION"),
     partyLedgerName: getTagText(block, "PARTYLEDGERNAME"),
     ledgerNames,
     ledgerEntries,
     bankReferences,
+    billAllocations,
+    inventoryEntries,
     masterId: getTagText(block, "MASTERID"),
     alterId: getTagText(block, "ALTERID"),
     guid: getTagText(block, "GUID"),
     isCancelled: getTagText(block, "ISCANCELLED"),
+    sourceDocumentPath: getUdfTagText(block, "GAJKESARISOURCEDOCUMENTPATH"),
+    sourceDocumentName: getUdfTagText(block, "GAJKESARISOURCEDOCUMENTNAME"),
+    sourceDocumentSha256: getUdfTagText(block, "GAJKESARISOURCEDOCUMENTSHA256"),
+    sourceDocumentId: getUdfTagText(block, "GAJKESARISOURCEDOCUMENTID"),
     rawPreview: previewXml(block),
   };
 }
@@ -1864,23 +2373,6 @@ function voucherHasLedger(voucher, ledgerName) {
   ].some((name) => normalizeLooseName(name) === key);
 }
 
-function uniqueNormalizedLedgerNames(values) {
-  return new Set(
-    (Array.isArray(values) ? values : [])
-      .map((value) => normalizeLooseName(value))
-      .filter(Boolean)
-  );
-}
-
-function relevantBankVoucher(voucher, bankLedgerName, relevantLedgerNames = new Set()) {
-  if (!voucherHasLedger(voucher, bankLedgerName)) return false;
-  if (relevantLedgerNames.size === 0) return true;
-  return [
-    voucher.partyLedgerName,
-    ...voucher.ledgerNames,
-  ].some((ledgerName) => relevantLedgerNames.has(normalizeLooseName(ledgerName)));
-}
-
 function voucherHasLedgerAmount(voucher, ledgerName, amount) {
   const key = normalizeLooseName(ledgerName);
   if (!key) return false;
@@ -2002,15 +2494,32 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
   });
 
   const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
-  let candidates = hasUsableReference
-    ? baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber))
-    : baseCandidates;
-  const partyMatches = counterpartyLedgerName
-    ? candidates.filter(({ voucher }) => voucherHasLedger(voucher, counterpartyLedgerName))
-    : [];
-  if (candidates.length > 1 && partyMatches.length === 1) candidates = partyMatches;
+  const counterpartyKey = normalizeLooseName(counterpartyLedgerName);
+  const hasUsableCounterparty = Boolean(counterpartyKey && !counterpartyKey.includes("suspense"));
+  const identityInsufficient = !hasUsableReference && !hasUsableCounterparty;
+  let candidates;
+  if (hasUsableReference) {
+    // An exact usable bank reference is independent transaction identity. Party
+    // mismatch must not hide a voucher when the selected ledger was wrong.
+    candidates = baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber));
+  } else if (hasUsableCounterparty) {
+    // Without a bank reference, the exact selected counterparty is mandatory.
+    // Same-date and same-amount vouchers belonging to another ledger are not a
+    // match and must remain missing.
+    candidates = baseCandidates.filter(({ voucher }) => voucherHasLedger(voucher, counterpartyLedgerName));
+  } else {
+    // Keep same-date/amount candidates only so the caller can report ambiguity;
+    // one such voucher is never sufficient without a reference or party.
+    candidates = baseCandidates;
+  }
 
-  return { candidates, baseCandidateCount: baseCandidates.length, hasUsableReference };
+  return {
+    candidates,
+    baseCandidateCount: baseCandidates.length,
+    hasUsableReference,
+    hasUsableCounterparty,
+    identityInsufficient,
+  };
 }
 
 function serializeStrictVoucherMatch(candidate) {
@@ -2061,19 +2570,18 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     dateFrom,
     dateTo,
   });
-  const relevantLedgerNames = uniqueNormalizedLedgerNames([
-    bankLedgerName,
-    ...(commandPayload.relevantLedgerNames || []),
-  ]);
-  const exportedVouchers = parseVoucherCollection(xml).filter(
+  const vouchers = parseVoucherCollection(xml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
-  );
-  const vouchers = exportedVouchers.filter((voucher) =>
-    relevantBankVoucher(voucher, bankLedgerName, relevantLedgerNames)
   );
   const reservedVoucherIndexes = new Set();
   const results = normalizedTransactions.map((transaction) => {
-    const { candidates, baseCandidateCount, hasUsableReference } = strictBankTransactionCandidates(
+    const {
+      candidates,
+      baseCandidateCount,
+      hasUsableReference,
+      hasUsableCounterparty,
+      identityInsufficient,
+    } = strictBankTransactionCandidates(
       vouchers,
       transaction,
       bankLedgerName,
@@ -2084,7 +2592,9 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     // row is unquestionably already posted; the extra vouchers are a Tally data
     // quality issue, not a reason to post the bank row again.
     const duplicateInTally = hasUsableReference && candidates.length > 1;
-    const verificationStatus = candidates.length === 1 || duplicateInTally
+    const verificationStatus = identityInsufficient && candidates.length > 0
+      ? "ambiguous"
+      : candidates.length === 1 || duplicateInTally
       ? "found"
       : candidates.length > 1
         ? "ambiguous"
@@ -2111,8 +2621,12 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
         ? `${candidates.length} Tally vouchers have the same strict bank transaction reference. The statement row is already posted; review the duplicate Tally vouchers separately.`
         : verificationStatus === "found"
           ? "A unique Tally voucher matched the date, bank ledger, amount, direction and available reference."
+        : identityInsufficient && verificationStatus === "ambiguous"
+          ? "A same-date and same-amount voucher exists, but no usable bank reference or exact counterparty ledger proves it is this statement row. Review manually."
         : verificationStatus === "ambiguous"
           ? "More than one same-date and same-amount voucher matched, but no reliable bank reference identifies one transaction. Review manually."
+          : !hasUsableReference && hasUsableCounterparty && baseCandidateCount > 0
+            ? "Date, amount and direction matched, but the exact selected counterparty ledger did not."
           : hasUsableReference && baseCandidateCount > 0
             ? "Date, amount and direction matched, but the exact UTR/reference did not."
             : "No unused Tally voucher matched the date, selected bank ledger, amount and direction.",
@@ -2157,8 +2671,6 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
       dateFrom,
       dateTo,
       bankLedgerName,
-      exportedVoucherCount: exportedVouchers.length,
-      relevantLedgerCount: relevantLedgerNames.size,
       scannedCount: vouchers.length,
       transactions: results,
       balanceProof: {
@@ -2253,7 +2765,7 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
   }
 
   const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Autodealer Bank Payment Verification",
+    collectionName: "Gajkesari Bank Payment Verification",
     tallyType: "Voucher",
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
@@ -2261,16 +2773,8 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     dateFrom: voucherDate,
     dateTo: voucherDate,
   });
-  const exportedVouchers = parseVoucherCollection(xml).filter(
+  const vouchers = parseVoucherCollection(xml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
-  );
-  const relevantLedgerNames = uniqueNormalizedLedgerNames([
-    bankLedgerName,
-    commandPayload.counterpartyLedgerName,
-    commandPayload.matchedLedgerName,
-  ]);
-  const vouchers = exportedVouchers.filter((voucher) =>
-    relevantBankVoucher(voucher, bankLedgerName, relevantLedgerNames)
   );
   const strictResult = strictBankTransactionCandidates(
     vouchers,
@@ -2280,7 +2784,9 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
   );
   const strictMatches = strictResult.candidates;
   const duplicateInTally = strictResult.hasUsableReference && strictMatches.length > 1;
-  const verificationStatus = strictMatches.length === 0
+  const verificationStatus = strictResult.identityInsufficient && strictMatches.length > 0
+    ? "ambiguous"
+    : strictMatches.length === 0
     ? "missing"
     : strictMatches.length === 1 || duplicateInTally
       ? "found"
@@ -2291,7 +2797,6 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     success: true,
     result: {
       verificationStatus,
-      exportedVoucherCount: exportedVouchers.length,
       scannedCount: vouchers.length,
       matchCount: strictMatches.length,
       duplicateInTally,
@@ -2307,8 +2812,12 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
           ? `${strictMatches.length} Tally vouchers have the same strict bank transaction reference. The bank row is already posted; review the duplicate Tally vouchers separately.`
           : verificationStatus === "found"
             ? "Found a unique strict match in Tally."
+          : strictResult.identityInsufficient && verificationStatus === "ambiguous"
+            ? "A same-date and same-amount voucher exists, but no usable bank reference or exact counterparty ledger proves it is this bank row. Review manually."
           : verificationStatus === "ambiguous"
             ? "More than one same-date and same-amount voucher matched, but no reliable bank reference identifies one transaction. Review manually."
+            : !strictResult.hasUsableReference && strictResult.hasUsableCounterparty && strictResult.baseCandidateCount > 0
+              ? "Date, amount and direction matched, but the exact selected counterparty ledger did not."
             : strictResult.hasUsableReference && strictResult.baseCandidateCount > 0
               ? "Date, amount and direction matched, but the exact UTR/reference did not."
               : "No matching Tally voucher found for this bank transaction.",
@@ -2390,7 +2899,29 @@ function emptyOpenBillBucket(ledgerName) {
   };
 }
 
-function toOpenBill(block, ledgerName) {
+function classifyOpenBillReferenceKind({
+  billType,
+  sourceVoucherType,
+  referenceName,
+  knownInvoice = false,
+  knownAdvance = false,
+} = {}) {
+  const type = String(billType || "").toLowerCase();
+  if (type.includes("advance")) return "advance";
+  if (knownInvoice) return "bill";
+  if (knownAdvance) return "advance";
+
+  // Some Tally Bill collection exports omit BillType for receipt advances.
+  // ADV-prefixed references are a controlled fallback only when no Sales
+  // invoice with that reference was found.
+  const looksLikeAdvanceReference = /^(?:adv|advance)(?:[-/\s]|\d)/i.test(String(referenceName || "").trim());
+  if (looksLikeAdvanceReference && (/receipt/i.test(String(sourceVoucherType || "")) || !sourceVoucherType)) {
+    return "advance";
+  }
+  return "bill";
+}
+
+function toOpenBill(block, ledgerName, evidence = {}) {
   const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
   if (!referenceName) return null;
   const rowLedgerName = billLedgerName(block);
@@ -2404,7 +2935,14 @@ function toOpenBill(block, ledgerName) {
   const pendingAmount = Math.abs(closing ?? 0);
   if (pendingAmount <= 0) return null;
 
-  const type = billReferenceType(block).toLowerCase();
+  const sourceVoucherType = getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null;
+  const kind = classifyOpenBillReferenceKind({
+    billType: billReferenceType(block),
+    sourceVoucherType,
+    referenceName,
+    knownInvoice: evidence.knownInvoice === true,
+    knownAdvance: evidence.knownAdvance === true,
+  });
   const common = {
     referenceName,
     voucherNumber: getTagText(block, "VOUCHERNUMBER") || referenceName,
@@ -2413,11 +2951,11 @@ function toOpenBill(block, ledgerName) {
     originalAmount: Math.abs(parseTallyAmount(getTagText(block, "OPENINGBALANCE")) ?? pendingAmount),
     settledAmount: null,
     pendingAmount,
-    sourceVoucherType: getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null,
+    sourceVoucherType,
     status: "open",
   };
 
-  if (type.includes("advance")) {
+  if (kind === "advance") {
     return {
       kind: "advance",
       referenceName,
@@ -2432,18 +2970,6 @@ function toOpenBill(block, ledgerName) {
 
 function openBillNarrationKey(ledgerName, referenceName) {
   return `${normalizeLooseName(ledgerName)}|${normalizeLooseName(referenceName)}`;
-}
-
-function minIsoDate(values) {
-  const dates = values
-    .map((value) => normalizeDateForCompare(value))
-    .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")))
-    .sort();
-  return dates[0] || null;
-}
-
-function todayIsoDate() {
-  return new Date().toISOString().slice(0, 10);
 }
 
 function isSalesInvoiceVoucher(block) {
@@ -2505,6 +3031,8 @@ function salesLedgerFromInvoiceVoucher(voucher, partyLedgerName) {
 function indexInvoiceNarrations(xml, requestedLedgerByKey) {
   const narrationByBill = new Map();
   const invoiceReferencesByLedger = new Map();
+  const invoiceReferenceKeys = new Set();
+  const advanceReferenceKeys = new Set();
   const salesLedgerByBill = new Map();
 
   for (const voucher of extractBlocks(xml, "VOUCHER")) {
@@ -2527,6 +3055,7 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
       const salesLedgerName = salesLedgerFromInvoiceVoucher(voucher, requestedLedgerName);
       for (const billReference of billReferences) {
         const key = openBillNarrationKey(requestedLedgerName, billReference);
+        invoiceReferenceKeys.add(key);
         if (narration) narrationByBill.set(key, narration);
         if (salesLedgerName) salesLedgerByBill.set(key, salesLedgerName);
         const references = invoiceReferencesByLedger.get(requestedLedgerName) || new Set();
@@ -2561,6 +3090,12 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
       let matchedAllocation = false;
 
       for (const allocation of entry.billAllocations) {
+        const allocationKey = openBillNarrationKey(requestedLedgerName, allocation.referenceName);
+        const allocationLooksLikeAdvance =
+          /advance/i.test(String(allocation.billType || "")) ||
+          (/^(?:adv|advance)(?:[-/\s]|\d)/i.test(allocation.referenceName) &&
+            !invoiceReferenceKeys.has(allocationKey));
+        if (allocationLooksLikeAdvance) advanceReferenceKeys.add(allocationKey);
         const invoiceReference = referenceByKey.get(normalizeLooseName(allocation.referenceName));
         if (!invoiceReference) continue;
         const key = openBillNarrationKey(requestedLedgerName, invoiceReference);
@@ -2589,39 +3124,13 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
     }
   }
 
-  return { narrationByBill, receiptEvidenceByBill, salesLedgerByBill };
-}
-
-async function fetchSettlementVoucherEvidenceXml(tallyUrl, options) {
-  const baseOptions = {
-    collectionName: "Autodealer Customer Invoice Narrations",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
-    companyName: options.companyName,
+  return {
+    narrationByBill,
+    receiptEvidenceByBill,
+    salesLedgerByBill,
+    invoiceReferenceKeys,
+    advanceReferenceKeys,
   };
-
-  if (options.dateFrom && options.dateTo) {
-    try {
-      return await exportTallyCollection(tallyUrl, {
-        ...baseOptions,
-        dateFrom: options.dateFrom,
-        dateTo: options.dateTo,
-      });
-    } catch (error) {
-      console.warn(
-        `Scoped settlement voucher evidence export failed; falling back to legacy broad export: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
-  }
-
-  return exportTallyCollection(tallyUrl, {
-    ...baseOptions,
-    dateFrom: "2000-04-01",
-    dateTo: "2099-03-31",
-  });
 }
 
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
@@ -2638,34 +3147,43 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
   // previously locked the whole connector cycle and surfaced as a dashboard
   // refresh timeout.
   const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Autodealer Customer Open Bills",
+    collectionName: "Gajkesari Customer Open Bills",
     tallyType: "Bill",
     fetchFields:
       "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
     companyName,
   });
-  const rawOpenBillEntries = [];
+  const voucherXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Gajkesari Customer Invoice Narrations",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
+    companyName,
+    dateFrom: "2000-04-01",
+    dateTo: "2099-03-31",
+  });
+  const {
+    narrationByBill,
+    receiptEvidenceByBill,
+    salesLedgerByBill,
+    invoiceReferenceKeys,
+    advanceReferenceKeys,
+  } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
+  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
+
   for (const block of extractBlocks(xml, "BILL")) {
     const rowLedgerName = billLedgerName(block);
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(rowLedgerName));
     if (!requestedLedgerName) continue;
 
-    const entry = toOpenBill(block, requestedLedgerName);
+    const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
+    const referenceKey = openBillNarrationKey(requestedLedgerName, referenceName);
+    const entry = toOpenBill(block, requestedLedgerName, {
+      knownInvoice: invoiceReferenceKeys.has(referenceKey),
+      knownAdvance: advanceReferenceKeys.has(referenceKey),
+    });
     if (!entry) continue;
-    rawOpenBillEntries.push({ requestedLedgerName, entry });
-  }
-  const settlementEvidenceDateFrom = minIsoDate(
-    rawOpenBillEntries.map(({ entry }) => entry.invoiceDate || entry.receiptDate)
-  );
-  const voucherXml = await fetchSettlementVoucherEvidenceXml(tallyUrl, {
-    companyName,
-    dateFrom: settlementEvidenceDateFrom,
-    dateTo: todayIsoDate(),
-  });
-  const { narrationByBill, receiptEvidenceByBill, salesLedgerByBill } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
-  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
 
-  for (const { requestedLedgerName, entry } of rawOpenBillEntries) {
     if (entry.kind === "bill") {
       entry.narration =
         narrationByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
@@ -2720,17 +3238,51 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
   };
 }
 
-function isTaxLedger(master) {
+function taxLedgerIdentity(master) {
   const name = master.name || "";
-  const parent = master.parent || "";
   const raw = master.raw || {};
+  const dutyHead = String(raw.gstDutyHead || "");
+  const taxType = String(raw.taxType || "");
 
-  return (
-    /gst|cgst|sgst|igst|cess/i.test(name) ||
-    /duties|taxes/i.test(parent) ||
-    /gst|tax/i.test(String(raw.taxType || "")) ||
-    /gst|tax/i.test(String(raw.gstDutyHead || ""))
+  return `${name} ${dutyHead} ${taxType}`;
+}
+
+function isGstLedger(master) {
+  return /\b(gst|cgst|sgst|igst|cess|central\s+tax|state\s+tax|integrated\s+tax)\b/i.test(
+    taxLedgerIdentity(master)
   );
+}
+
+function isWithholdingTaxLedger(master) {
+  return /\b(tds|tcs|tax\s+deducted|tax\s+collected)\b/i.test(
+    taxLedgerIdentity(master)
+  );
+}
+
+function classifyTaxLedgers(ledgers) {
+  return {
+    gstLedgers: dedupeMasters(ledgers.filter(isGstLedger)),
+    taxLedgers: dedupeMasters(ledgers.filter(isWithholdingTaxLedger)),
+  };
+}
+
+function gstStateCodeFromName(value) {
+  const key = normalizeLooseName(value);
+  if (!key) return null;
+  const codes = new Map([
+    ["jammu and kashmir", "01"], ["himachal pradesh", "02"], ["punjab", "03"],
+    ["chandigarh", "04"], ["uttarakhand", "05"], ["haryana", "06"], ["delhi", "07"],
+    ["rajasthan", "08"], ["uttar pradesh", "09"], ["bihar", "10"], ["sikkim", "11"],
+    ["arunachal pradesh", "12"], ["nagaland", "13"], ["manipur", "14"], ["mizoram", "15"],
+    ["tripura", "16"], ["meghalaya", "17"], ["assam", "18"], ["west bengal", "19"],
+    ["jharkhand", "20"], ["odisha", "21"], ["chhattisgarh", "22"], ["madhya pradesh", "23"],
+    ["gujarat", "24"], ["dadra and nagar haveli and daman and diu", "26"],
+    ["maharashtra", "27"], ["karnataka", "29"], ["goa", "30"], ["lakshadweep", "31"],
+    ["kerala", "32"], ["tamil nadu", "33"], ["puducherry", "34"],
+    ["andaman and nicobar islands", "35"], ["telangana", "36"], ["andhra pradesh", "37"],
+    ["ladakh", "38"], ["other territory", "97"],
+  ].map(([name, code]) => [normalizeLooseName(name), code]));
+  return codes.get(key) || null;
 }
 
 function toBankLedgerPayload(master) {
@@ -2746,6 +3298,40 @@ function toBankLedgerPayload(master) {
   };
 }
 
+function findBankLedgersFromMasters(ledgers, groups) {
+  const groupParentByName = new Map(
+    groups
+      .filter((group) => group?.name)
+      .map((group) => [normalizeLooseName(group.name), group.parent || null])
+  );
+
+  const descendsFromBankAccounts = (parentName) => {
+    const visited = new Set();
+    let currentName = parentName;
+
+    while (currentName) {
+      const normalized = normalizeLooseName(currentName);
+      if (!normalized || visited.has(normalized)) return false;
+      if (normalized === normalizeLooseName("Bank Accounts")) return true;
+      visited.add(normalized);
+      currentName = groupParentByName.get(normalized) || null;
+    }
+
+    return false;
+  };
+
+  return ledgers.filter((ledger) => {
+    const hasBankIdentity = Boolean(
+      ledger.bankName ||
+      ledger.bankAccountNumber ||
+      ledger.ifscCode ||
+      ledger.branchName ||
+      ledger.accountHolderName
+    );
+    return hasBankIdentity || descendsFromBankAccounts(ledger.parent);
+  });
+}
+
 async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const companyNames = mergeCompanyNames([
@@ -2759,17 +3345,24 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   for (const companyName of targets) {
     const key = companyName || "Current company";
     try {
-      const xml = await exportTallyXml(
-        tallyUrl,
-        buildBankLedgersExportXml(companyName),
-        `Bank ledgers for ${key}`
-      );
-      byCompany[key] = parseMasterCollection(xml, "LEDGER")
-        .filter(
-          (master) =>
-            !master.parent ||
-            normalizeLooseName(master.parent) === normalizeLooseName("Bank Accounts")
-        )
+      const [ledgerXml, groupXml] = await Promise.all([
+        exportTallyCollection(tallyUrl, {
+          collectionName: "Gajkesari Bank Ledger Discovery",
+          tallyType: "Ledger",
+          fetchFields:
+            "Name,Parent,GUID,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
+          companyName,
+        }),
+        exportTallyCollection(tallyUrl, {
+          collectionName: "Gajkesari Bank Group Discovery",
+          tallyType: "Group",
+          fetchFields: "Name,Parent,GUID",
+          companyName,
+        }),
+      ]);
+      const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
+      const groups = parseMasterCollection(groupXml, "GROUP");
+      byCompany[key] = findBankLedgersFromMasters(ledgers, groups)
         .map(toBankLedgerPayload);
     } catch (error) {
       errors.push({
@@ -2803,41 +3396,80 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
 
-  const [ledgerXml, groupXml, voucherTypeXml] = await Promise.all([
+  const [ledgerXml, groupXml, stockItemXml, unitXml, voucherTypeXml, companyXml] = await Promise.all([
     exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Ledgers Sync",
+      collectionName: "Gajkesari Ledgers Sync",
       tallyType: "Ledger",
       fetchFields:
         "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation",
       companyName,
     }),
     exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Groups Sync",
+      collectionName: "Gajkesari Groups Sync",
       tallyType: "Group",
       fetchFields: "Name,Parent,GUID",
       companyName,
     }),
     exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Voucher Types Sync",
+      collectionName: "Gajkesari Stock Items Sync",
+      tallyType: "StockItem",
+      fetchFields:
+        "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable",
+      companyName,
+    }),
+    exportTallyCollection(tallyUrl, {
+      collectionName: "Gajkesari Units Sync",
+      tallyType: "Unit",
+      fetchFields: "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit",
+      companyName,
+    }),
+    exportTallyCollection(tallyUrl, {
+      collectionName: "Gajkesari Voucher Types Sync",
       tallyType: "VoucherType",
       fetchFields: "Name,Parent,GUID",
       companyName,
     }),
+    exportTallyCollection(tallyUrl, {
+      collectionName: "Gajkesari Company Profile Sync",
+      tallyType: "Company",
+      fetchFields:
+        "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
+      companyName,
+    }).catch(() => ""),
   ]);
 
   const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
   const groups = parseMasterCollection(groupXml, "GROUP");
+  const stockItems = parseMasterCollection(stockItemXml, "STOCKITEM");
+  const units = parseMasterCollection(unitXml, "UNIT");
   const voucherTypes = parseMasterCollection(voucherTypeXml, "VOUCHERTYPE");
-  const gstLedgers = dedupeMasters(ledgers.filter(isTaxLedger));
+  const companies = parseMasterCollection(companyXml, "COMPANY");
+  const activeCompany = companies.find(
+    (company) => normalizeLooseName(company.name) === normalizeLooseName(companyName)
+  ) || companies[0] || null;
+  const companyGstin = activeCompany?.gstin || null;
+  const companyStateCode =
+    String(companyGstin || "").match(/^\d{2}/)?.[0] ||
+    gstStateCodeFromName(activeCompany?.raw?.stateName) ||
+    null;
+  const { gstLedgers, taxLedgers } = classifyTaxLedgers(ledgers);
 
   return {
     ledgers,
     groups,
-    stockItems: [],
-    units: [],
+    stockItems,
+    units,
     voucherTypes,
     gstLedgers,
-    taxLedgers: gstLedgers,
+    taxLedgers,
+    companyProfile: activeCompany ? {
+      name: activeCompany.name,
+      guid: activeCompany.guid || null,
+      gstin: companyGstin,
+      stateCode: companyStateCode,
+      stateName: activeCompany.raw?.stateName || null,
+      countryName: activeCompany.raw?.countryName || null,
+    } : {},
   };
 }
 
@@ -2853,8 +3485,7 @@ async function postMastersToBackend(config, payload) {
   const result = await readJsonResponse(response);
 
   if (!response.ok) {
-    const detail = result.error || result.message || JSON.stringify(result);
-    throw new Error(`Master sync upload failed with HTTP ${response.status}: ${detail}`);
+    throw new Error(result.error || `Master sync upload failed with HTTP ${response.status}.`);
   }
 
   return result;
@@ -2895,7 +3526,16 @@ async function syncMastersFromTally(config, commandPayload = {}) {
     connectionId: config.connectionId,
     companyName: resolvedCompanyName,
     bridgeVersion: BRIDGE_VERSION,
-    masters,
+    masters: {
+      ledgers: masters.ledgers,
+      groups: masters.groups,
+      stockItems: masters.stockItems,
+      units: masters.units,
+      voucherTypes: masters.voucherTypes,
+      gstLedgers: masters.gstLedgers,
+      taxLedgers: masters.taxLedgers,
+    },
+    companyProfile: masters.companyProfile,
   };
   const syncResult = await postMastersToBackend(config, payload);
 
@@ -3029,6 +3669,77 @@ async function sendCommandResult(config, command, outcome) {
   return payload;
 }
 
+function safeDocumentPathSegment(value, fallback) {
+  const sanitized = String(value || "")
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-")
+    .replace(/[.\s]+$/g, "")
+    .slice(0, 100);
+  return sanitized || fallback;
+}
+
+async function materializePurchaseSourceDocument(payload) {
+  const source = payload?.sourceDocument;
+  if (!source || typeof source !== "object") {
+    return payload;
+  }
+
+  const downloadUrl = String(source.downloadUrl || "").trim();
+  const documentId = safeDocumentPathSegment(source.id, "source-document");
+  const companyName = safeDocumentPathSegment(payload?.companyName, "Tally company");
+  const originalName = safeDocumentPathSegment(source.name, "source-invoice.pdf");
+  const fileName = /\.pdf$/i.test(originalName) ? originalName : `${originalName}.pdf`;
+  if (!/^https?:\/\//i.test(downloadUrl)) {
+    throw new Error("Purchase source document does not have a valid download URL.");
+  }
+
+  const response = await fetch(downloadUrl, { signal: AbortSignal.timeout(60_000) });
+  if (!response.ok) {
+    throw new Error(`Purchase source document download failed with HTTP ${response.status}.`);
+  }
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > MAX_PURCHASE_SOURCE_PDF_BYTES) {
+    throw new Error("Purchase source PDF is larger than the 25 MB connector limit.");
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length === 0 || bytes.length > MAX_PURCHASE_SOURCE_PDF_BYTES) {
+    throw new Error("Purchase source PDF is empty or larger than the 25 MB connector limit.");
+  }
+  if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
+    throw new Error("Purchase source document is not a valid PDF.");
+  }
+
+  const sha256 = createHash("sha256").update(bytes).digest("hex").toUpperCase();
+  const documentDir = path.join(
+    CONFIG_DIR,
+    "documents",
+    companyName,
+    "Purchase",
+    documentId
+  );
+  const documentPath = path.join(documentDir, fileName);
+  fs.mkdirSync(documentDir, { recursive: true });
+
+  const existingSha256 = fs.existsSync(documentPath)
+    ? createHash("sha256").update(fs.readFileSync(documentPath)).digest("hex").toUpperCase()
+    : null;
+  if (existingSha256 !== sha256) {
+    const temporaryPath = `${documentPath}.${randomUUID()}.tmp`;
+    fs.writeFileSync(temporaryPath, bytes, { mode: 0o600 });
+    fs.rmSync(documentPath, { force: true });
+    fs.renameSync(temporaryPath, documentPath);
+  }
+
+  return {
+    ...payload,
+    sourceDocumentPath: documentPath,
+    sourceDocumentName: fileName,
+    sourceDocumentSha256: sha256,
+    sourceDocumentId: String(source.id || documentId).trim() || documentId,
+  };
+}
+
 async function runCommand(config, command, options = {}) {
   if (!command) return;
 
@@ -3151,6 +3862,61 @@ async function runCommand(config, command, options = {}) {
           commandPayload: command.payload ?? {},
           transactionId: command.payload?.transactionId,
           sourceBankTransactionId: command.payload?.transactionId,
+        },
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "create_purchase_voucher") {
+    try {
+      const live = await testTally(config.tallyUrl);
+      const requestedCompany = String(command.payload?.companyName || "").trim();
+      if (!live.tallyReachable || !live.companyLoaded) {
+        throw new Error(live.error || "TallyPrime is not ready for Purchase voucher creation.");
+      }
+      if (
+        requestedCompany &&
+        normalizeLooseName(requestedCompany) !== normalizeLooseName(live.companyName)
+      ) {
+        throw new Error(`Tally is currently open to ${live.companyName || "another company"}. Switch to ${requestedCompany} before posting.`);
+      }
+
+      const purchasePayload = await materializePurchaseSourceDocument(command.payload);
+      const posted = await postPurchaseVoucher(
+        config.tallyUrl,
+        purchasePayload,
+        requestedCompany || live.companyName || config.companyName
+      );
+      await sendCommandResult(config, command, {
+        ...posted.outcome,
+        result: {
+          ...(posted.outcome.result || {}),
+          postingId: command.payload?.postingId,
+          caseId: command.payload?.caseId,
+          revision: command.payload?.revision,
+          idempotencyKey: command.payload?.idempotencyKey,
+          sourceDocumentAttached: Boolean(purchasePayload.sourceDocumentPath),
+          sourceDocumentName: purchasePayload.sourceDocumentName || null,
+          sourceDocumentSha256: purchasePayload.sourceDocumentSha256 || null,
+        },
+      });
+      console.log(
+        posted.outcome.success
+          ? `Command ${command.id} completed: Purchase voucher verified in Tally.`
+          : `Command ${command.id} needs correction: ${posted.outcome.error || "Purchase voucher verification failed."}`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Purchase voucher creation failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: {
+          postingId: command.payload?.postingId,
+          caseId: command.payload?.caseId,
+          revision: command.payload?.revision,
+          idempotencyKey: command.payload?.idempotencyKey,
         },
         error: message,
       });
@@ -3964,7 +4730,7 @@ async function diagnoseTallyCompanyCli(args) {
   const tallyUrl = normalizeTallyUrl(args["tally-url"] || config?.tallyUrl);
   const companyName = args["company-name"] || config?.companyName || null;
   const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Autodealer Company Diagnostics",
+    collectionName: "Gajkesari Company Diagnostics",
     tallyType: "Company",
     fetchFields:
       "Name,Guid,StartingFrom,BooksFrom,FinancialYearFrom,CurrentPeriod,AlterID,MasterID",
@@ -4002,7 +4768,7 @@ async function findVouchersCli(args) {
   }
 
   const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Autodealer Voucher Lookup",
+    collectionName: "Gajkesari Voucher Lookup",
     tallyType: "Voucher",
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName",
@@ -4052,7 +4818,7 @@ async function listVouchersCli(args) {
   const limit = Math.max(1, Math.min(Number(args.limit || 20) || 20, 200));
   const includeAll = String(args.all || "").toLowerCase() === "true" || String(args.all || "").toLowerCase() === "yes";
   const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Autodealer Voucher List",
+    collectionName: "Gajkesari Voucher List",
     tallyType: "Voucher",
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName",
@@ -4154,19 +4920,28 @@ export {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TALLY_URL,
   createBridgeRunner,
+  classifyOpenBillReferenceKind,
+  classifyTaxLedgers,
+  buildPurchaseVoucherXml,
   deleteConfig,
   disconnectBridge,
   exportTallyCollection,
   fetchAvailableCompanies,
+  fetchBankLedgersFromTally,
+  findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   normalizeTallyUrl,
   pairBridge,
+  parseTallyImportResult,
+  purchaseVoucherReadbackComparison,
   readConfig,
   reconcileBankTransactionsInTally,
+  strictBankTransactionCandidates,
   runOnce,
   startBridge,
   testBridge,
   testTally,
+  verifyPurchaseVoucherInTally,
   writeConfig,
 };
 

@@ -3,12 +3,13 @@ import styles from "./AppShell.module.css";
 
 type AppShellProps = {
   children: React.ReactNode;
+  defaultSidebarCollapsed?: boolean;
 };
 
-export function AppShell({ children }: AppShellProps) {
+export function AppShell({ children, defaultSidebarCollapsed = false }: AppShellProps) {
   return (
     <div className={styles.shell}>
-      <DashboardSidebar />
+      <DashboardSidebar defaultCollapsed={defaultSidebarCollapsed} />
 
       <main className={styles.main}>{children}</main>
     </div>

@@ -5,7 +5,7 @@ This folder contains the Windows installer assets for the Gajkesari desktop Tall
 The installer:
 
 - uses the visible product name `Gajkesari Tally Connector`
-- installs under `C:\Gajkesari\tally-bridge`
+- installs without elevation under `C:\Gajkesari\tally-bridge`
 - preserves the existing `%USERPROFILE%\.gajkesari-tally-bridge\config.json` pairing during updates
 - registers the `gajkesari-tally://` protocol expected by the Gajkesari web application
 - starts the connector after installation

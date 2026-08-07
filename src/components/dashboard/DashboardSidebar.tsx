@@ -44,12 +44,13 @@ interface UserInfo {
 
 export interface DashboardSidebarProps {
   user?: UserInfo;
+  defaultCollapsed?: boolean;
 }
 
-export function DashboardSidebar({ user }: DashboardSidebarProps) {
+export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSidebarProps) {
   const pathname = usePathname();
   const [popoverOpen, setPopoverOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const userRowRef = useRef<HTMLDivElement>(null);
 
   const displayUser: UserInfo = user ?? {
@@ -76,6 +77,9 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
           onClick={() => setCollapsed(!collapsed)}
           className={styles.collapseBtn}
           type="button"
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!collapsed}
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         >
           <ChevronLeft className={`h-4 w-4 transition-transform ${collapsed ? "rotate-180" : ""}`} />
         </button>
@@ -95,6 +99,8 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                     <Link
                       href={item.href}
                       className={`${styles.navItem} ${active ? styles.navItemActive : ""}`}
+                      aria-label={collapsed ? item.label : undefined}
+                      title={collapsed ? item.label : undefined}
                     >
                       <div className={styles.navItemLeft}>
                         {active && <div className={styles.activeBar} />}
@@ -164,7 +170,6 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                   <div className={styles.popoverUserEmail}>{displayUser.email}</div>
                 </div>
               </div>
-              
               <div className={styles.popoverFooter}>
                 <form action="/auth/signout" method="post" className="w-full">
                   <button type="submit" className={styles.popoverLogoutBtn}>

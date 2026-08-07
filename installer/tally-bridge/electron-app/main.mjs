@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog } from "electron";
+import { app, BrowserWindow, dialog, net } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,13 @@ const BRAND_NAME = "Gajkesari";
 const CONNECTOR_NAME = "Gajkesari Tally Connector";
 const PROTOCOL_NAME = "gajkesari-tally";
 const APP_USER_MODEL_ID = "com.gajkesari.tally-connector";
-const BRAND_MARK = "G";
+const BRAND_MARK = "P";
+
+// The connector UI is lightweight and does not need GPU acceleration. Some
+// Windows machines cannot start Electron's GPU subprocess, which otherwise
+// terminates the whole connector before its window appears.
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch("disable-gpu");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const installDir = path.resolve(__dirname, "..", "..");
@@ -24,6 +30,23 @@ let lastStatus = {
   detail: `Open ${BRAND_NAME} and click Connect.`,
   state: "idle",
 };
+
+function installSystemNetworkFetch() {
+  // Use Windows' proxy and certificate store, matching the user's browser.
+  // This avoids TLS failures on machines with corporate/antivirus inspection.
+  globalThis.fetch = (input, init) =>
+    net.fetch(input instanceof URL ? input.toString() : input, init);
+}
+
+function formatConnectorError(error) {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  if (cause instanceof Error) {
+    const code = typeof cause.code === "string" ? ` (${cause.code})` : "";
+    return `${error.message}: ${cause.message}${code}`;
+  }
+  return error.message;
+}
 
 function appendLog(filePath, message) {
   const line = `[${new Date().toISOString()}] ${message}\n`;
@@ -161,7 +184,7 @@ async function handleConnectUrl(value) {
     sendStatus({ title: "Connector paired", detail: "Starting live sync.", state: "running" });
     await startRunner();
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatConnectorError(error);
     appendLog(errPath, message);
     sendStatus({ title: "Connection failed", detail: message, state: "error" });
     showWindow();
@@ -176,7 +199,7 @@ async function handleDisconnectUrl(value) {
     await disconnectBridge({ "connection-id": url.searchParams.get("connectionId") || "" });
     sendStatus({ title: "Disconnected", detail: "Connector stopped.", state: "stopped" });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatConnectorError(error);
     appendLog(errPath, message);
   }
 }
@@ -269,6 +292,7 @@ if (!gotLock) {
     else pendingProtocolUrl = url;
   });
   app.whenReady().then(() => {
+    installSystemNetworkFetch();
     createWindow();
     const protocolArg =
       process.argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`)) || pendingProtocolUrl;
@@ -276,7 +300,7 @@ if (!gotLock) {
       handleProtocolUrl(protocolArg);
     } else {
       startRunner().catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = formatConnectorError(error);
         appendLog(errPath, message);
         sendStatus({
           title: "Waiting for connection",
