@@ -10,6 +10,7 @@ import {
   CalendarDays,
   CheckCircle2,
   Filter,
+  Info,
   Landmark,
   Loader2,
   Pencil,
@@ -24,6 +25,7 @@ import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
+import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type BankAccount = {
@@ -374,6 +376,10 @@ type QueueTransaction = {
 type MessageTone = "success" | "error" | "info";
 type ReviewStatusFilter = "all" | "matched" | "needs_review" | "suspense";
 type ReviewDirectionFilter = "all" | "debit" | "credit";
+type ReviewWorkStatusFilter = "all" | "needs_action" | "ready" | "completed";
+type ReviewTallyResultFilter = "all" | "pending" | "found" | "missing" | "review" | "failed";
+type ReviewLedgerFilter = "all" | "needs_action" | "automatic" | "manual" | "suspense";
+type ReviewAllocationFilter = "all" | "needs_action" | "ready" | "completed" | "not_applicable";
 type TallySendMode = "post_receipts" | "check_payments";
 
 type ToastMessage = {
@@ -1215,28 +1221,65 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
   return groups;
 }
 
+type LedgerSearchGroup = {
+  label: string;
+  options: Array<{
+    name: string;
+    helper?: string;
+  }>;
+};
+
 function LedgerSearchSelect({
   value,
-  options,
+  groups,
   placeholder,
   onChange,
 }: {
   value: string;
-  options: string[];
+  groups: LedgerSearchGroup[];
   placeholder: string;
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const uniqueOptions = useMemo(() => Array.from(new Set(options.filter(Boolean))), [options]);
-  const filteredOptions = useMemo(() => {
+  const [activeOptionIndex, setActiveOptionIndex] = useState(0);
+  const uniqueGroups = useMemo(() => {
+    const seen = new Set<string>();
+    return groups
+      .map((group) => ({
+        ...group,
+        options: group.options.filter((option) => {
+          const key = normalizeName(option.name);
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        }),
+      }))
+      .filter((group) => group.options.length > 0);
+  }, [groups]);
+  const filteredGroups = useMemo(() => {
     const normalizedQuery = normalizeName(query);
-    const matches = normalizedQuery
-      ? uniqueOptions.filter((option) => normalizeName(option).includes(normalizedQuery))
-      : uniqueOptions;
+    if (!normalizedQuery) return uniqueGroups;
+    return uniqueGroups
+      .map((group) => ({
+        ...group,
+        options: group.options.filter((option) =>
+          normalizeName(`${option.name} ${option.helper ?? ""} ${group.label}`).includes(normalizedQuery)
+        ),
+      }))
+      .filter((group) => group.options.length > 0);
+  }, [query, uniqueGroups]);
+  const visibleOptions = useMemo(
+    () => filteredGroups.flatMap((group) => group.options),
+    [filteredGroups]
+  );
 
-    return matches.slice(0, 60);
-  }, [query, uniqueOptions]);
+  function chooseLedger(name: string) {
+    onChange(name);
+    setQuery("");
+    setOpen(false);
+    setActiveOptionIndex(0);
+  }
 
   return (
     <div className="relative">
@@ -1249,8 +1292,35 @@ function LedgerSearchSelect({
           onChange={(event) => {
             setQuery(event.target.value);
             setOpen(true);
+            setActiveOptionIndex(0);
           }}
-          onFocus={() => setOpen(true)}
+          onFocus={(event) => {
+            const input = event.currentTarget;
+            setOpen(true);
+            setActiveOptionIndex(0);
+            window.requestAnimationFrame(() => input.select());
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setOpen(false);
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              setOpen(true);
+              const direction = event.key === "ArrowDown" ? 1 : -1;
+              setActiveOptionIndex((current) => {
+                if (visibleOptions.length === 0) return 0;
+                return (current + direction + visibleOptions.length) % visibleOptions.length;
+              });
+              return;
+            }
+            if (event.key === "Enter" && open && visibleOptions[activeOptionIndex]) {
+              event.preventDefault();
+              chooseLedger(visibleOptions[activeOptionIndex].name);
+            }
+          }}
           placeholder={placeholder}
           value={open ? query : value}
         />
@@ -1258,24 +1328,42 @@ function LedgerSearchSelect({
 
       {open ? (
         <div className="absolute z-30 mt-2 max-h-72 w-full overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-xl">
-          {filteredOptions.length > 0 ? (
-            filteredOptions.map((option) => (
-              <button
-                className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
-                  option === value ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
-                }`}
-                key={option}
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  onChange(option);
-                  setQuery("");
-                  setOpen(false);
-                }}
-                type="button"
-              >
-                <span className="truncate">{option}</span>
-                {option === value ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /> : null}
-              </button>
+          {filteredGroups.length > 0 ? (
+            filteredGroups.map((group) => (
+              <div className="mb-1 last:mb-0" key={group.label}>
+                <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                  {group.label}
+                </div>
+                {group.options.map((option) => {
+                  const optionIndex = visibleOptions.findIndex((candidate) => candidate.name === option.name);
+                  const keyboardActive = optionIndex === activeOptionIndex;
+                  return (
+                    <button
+                      className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
+                        option.name === value || keyboardActive
+                          ? "bg-[#f6efe6] text-[#4b3828]"
+                          : "text-[#2b241d]"
+                      }`}
+                      key={option.name}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        chooseLedger(option.name);
+                      }}
+                      type="button"
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate">{option.name}</span>
+                        {option.helper ? (
+                          <span className="mt-0.5 block truncate text-[11px] font-medium text-[#8a7f72]">
+                            {option.helper}
+                          </span>
+                        ) : null}
+                      </span>
+                      {option.name === value ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /> : null}
+                    </button>
+                  );
+                })}
+              </div>
             ))
           ) : (
             <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
@@ -1306,13 +1394,17 @@ function isSuspenseLedgerName(value: string) {
 function LedgerReviewSelect({
   transaction,
   ledgerMasters,
+  onCancel,
   onChange,
 }: {
   transaction: ReviewTransaction;
   ledgerMasters: TallyMaster[];
+  onCancel: () => void;
   onChange: (selection: LedgerSelection) => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [popoverPosition, setPopoverPosition] = useState<{
     bottom?: number;
@@ -1322,6 +1414,7 @@ function LedgerReviewSelect({
     width: number;
   } | null>(null);
   const [query, setQuery] = useState("");
+  const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const groups = useMemo(
     () => buildLedgerPickerGroups(transaction, ledgerMasters),
     [ledgerMasters, transaction]
@@ -1344,6 +1437,10 @@ function LedgerReviewSelect({
       .filter((group) => group.options.length > 0);
   }, [groups, normalizedQuery, query]);
   const displayValue = open ? query : getLedgerPickerDisplayValue(transaction);
+  const visibleOptions = useMemo(
+    () => filteredGroups.flatMap((group) => group.options),
+    [filteredGroups]
+  );
 
   function selectOption(option: LedgerSelection) {
     onChange(option);
@@ -1372,12 +1469,41 @@ function LedgerReviewSelect({
         width,
       });
     }
+    setActiveOptionIndex(0);
     setOpen(true);
   }
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      openMenu();
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // This editor is mounted only when a row enters edit mode. Opening once
+    // after layout guarantees that the first cell click can be measured.
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+
+    function handleOutsidePointerDown(event: PointerEvent) {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (target instanceof Element && target.closest("[data-ledger-editor-toggle]")) return;
+      if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+
+      setOpen(false);
+      onCancel();
+    }
+
+    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
+  }, [onCancel, open]);
 
   const popover = open && popoverPosition ? (
     <div
       className="fixed z-[1000] overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-2xl"
+      ref={popoverRef}
       style={{
         bottom: popoverPosition.bottom,
         left: popoverPosition.left,
@@ -1396,10 +1522,12 @@ function LedgerReviewSelect({
               const selected =
                 normalizeName(option.name) === normalizeName(transaction.selectedLedgerName) &&
                 option.action === transaction.ledgerAction;
+              const optionIndex = visibleOptions.findIndex((candidate) => candidate.key === option.key);
+              const keyboardActive = optionIndex === activeOptionIndex;
               return (
                 <button
                   className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
-                    selected ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
+                    selected || keyboardActive ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
                   }`}
                   key={option.key}
                   onMouseDown={(event) => {
@@ -1446,14 +1574,55 @@ function LedgerReviewSelect({
       <div className="relative">
         <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
         <input
+          autoFocus
           className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 pl-9 text-sm font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
-          onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+          onBlur={() => {
+            window.setTimeout(() => {
+              const focusedElement = document.activeElement;
+              if (
+                focusedElement instanceof Node &&
+                !rootRef.current?.contains(focusedElement) &&
+                !popoverRef.current?.contains(focusedElement)
+              ) {
+                setOpen(false);
+                onCancel();
+              }
+            }, 0);
+          }}
           onChange={(event) => {
             setQuery(event.target.value);
+            setActiveOptionIndex(0);
             openMenu();
           }}
-          onFocus={openMenu}
+          onFocus={(event) => {
+            const input = event.currentTarget;
+            openMenu();
+            window.requestAnimationFrame(() => input.select());
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              setOpen(false);
+              onCancel();
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              if (!open) openMenu();
+              const direction = event.key === "ArrowDown" ? 1 : -1;
+              setActiveOptionIndex((current) => {
+                if (visibleOptions.length === 0) return 0;
+                return (current + direction + visibleOptions.length) % visibleOptions.length;
+              });
+              return;
+            }
+            if (event.key === "Enter" && open && visibleOptions[activeOptionIndex]) {
+              event.preventDefault();
+              selectOption(visibleOptions[activeOptionIndex]);
+            }
+          }}
           placeholder="Search or choose action"
+          ref={inputRef}
           value={displayValue}
         />
       </div>
@@ -1513,9 +1682,8 @@ function CurrencyAmountInput({
 
 function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
   if (
-    transaction.ledgerAction === "needs_review" ||
     transaction.requiresUserConfirmation ||
-    transaction.candidateLedgerNames.length > 0
+    (transaction.ledgerAction === "needs_review" && transaction.candidateLedgerNames.length > 0)
   ) {
     return "needs_review";
   }
@@ -1528,14 +1696,14 @@ function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
   ) {
     return "matched";
   }
-  return "needs_review";
+  return "suspense";
 }
 
 function getReviewStatusLabel(transaction: ReviewTransaction) {
   const status = getReviewStatus(transaction);
   if (status === "matched") return "Ledger matched";
   if (status === "suspense") return "In Suspense";
-  return "Needs review";
+  return "Close match";
 }
 
 function getReviewStatusClass(transaction: ReviewTransaction) {
@@ -1543,6 +1711,36 @@ function getReviewStatusClass(transaction: ReviewTransaction) {
   if (status === "matched") return "border-emerald-200 bg-emerald-50 text-emerald-800";
   if (status === "suspense") return "border-slate-300 bg-slate-100 text-slate-700";
   return "border-amber-200 bg-amber-50 text-amber-800";
+}
+
+function getLedgerReviewFilterValue(transaction: ReviewTransaction): Exclude<ReviewLedgerFilter, "all"> {
+  const status = getReviewStatus(transaction);
+  if (status === "needs_review") return "needs_action";
+  if (status === "suspense") return "suspense";
+  return transaction.ledgerSelectionTouched ? "manual" : "automatic";
+}
+
+function getTallyResultFilterValue(
+  draft?: OutgoingVerificationDraft | null
+): Exclude<ReviewTallyResultFilter, "all"> {
+  if (!draft || draft.status === "not_checked" || draft.status === "checking") return "pending";
+  if (draft.duplicateInTally || draft.status === "ambiguous") return "review";
+  if (draft.status === "found") return "found";
+  if (draft.status === "missing") return "missing";
+  return "failed";
+}
+
+function getReceiptAllocationFilterValue(
+  transaction: ReviewTransaction,
+  ledgerMasters: TallyMaster[],
+  draft?: BillAllocationDraft | null
+): Exclude<ReviewAllocationFilter, "all"> {
+  if (!isIncomingReceiptRow(transaction) || !isBillMatchEligibleTransaction(transaction, ledgerMasters)) {
+    return "not_applicable";
+  }
+  if (draft?.status === "posted") return "completed";
+  if (draft?.status === "ready_to_post") return "ready";
+  return "needs_action";
 }
 
 function getBillAllocationLabel(draft?: BillAllocationDraft | null) {
@@ -1945,26 +2143,13 @@ function allocateBillsForTransaction(
 
   const narrationBill = findNarrationBill(openBills, transaction);
   const candidateBills = sortOpenBills(openBills);
-  const exactSingleBill =
-    openBills.length === 1 &&
-    Math.abs(Number(openBills[0].pendingAmount ?? 0) - receiptAmount) <= 0.01
-      ? openBills[0]
-      : null;
-  const safeBill = narrationBill || exactSingleBill;
 
-  if (existingAdvances.length > 0 || !safeBill) {
-    const reason = existingAdvances.length > 0
-      ? "Existing advances require an explicit allocation review before applying this receipt."
-      : openBills.length === 0
-        ? "No open bill was found. Confirm whether this receipt should be a new advance."
-        : openBills.length > 1
-          ? "Multiple open bills were found. Choose the intended bill allocation explicitly."
-          : "A partial receipt can be auto-allocated only when its bill reference is visible in the bank narration.";
+  if (openBills.length > 0 && existingAdvances.length > 0) {
     return {
       status: "needs_review",
       caseType: "cannot_match_yet",
       caseLabel: "Needs Review",
-      reason,
+      reason: "Existing advances require an explicit allocation review before applying this receipt.",
       receiptAmount,
       totalAllocatedAmount: 0,
       newAdvanceAmount: 0,
@@ -1977,56 +2162,40 @@ function allocateBillsForTransaction(
     };
   }
 
-  const pendingAmount = Math.max(0, Number(safeBill.pendingAmount ?? 0));
-  if (receiptAmount - pendingAmount > 0.01) {
-    return {
-      status: "needs_review",
-      caseType: "cannot_match_yet",
-      caseLabel: "Needs Review",
-      reason: `Receipt exceeds visible bill ${safeBill.referenceName}. Review the bill and advance split explicitly.`,
-      receiptAmount,
-      totalAllocatedAmount: 0,
-      newAdvanceAmount: 0,
-      unallocatedAmount: receiptAmount,
-      allocations: [],
-      candidateBills,
-      existingAdvances,
-      requiresUserReview: true,
-      isEligibleForPosting: false,
-    };
+  const automaticAllocation = allocateReceiptByFifo(
+    receiptAmount,
+    openBills,
+    buildAdvanceReference(transaction),
+    narrationBill?.referenceName
+  );
+  const allocations: BillAllocationLine[] = automaticAllocation.allocations;
+  const billAllocationCount = allocations.filter((allocation) => allocation.referenceType === "Agst Ref").length;
+  const isBalanced = isAllocationTotalValid(receiptAmount, automaticAllocation.totalAllocatedAmount);
+  let allocationReason = "Allocated against the oldest open bill using due date, invoice date, then bill reference.";
+  if (openBills.length === 0) {
+    allocationReason = "No open bill was found. The full receipt will be posted as a new customer advance.";
+  } else if (narrationBill) {
+    allocationReason = `Matched the visible bill reference ${narrationBill.referenceName}; any remaining receipt was allocated FIFO.`;
+  } else if (automaticAllocation.newAdvanceAmount > 0) {
+    allocationReason = "Allocated open bills FIFO; the remaining receipt will be posted as a new advance.";
+  } else if (billAllocationCount > 1) {
+    allocationReason = `Allocated across ${billAllocationCount} open bills using FIFO by due date, invoice date, then bill reference.`;
   }
-
-  const allocation: BillAllocationLine = {
-    referenceType: "Agst Ref",
-    referenceName: safeBill.referenceName,
-    voucherNumber: safeBill.voucherNumber,
-    invoiceDate: safeBill.invoiceDate,
-    dueDate: safeBill.dueDate,
-    previousPendingAmount: pendingAmount,
-    allocatedAmount: receiptAmount,
-    pendingAmountAfterAllocation: Number((pendingAmount - receiptAmount).toFixed(2)),
-    statusAfterAllocation: pendingAmount - receiptAmount <= 0.01 ? "cleared" : "partially_settled",
-  };
-  const allocations = [allocation];
-  const caseType = getAllocationCaseType(allocations, 0);
-  const caseLabel = getAllocationCaseLabel(allocations, 0);
 
   return {
-    status: "ready_to_post",
-    caseType,
-    caseLabel,
-    reason: narrationBill
-      ? `Matched the visible bill reference ${narrationBill.referenceName}.`
-      : "Exactly one open bill matched the receipt amount.",
+    status: isBalanced ? "ready_to_post" : "needs_review",
+    caseType: getAllocationCaseType(allocations, automaticAllocation.newAdvanceAmount),
+    caseLabel: getAllocationCaseLabel(allocations, automaticAllocation.newAdvanceAmount),
+    reason: allocationReason,
     receiptAmount,
-    totalAllocatedAmount: receiptAmount,
-    newAdvanceAmount: 0,
-    unallocatedAmount: 0,
+    totalAllocatedAmount: automaticAllocation.totalAllocatedAmount,
+    newAdvanceAmount: automaticAllocation.newAdvanceAmount,
+    unallocatedAmount: automaticAllocation.unallocatedAmount,
     allocations,
-    candidateBills,
+    candidateBills: openBills.length > 0 ? automaticAllocation.orderedBills : candidateBills,
     existingAdvances,
-    requiresUserReview: false,
-    isEligibleForPosting: true,
+    requiresUserReview: !isBalanced,
+    isEligibleForPosting: isBalanced,
   };
 }
 
@@ -2237,7 +2406,6 @@ async function buildDocumentPreview(file: File): Promise<DocumentPreviewState> {
       return {
         ...basePreview,
         kind: "pdf",
-        objectUrl: URL.createObjectURL(file),
         totalRows: 1,
         error: file.size > 0 ? null : "This PDF is empty. Choose a valid bank statement PDF.",
       };
@@ -2423,6 +2591,8 @@ export function BankStatementsPage() {
   const [statementPassword, setStatementPassword] = useState("");
   const [statementPasswordRequired, setStatementPasswordRequired] = useState(false);
   const [statementPasswordError, setStatementPasswordError] = useState<string | null>(null);
+  const [statementPasswordChecking, setStatementPasswordChecking] = useState(false);
+  const [statementPasswordVerified, setStatementPasswordVerified] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
@@ -2458,9 +2628,14 @@ export function BankStatementsPage() {
   const [tallyPostingStatus, setTallyPostingStatus] = useState<TallyPostingStatus | null>(null);
   const [statementDoneSummary, setStatementDoneSummary] = useState<StatementDoneSummary | null>(null);
   const [reviewFiltersOpen, setReviewFiltersOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [activeReviewTransactionId, setActiveReviewTransactionId] = useState<string | null>(null);
   const [reviewSearch, setReviewSearch] = useState("");
-  const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
+  const [reviewWorkStatusFilter, setReviewWorkStatusFilter] = useState<ReviewWorkStatusFilter>("all");
+  const [reviewTallyResultFilter, setReviewTallyResultFilter] = useState<ReviewTallyResultFilter>("all");
+  const [reviewLedgerFilter, setReviewLedgerFilter] = useState<ReviewLedgerFilter>("all");
   const [reviewDirectionFilter, setReviewDirectionFilter] = useState<ReviewDirectionFilter>("all");
+  const [reviewAllocationFilter, setReviewAllocationFilter] = useState<ReviewAllocationFilter>("all");
   const [reviewDateFrom, setReviewDateFrom] = useState("");
   const [reviewDateTo, setReviewDateTo] = useState("");
   const [rowsPerPage, setRowsPerPage] = useState(50);
@@ -2471,6 +2646,9 @@ export function BankStatementsPage() {
   const [, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [outgoingReviewTransactionId, setOutgoingReviewTransactionId] = useState<string | null>(null);
+  const reviewRowRefs = useRef<Map<string, HTMLTableRowElement>>(new Map());
+  const reviewSearchInputRef = useRef<HTMLInputElement>(null);
+  const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
   const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
@@ -2616,6 +2794,30 @@ export function BankStatementsPage() {
       return true;
     });
   }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
+  const bankLedgerPickerGroups = useMemo<LedgerSearchGroup[]>(() => {
+    const identifiedNames = new Set(bankLedgerOptions.map((ledger) => normalizeName(ledger.name)));
+    const identifiedBankLedgers = [...bankLedgerOptions]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((ledger) => ({
+        name: ledger.name,
+        helper: [
+          ledger.bankName || ledger.parent || "Bank Accounts",
+          ledger.bankAccountNumber ? `A/c ${ledger.bankAccountNumber}` : null,
+        ].filter(Boolean).join(" - "),
+      }));
+    const allOtherLedgers = ledgerMasters
+      .filter((ledger) => ledger.name.trim() && !identifiedNames.has(normalizeName(ledger.name)))
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((ledger) => ({
+        name: ledger.name,
+        helper: ledger.parent ? `Group: ${ledger.parent}` : "Tally ledger",
+      }));
+
+    return [
+      { label: "Identified bank account ledgers", options: identifiedBankLedgers },
+      { label: "All other Tally ledgers", options: allOtherLedgers },
+    ];
+  }, [bankLedgerOptions, ledgerMasters]);
   const exactBankLedgerMatch = useMemo(() => {
     const statementAccountNumber = normalizeBankAccountNumber(account.accountNumber);
     if (!statementAccountNumber) return null;
@@ -2705,7 +2907,7 @@ export function BankStatementsPage() {
     [validTransactions]
   );
   const pendingLedgerReviewCount = useMemo(
-    () => validTransactions.filter((transaction) => transaction.ledgerAction === "needs_review").length,
+    () => validTransactions.filter((transaction) => getReviewStatus(transaction) === "needs_review").length,
     [validTransactions]
   );
   const pendingBillEligibleTransactions = useMemo(
@@ -2780,8 +2982,7 @@ export function BankStatementsPage() {
       const presence = tallyPresenceByTransactionId[transaction.id];
       const isIncoming = isIncomingReceiptRow(transaction);
       const isOutgoing = isOutgoingPaymentRow(transaction);
-      const hasLedgerIssue =
-        !transaction.selectedLedgerName.trim() || transaction.ledgerAction === "needs_review";
+      const hasLedgerIssue = getReviewStatus(transaction) === "needs_review";
       const allocation = billAllocationsByTransactionId[transaction.id];
       const hasBlockingBillAllocation =
         isIncoming &&
@@ -2833,10 +3034,36 @@ export function BankStatementsPage() {
     }
     return `${transactionOutcomeCounts.needsAttention} transaction${transactionOutcomeCounts.needsAttention === 1 ? "" : "s"} need review`;
   }, [missingOutgoingCount, transactionOutcomeCounts.needsAttention, uncheckedTallyPresenceCount]);
+  const reviewWorkStatusCounts = useMemo(() => {
+    const counts = { needsAction: 0, ready: 0, completed: 0 };
+    for (const transaction of validTransactions) {
+      const completed = tallyPresenceByTransactionId[transaction.id]?.status === "found";
+      if (completed) counts.completed += 1;
+      else if (getReviewStatus(transaction) === "needs_review") counts.needsAction += 1;
+      else if (getReviewStatus(transaction) === "matched") counts.ready += 1;
+    }
+    return counts;
+  }, [tallyPresenceByTransactionId, validTransactions]);
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
     return validTransactions.filter((transaction) => {
-      if (reviewStatusFilter !== "all" && getReviewStatus(transaction) !== reviewStatusFilter) {
+      const ledgerReview = getLedgerReviewFilterValue(transaction);
+      const tallyResult = getTallyResultFilterValue(tallyPresenceByTransactionId[transaction.id]);
+      const completed = tallyPresenceByTransactionId[transaction.id]?.status === "found";
+      const workStatus: Exclude<ReviewWorkStatusFilter, "all"> | null = completed
+        ? "completed"
+        : getReviewStatus(transaction) === "needs_review"
+          ? "needs_action"
+          : getReviewStatus(transaction) === "matched"
+            ? "ready"
+            : null;
+      if (reviewWorkStatusFilter !== "all" && workStatus !== reviewWorkStatusFilter) {
+        return false;
+      }
+      if (reviewTallyResultFilter !== "all" && tallyResult !== reviewTallyResultFilter) {
+        return false;
+      }
+      if (reviewLedgerFilter !== "all" && ledgerReview !== reviewLedgerFilter) {
         return false;
       }
       if (reviewDirectionFilter === "debit" && (parseNumber(transaction.debitAmount) ?? 0) <= 0) {
@@ -2849,6 +3076,17 @@ export function BankStatementsPage() {
         return false;
       }
       if (reviewDateTo && transaction.transactionDate > reviewDateTo) {
+        return false;
+      }
+      if (
+        tallyCheckAttempted &&
+        reviewAllocationFilter !== "all" &&
+        getReceiptAllocationFilterValue(
+          transaction,
+          ledgerMasters,
+          billAllocationsByTransactionId[transaction.id]
+        ) !== reviewAllocationFilter
+      ) {
         return false;
       }
 
@@ -2864,13 +3102,29 @@ export function BankStatementsPage() {
         transaction.suggestedLedgerName,
         transaction.selectedLedgerName,
         transaction.ledgerGroup,
+        getLedgerGroupLabel(transaction, ledgerMasters),
+        ...transaction.candidateLedgerNames,
         transaction.debitAmount,
         transaction.creditAmount,
         getTransactionPartyTitle(transaction),
       ].join(" ");
       return normalizeName(searchable).includes(normalizedSearch);
     });
-  }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, validTransactions]);
+  }, [
+    billAllocationsByTransactionId,
+    ledgerMasters,
+    reviewAllocationFilter,
+    reviewDateFrom,
+    reviewDateTo,
+    reviewDirectionFilter,
+    reviewLedgerFilter,
+    reviewSearch,
+    reviewTallyResultFilter,
+    reviewWorkStatusFilter,
+    tallyCheckAttempted,
+    tallyPresenceByTransactionId,
+    validTransactions,
+  ]);
   const visibleReviewTransactions = useMemo(
     () => {
       const start = (reviewPage - 1) * rowsPerPage;
@@ -2913,18 +3167,161 @@ export function BankStatementsPage() {
   const statementReviewDrawerLocked = tallyPostingInProgress;
   const activeReviewFilterCount = [
     reviewSearch.trim(),
-    reviewStatusFilter !== "all" ? reviewStatusFilter : "",
+    reviewWorkStatusFilter !== "all" ? reviewWorkStatusFilter : "",
+    reviewTallyResultFilter !== "all" ? reviewTallyResultFilter : "",
+    reviewLedgerFilter !== "all" ? reviewLedgerFilter : "",
     reviewDirectionFilter !== "all" ? reviewDirectionFilter : "",
+    tallyCheckAttempted && reviewAllocationFilter !== "all" ? reviewAllocationFilter : "",
     reviewDateFrom,
     reviewDateTo,
   ].filter(Boolean).length;
   useEffect(() => {
     setReviewPage(1);
-  }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, rowsPerPage]);
+  }, [
+    reviewAllocationFilter,
+    reviewDateFrom,
+    reviewDateTo,
+    reviewDirectionFilter,
+    reviewLedgerFilter,
+    reviewSearch,
+    reviewTallyResultFilter,
+    reviewWorkStatusFilter,
+    rowsPerPage,
+  ]);
 
   useEffect(() => {
     setReviewPage((current) => Math.min(current, reviewPageCount));
   }, [reviewPageCount]);
+
+  useEffect(() => {
+    if (visibleReviewTransactions.length === 0) {
+      setActiveReviewTransactionId(null);
+      return;
+    }
+    setActiveReviewTransactionId((current) =>
+      current && visibleReviewTransactions.some((transaction) => transaction.id === current)
+        ? current
+        : visibleReviewTransactions[0].id
+    );
+  }, [visibleReviewTransactions]);
+
+  useEffect(() => {
+    function isTypingTarget(target: EventTarget | null) {
+      if (!(target instanceof HTMLElement)) return false;
+      return (
+        target.isContentEditable ||
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT"
+      );
+    }
+
+    function isInteractiveTarget(target: EventTarget | null) {
+      return target instanceof HTMLElement && Boolean(target.closest("button, a, [role='button']"));
+    }
+
+    function handleReviewShortcut(event: KeyboardEvent) {
+      if (!preview) {
+        if (event.key === "Escape" && shortcutsOpen) {
+          event.preventDefault();
+          setShortcutsOpen(false);
+        }
+        return;
+      }
+
+      if (event.key === "Escape") {
+        if (shortcutsOpen) {
+          event.preventDefault();
+          setShortcutsOpen(false);
+        } else if (billAllocationReviewTransactionId) {
+          event.preventDefault();
+          setBillAllocationReviewTransactionId(null);
+        } else if (outgoingReviewTransactionId) {
+          event.preventDefault();
+          setOutgoingReviewTransactionId(null);
+        } else if (editingLedgerIds.size > 0) {
+          event.preventDefault();
+          setEditingLedgerIds(new Set());
+        } else if (reviewFiltersOpen) {
+          event.preventDefault();
+          setReviewFiltersOpen(false);
+        } else if (bankLedgerChangeMode) {
+          event.preventDefault();
+          cancelBankLedgerChange();
+        }
+        return;
+      }
+
+      if (shortcutsOpen || billAllocationReviewTransactionId || outgoingReviewTransactionId) return;
+
+      if (event.altKey && event.key === "F2") {
+        event.preventDefault();
+        setReviewFiltersOpen(true);
+        window.requestAnimationFrame(() => reviewPeriodInputRef.current?.focus());
+        return;
+      }
+
+      if (event.altKey && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setReviewFiltersOpen(true);
+        window.requestAnimationFrame(() => reviewSearchInputRef.current?.focus());
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        setReviewFiltersOpen((current) => !current);
+        return;
+      }
+
+      if (isTypingTarget(event.target) || isInteractiveTarget(event.target)) return;
+
+      if (["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp"].includes(event.key)) {
+        if (filteredTransactions.length === 0) return;
+        event.preventDefault();
+        const currentIndex = filteredTransactions.findIndex(
+          (transaction) => transaction.id === activeReviewTransactionId
+        );
+        let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+        if (event.key === "Home") nextIndex = 0;
+        else if (event.key === "End") nextIndex = filteredTransactions.length - 1;
+        else if (event.key === "ArrowDown") nextIndex += 1;
+        else if (event.key === "ArrowUp") nextIndex -= 1;
+        else if (event.key === "PageDown") nextIndex += rowsPerPage;
+        else if (event.key === "PageUp") nextIndex -= rowsPerPage;
+        nextIndex = Math.min(Math.max(nextIndex, 0), filteredTransactions.length - 1);
+        const nextTransaction = filteredTransactions[nextIndex];
+        setActiveReviewTransactionId(nextTransaction.id);
+        setReviewPage(Math.floor(nextIndex / rowsPerPage) + 1);
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            reviewRowRefs.current.get(nextTransaction.id)?.scrollIntoView({ block: "nearest" });
+          });
+        });
+        return;
+      }
+
+      if ((event.key === "Enter" || event.key === "F2") && activeReviewTransactionId && !statementReviewLocked) {
+        event.preventDefault();
+        setEditingLedgerIds(new Set([activeReviewTransactionId]));
+      }
+    }
+
+    window.addEventListener("keydown", handleReviewShortcut);
+    return () => window.removeEventListener("keydown", handleReviewShortcut);
+  }, [
+    activeReviewTransactionId,
+    bankLedgerChangeMode,
+    billAllocationReviewTransactionId,
+    editingLedgerIds,
+    filteredTransactions,
+    outgoingReviewTransactionId,
+    preview,
+    reviewFiltersOpen,
+    rowsPerPage,
+    shortcutsOpen,
+    statementReviewLocked,
+  ]);
   const billAllocationReviewTransaction = billAllocationReviewTransactionId
     ? validTransactions.find((transaction) => transaction.id === billAllocationReviewTransactionId) ?? null
     : null;
@@ -2934,9 +3331,46 @@ export function BankStatementsPage() {
   const outgoingReviewTransaction = outgoingReviewTransactionId
     ? validTransactions.find((transaction) => transaction.id === outgoingReviewTransactionId) ?? null
     : null;
-  const outgoingReviewDraft = outgoingReviewTransaction
-    ? outgoingVerificationsByTransactionId[outgoingReviewTransaction.id] ?? null
+  const tallyResultReviewDraft = outgoingReviewTransaction
+    ? tallyPresenceByTransactionId[outgoingReviewTransaction.id] ??
+      outgoingVerificationsByTransactionId[outgoingReviewTransaction.id] ??
+      null
     : null;
+  const tallyResultReviewIsIncoming = outgoingReviewTransaction
+    ? isIncomingReceiptRow(outgoingReviewTransaction)
+    : false;
+  const tallyResultReviewDirection = tallyResultReviewIsIncoming ? "receipt" : "payment";
+  const tallyResultReviewAmount = outgoingReviewTransaction
+    ? tallyResultReviewIsIncoming
+      ? outgoingReviewTransaction.creditAmount
+      : outgoingReviewTransaction.debitAmount
+    : 0;
+  const tallyResultReviewReason = (() => {
+    if (!outgoingReviewTransaction || !tallyResultReviewDraft) {
+      return `Run Check Tally Matches to verify this ${tallyResultReviewDirection} against Tally.`;
+    }
+    if (tallyResultReviewDraft.status === "found") {
+      const genericOutgoingReason = "Existing outgoing entry was found in Tally.";
+      if (!tallyResultReviewDraft.reason || (tallyResultReviewIsIncoming && tallyResultReviewDraft.reason === genericOutgoingReason)) {
+        return `This ${tallyResultReviewDirection} matches an existing Tally voucher. No action is required.`;
+      }
+    }
+    return tallyResultReviewDraft.reason;
+  })();
+  const tallyResultReviewEvidence: OutgoingMatchCandidate[] = tallyResultReviewDraft?.matches?.length
+    ? tallyResultReviewDraft.matches
+    : tallyResultReviewDraft?.status === "found" &&
+        (tallyResultReviewDraft.voucherNumber || tallyResultReviewDraft.voucherDate)
+      ? [{
+          reasons: [],
+          date: tallyResultReviewDraft.voucherDate,
+          voucherNumber: tallyResultReviewDraft.voucherNumber,
+          partyLedgerName: outgoingReviewTransaction?.selectedLedgerName || null,
+          ledgerNames: outgoingReviewTransaction?.selectedLedgerName
+            ? [outgoingReviewTransaction.selectedLedgerName]
+            : [],
+        }]
+      : [];
 
   const loadTallyConnections = useCallback(async () => {
     const response = await apiFetch("/api/tally/connections", { cache: "no-store" });
@@ -3751,6 +4185,16 @@ export function BankStatementsPage() {
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
     setStatementDirectionsSwapped(false);
+    setReviewFiltersOpen(false);
+    setReviewSearch("");
+    setReviewWorkStatusFilter("all");
+    setReviewTallyResultFilter("all");
+    setReviewLedgerFilter("all");
+    setReviewDirectionFilter("all");
+    setReviewAllocationFilter("all");
+    setReviewDateFrom("");
+    setReviewDateTo("");
+    setActiveReviewTransactionId(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }
@@ -3797,11 +4241,90 @@ export function BankStatementsPage() {
     setStatementPassword("");
     setStatementPasswordRequired(false);
     setStatementPasswordError(null);
+    setStatementPasswordChecking(false);
+    setStatementPasswordVerified(false);
     setFile(nextFile);
     try {
-      setDocumentPreview(await buildDocumentPreview(nextFile));
+      const nextPreview = await buildDocumentPreview(nextFile);
+      setDocumentPreview(nextPreview);
+      if (nextPreview.kind === "pdf" && !nextPreview.error) {
+        await unlockStatementPdfPreview(nextFile, "");
+      }
     } finally {
       setDocumentPreviewLoading(false);
+    }
+  }
+
+  async function unlockStatementPdfPreview(nextFile = file, password = statementPassword) {
+    if (!nextFile || !isPdfFile(nextFile)) return false;
+
+    setStatementPasswordChecking(true);
+    setStatementPasswordError(null);
+    setStatementPasswordVerified(false);
+
+    try {
+      const formData = new FormData();
+      formData.set("file", nextFile);
+      if (password) {
+        formData.set("statementPassword", password);
+      }
+
+      const response = await apiFetch("/api/bank-statements/pdf-preview", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const payload = await readApiErrorPayload(response);
+        const isPasswordIssue =
+          payload.code === "BANK_STATEMENT_PASSWORD_REQUIRED" ||
+          payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT";
+
+        if (isPasswordIssue) {
+          const message =
+            payload.error ??
+            (payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT"
+              ? "That password is incorrect. Check it and try again."
+              : "This PDF is password protected. Enter its password to continue.");
+          setStatementPasswordRequired(true);
+          setStatementPasswordError(
+            payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT" ? message : null
+          );
+          if (payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT") {
+            setStatementPassword("");
+            setBanner({ tone: "error", text: message });
+          }
+          return false;
+        }
+
+        const message = payload.error ?? "This PDF could not be prepared for preview.";
+        setStatementPasswordError(message);
+        setBanner({ tone: "error", text: message });
+        return false;
+      }
+
+      const unlockedPdfUrl = URL.createObjectURL(await response.blob());
+      setDocumentPreview((current) => {
+        if (!current || current.fileName !== nextFile.name) {
+          URL.revokeObjectURL(unlockedPdfUrl);
+          return current;
+        }
+        return { ...current, objectUrl: unlockedPdfUrl, error: null };
+      });
+
+      if (password) {
+        setStatementPasswordRequired(true);
+        setStatementPasswordVerified(true);
+        setBanner({ tone: "success", text: "PDF unlocked. You can review and analyze it now." });
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "This PDF could not be prepared for preview.";
+      setStatementPasswordError(message);
+      setBanner({ tone: "error", text: message });
+      return false;
+    } finally {
+      setStatementPasswordChecking(false);
     }
   }
 
@@ -3812,6 +4335,8 @@ export function BankStatementsPage() {
     setStatementPassword("");
     setStatementPasswordRequired(false);
     setStatementPasswordError(null);
+    setStatementPasswordChecking(false);
+    setStatementPasswordVerified(false);
     setDragActive(false);
     setBanner(null);
     setPostUploadSyncImportId(null);
@@ -3931,8 +4456,14 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: setupErrorMessage || "Refresh Gajkesari to verify the Tally company before upload." });
       return;
     }
-    if (statementPasswordRequired && isPdfFile(nextFile) && !statementPassword.trim()) {
-      const message = "Enter the statement password to continue.";
+    if (
+      statementPasswordRequired &&
+      isPdfFile(nextFile) &&
+      (!statementPassword.trim() || !statementPasswordVerified)
+    ) {
+      const message = statementPassword.trim()
+        ? "Unlock the PDF preview with this password before analysis."
+        : "Enter the statement password to continue.";
       setStatementPasswordError(message);
       setBanner({ tone: "error", text: message });
       return;
@@ -3982,6 +4513,7 @@ export function BankStatementsPage() {
           payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT"
         ) {
           setStatementPasswordRequired(true);
+          setStatementPasswordVerified(false);
           setStatementPasswordError(payload.error ?? "This statement could not be unlocked.");
           if (payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT") {
             setStatementPassword("");
@@ -3999,6 +4531,7 @@ export function BankStatementsPage() {
       setStatementPassword("");
       setStatementPasswordRequired(false);
       setStatementPasswordError(null);
+      setStatementPasswordVerified(false);
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -4864,6 +5397,65 @@ export function BankStatementsPage() {
           </div>
         ))}
       </div>
+      {shortcutsOpen ? (
+        <div
+          aria-labelledby="bank-statement-shortcuts-title"
+          aria-modal="true"
+          className="fixed inset-0 z-[1100] flex items-center justify-center bg-black/35 p-4 backdrop-blur-[2px]"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) setShortcutsOpen(false);
+          }}
+          role="dialog"
+        >
+          <div className="w-full max-w-lg rounded-2xl border border-[#ddd3c5] bg-white p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-black text-[#1a1a1a]" id="bank-statement-shortcuts-title">
+                  Bank statement shortcuts
+                </h2>
+                <p className="mt-1 text-xs font-semibold leading-5 text-slate-500">
+                  {preview
+                    ? "Familiar Tally-style keys for reviewing the analysed statement without leaving the table."
+                    : "These Tally-style review shortcuts become active after a statement has been analysed."}
+                </p>
+              </div>
+              <button
+                aria-label="Close keyboard shortcuts"
+                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e5ddd0] text-slate-600 transition hover:bg-[#faf8f4]"
+                onClick={() => setShortcutsOpen(false)}
+                type="button"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="mt-5 max-h-[60vh] divide-y divide-[#eee7dc] overflow-auto rounded-xl border border-[#e5ddd0] px-4">
+              {[
+                ["Up / Down", "Move through the filtered transaction list"],
+                ["Home / End", "Move to the first or last filtered transaction"],
+                ["PgUp / PgDn", "Move one page through filtered transactions"],
+                ["Enter", "Open ledger selection for the highlighted row"],
+                ["F2", "Alter the highlighted row's Tally ledger"],
+                ["Alt + F", "Open Filters and focus transaction search"],
+                ["Ctrl + B", "Open or close Filters, including while using them"],
+                ["Alt + F2", "Open Filters and focus the statement period"],
+                ["Esc", "Close the current popover, editor, drawer, filters, or this window"],
+              ].map(([shortcut, description]) => (
+                <div className="flex items-center gap-4 py-3" key={shortcut}>
+                  <kbd className="inline-flex min-w-20 justify-center rounded-md border border-[#d8cbbb] bg-[#faf8f4] px-2 py-1 text-[11px] font-black text-[#4b3828] shadow-sm">
+                    {shortcut}
+                  </kbd>
+                  <span className="text-sm font-semibold text-slate-600">{description}</span>
+                </div>
+              ))}
+            </div>
+            <p className="mt-4 text-xs font-semibold text-slate-500">
+              {preview
+                ? "You can also click any Tally Ledger cell to open the same selector directly."
+                : "Upload and analyse a statement first; the highlighted-row and filter shortcuts will then be available."}
+            </p>
+          </div>
+        </div>
+      ) : null}
       <div className={`bank-statements-workflow min-h-screen bg-[#f7f7f5] px-4 text-[#1a1a1a] sm:px-8 ${preview ? "py-3 pb-40 sm:py-4 sm:pb-40" : "py-6 sm:py-8"}`}>
         <div className={`mx-auto flex max-w-7xl flex-col ${preview ? "gap-2.5" : "gap-4"}`}>
           <header className={`flex flex-col md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "gap-2 pb-2" : "gap-3 pb-4"}`}>
@@ -4887,6 +5479,15 @@ export function BankStatementsPage() {
                     {statementDoneSummary ? "Completed" : "Analyzed"}
                   </span>
                 )}
+                <button
+                  aria-label="View bank statement keyboard shortcuts"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[#ddd3c5] bg-white text-[#6f6255] shadow-sm transition hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
+                  onClick={() => setShortcutsOpen(true)}
+                  title="Keyboard shortcuts"
+                  type="button"
+                >
+                  <Info className="h-4 w-4" />
+                </button>
               </h1>
               {!preview && (
                 <p className="text-xs font-semibold text-slate-500 mt-1">
@@ -5292,7 +5893,10 @@ export function BankStatementsPage() {
                             !file ||
                             !selectedCompanyId ||
                             !uploadContextReady ||
-                            (statementPasswordRequired && !statementPassword.trim()) ||
+                            (statementPasswordRequired &&
+                              (!statementPassword.trim() ||
+                                !statementPasswordVerified ||
+                                statementPasswordChecking)) ||
                             Boolean(statementPasswordError && !statementPasswordRequired)
                           }
                           onClick={() => {
@@ -5331,35 +5935,83 @@ export function BankStatementsPage() {
                           </div>
                         </div>
                       </div>
-                      {documentPreview.kind === "pdf" && (statementPasswordRequired || statementPasswordError) ? (
-                        <div className="rounded-xl border border-amber-200 bg-white px-3 py-3">
-                          <label className="block">
+                      {documentPreview.kind === "pdf" &&
+                      (statementPasswordRequired || statementPasswordError || statementPasswordChecking) ? (
+                        <div
+                          className={`rounded-xl border px-3 py-3 ${
+                            statementPasswordVerified
+                              ? "border-emerald-200 bg-emerald-50"
+                              : statementPasswordError
+                                ? "border-rose-200 bg-rose-50"
+                                : "border-amber-200 bg-white"
+                          }`}
+                        >
+                          <label className={statementPasswordVerified ? "hidden" : "block"}>
                             <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">
                               Statement password
                             </span>
-                            {statementPasswordRequired ? (
+                            <div className="mt-2 flex gap-2">
                               <input
                                 autoComplete="off"
-                                className="mt-2 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-sm font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-300 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                                autoFocus={statementPasswordRequired}
+                                className="h-9 min-w-0 flex-1 rounded-xl border border-[#e5ddd0] bg-white px-3 text-sm font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-300 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                                disabled={statementPasswordChecking}
                                 onChange={(event) => {
                                   setStatementPassword(event.target.value);
                                   setStatementPasswordError(null);
+                                  setStatementPasswordVerified(false);
                                   setBanner(null);
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" && statementPassword.trim() && !statementPasswordChecking) {
+                                    event.preventDefault();
+                                    void unlockStatementPdfPreview(file, statementPassword);
+                                  }
                                 }}
                                 placeholder="Enter PDF password"
                                 type="password"
                                 value={statementPassword}
                               />
-                            ) : null}
+                              <button
+                                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                                disabled={!statementPassword.trim() || statementPasswordChecking}
+                                onClick={() => void unlockStatementPdfPreview(file, statementPassword)}
+                                type="button"
+                              >
+                                {statementPasswordChecking ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : null}
+                                {statementPasswordChecking ? "Checking" : "Unlock preview"}
+                              </button>
+                            </div>
                           </label>
-                          <div className={`mt-2 flex items-start gap-2 text-xs font-semibold ${statementPasswordError ? "text-amber-900" : "text-[#7a6c5f]"}`}>
-                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                          <div
+                            aria-live="polite"
+                            className={`flex items-start gap-2 text-xs font-semibold ${
+                              statementPasswordVerified
+                                ? "text-emerald-800"
+                                : statementPasswordError
+                                  ? "mt-2 text-rose-800"
+                                  : "mt-2 text-[#7a6c5f]"
+                            }`}
+                          >
+                            {statementPasswordVerified ? (
+                              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
+                            ) : (
+                              <AlertTriangle
+                                className={`mt-0.5 h-4 w-4 shrink-0 ${
+                                  statementPasswordError ? "text-rose-700" : "text-amber-700"
+                                }`}
+                              />
+                            )}
                             <span>
-                              {statementPasswordError ||
-                                "Password is used only for this upload attempt and is not stored."}
+                              {statementPasswordVerified
+                                ? "PDF unlocked. Preview and analysis are ready."
+                                : statementPasswordError ||
+                                  "This PDF is protected. Enter its password to unlock the preview."}
                             </span>
                           </div>
-                          {statementPasswordRequired ? (
+                          {statementPasswordRequired && !statementPasswordVerified ? (
                             <div className="mt-1 text-[11px] font-semibold text-[#7a6c5f]">
                               The password is used only to unlock this PDF for analysis. It is not saved.
                             </div>
@@ -5418,6 +6070,32 @@ export function BankStatementsPage() {
                             title={`Preview of ${documentPreview.fileName}`}
                             className="h-[680px] w-full bg-white"
                           />
+                        ) : documentPreview.kind === "pdf" ? (
+                          <div className="flex min-h-[420px] items-center justify-center bg-[#faf8f4] px-6 py-12 text-center">
+                            <div className="max-w-sm">
+                              <div
+                                className={`mx-auto flex h-11 w-11 items-center justify-center rounded-2xl ${
+                                  statementPasswordChecking
+                                    ? "bg-slate-200 text-slate-600"
+                                    : "bg-amber-100 text-amber-800"
+                                }`}
+                              >
+                                {statementPasswordChecking ? (
+                                  <Loader2 className="h-5 w-5 animate-spin" />
+                                ) : (
+                                  <Landmark className="h-5 w-5" />
+                                )}
+                              </div>
+                              <div className="mt-3 text-sm font-extrabold text-[#1a1a1a]">
+                                {statementPasswordChecking ? "Checking PDF security" : "Password required"}
+                              </div>
+                              <p className="mt-1 text-xs font-semibold leading-5 text-[#7a6c5f]">
+                                {statementPasswordChecking
+                                  ? "Preparing a safe preview without storing the document password."
+                                  : "Enter the PDF password on the left, then choose Unlock preview."}
+                              </p>
+                            </div>
+                          </div>
                         ) : documentPreview.kind === "image" && documentPreview.objectUrl ? (
                           <div className="flex max-h-[640px] items-center justify-center overflow-auto bg-white p-5">
                             {/* eslint-disable-next-line @next/next/no-img-element -- Local object URLs cannot be optimized by next/image. */}
@@ -5482,9 +6160,9 @@ export function BankStatementsPage() {
                         {bankLedgerChangeMode || !bankLedgerName ? (
                           <div className="mt-1.5">
                             <LedgerSearchSelect
+                              groups={bankLedgerPickerGroups}
                               onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
-                              options={bankLedgerOptions.map((ledger) => ledger.name)}
-                              placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
+                              placeholder="Search bank accounts or all Tally ledgers"
                               value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
                             />
                             {bankLedgerChangeMode ? (
@@ -5812,9 +6490,9 @@ export function BankStatementsPage() {
                     ) : (
                       <div className="mt-2">
                         <LedgerSearchSelect
+                          groups={bankLedgerPickerGroups}
                           onChange={applyTallyBankLedgerSelection}
-                          options={bankLedgerOptions.map((ledger) => ledger.name)}
-                          placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank account"}
+                          placeholder="Search bank accounts or all Tally ledgers"
                           value={bankLedgerName}
                         />
                       </div>
@@ -5845,7 +6523,9 @@ export function BankStatementsPage() {
                         ) : null}
                       </button>
                       <span className="text-[11px] font-bold text-slate-400">
-                        {validTransactions.length} transaction{validTransactions.length === 1 ? "" : "s"}
+                        {filteredTransactions.length === validTransactions.length
+                          ? `${validTransactions.length} transaction${validTransactions.length === 1 ? "" : "s"}`
+                          : `${filteredTransactions.length} of ${validTransactions.length} transactions`}
                       </span>
                       {!tallyCheckAttempted && validTransactions.length > 0 ? (
                         <button
@@ -5915,7 +6595,23 @@ export function BankStatementsPage() {
                   </div>
                   {reviewFiltersOpen ? (
                     <div className="mt-3.5 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/60 p-4">
-                      <div className="grid gap-3.5 md:grid-cols-2 xl:grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr_0.8fr_auto] xl:items-end">
+                      <div className="grid gap-3.5 md:grid-cols-2 xl:grid-cols-4 xl:items-end">
+                        <label className="block">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                            Work status
+                          </span>
+                          <select
+                            className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            onChange={(event) => setReviewWorkStatusFilter(event.target.value as ReviewWorkStatusFilter)}
+                            title="Needs action contains only unresolved close ledger matches."
+                            value={reviewWorkStatusFilter}
+                          >
+                            <option value="all">All transactions ({validTransactions.length})</option>
+                            <option value="needs_action">Needs action - close matches ({reviewWorkStatusCounts.needsAction})</option>
+                            <option value="ready">Ready ({reviewWorkStatusCounts.ready})</option>
+                            <option value="completed">Completed ({reviewWorkStatusCounts.completed})</option>
+                          </select>
+                        </label>
                         <label className="block">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                             Search
@@ -5926,79 +6622,119 @@ export function BankStatementsPage() {
                               className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-semibold text-[#1a1a1a] outline-none placeholder:text-slate-400 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                               onChange={(event) => setReviewSearch(event.target.value)}
                               placeholder="Narration, amount, ledger, reference..."
+                              ref={reviewSearchInputRef}
                               value={reviewSearch}
                             />
                           </div>
                         </label>
                         <label className="block">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                            Status
+                            Tally result
                           </span>
                           <select
                             className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewStatusFilter(event.target.value as ReviewStatusFilter)}
-                            value={reviewStatusFilter}
+                            onChange={(event) => setReviewTallyResultFilter(event.target.value as ReviewTallyResultFilter)}
+                            value={reviewTallyResultFilter}
                           >
-                            <option value="all">All rows</option>
-                            <option value="matched">Ledger matched</option>
-                            <option value="needs_review">Needs review</option>
-                            <option value="suspense">Suspense</option>
+                            <option value="all">All Tally results</option>
+                            <option value="pending">Check pending</option>
+                            <option value="found">Found in Tally</option>
+                            <option value="missing">Not found in Tally</option>
+                            <option value="review">Ambiguous or duplicate</option>
+                            <option value="failed">Failed or cannot check</option>
                           </select>
                         </label>
                         <label className="block">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                            Type
+                            Ledger review
+                          </span>
+                          <select
+                            className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            onChange={(event) => setReviewLedgerFilter(event.target.value as ReviewLedgerFilter)}
+                            value={reviewLedgerFilter}
+                          >
+                            <option value="all">All ledger reviews</option>
+                            <option value="needs_action">Close match needs action</option>
+                            <option value="automatic">Matched automatically</option>
+                            <option value="manual">Confirmed manually</option>
+                            <option value="suspense">Suspense / no match</option>
+                          </select>
+                        </label>
+                        <label className="block">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                            Payment / receipt
                           </span>
                           <select
                             className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
                             onChange={(event) => setReviewDirectionFilter(event.target.value as ReviewDirectionFilter)}
                             value={reviewDirectionFilter}
                           >
-                            <option value="all">Debit and credit</option>
-                            <option value="debit">Debit only</option>
-                            <option value="credit">Credit only</option>
+                            <option value="all">Payments and receipts</option>
+                            <option value="debit">Payments only</option>
+                            <option value="credit">Receipts only</option>
                           </select>
                         </label>
-                        <label className="block">
+                        <label className="block xl:col-span-2">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                            From date
+                            Statement period
                           </span>
-                          <div className="relative mt-1.5">
-                            <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                            <input
-                              className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                              onChange={(event) => setReviewDateFrom(event.target.value)}
-                              type="date"
-                              value={reviewDateFrom}
-                            />
+                          <div className="mt-1.5 grid grid-cols-2 gap-2">
+                            <div className="relative">
+                              <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                              <input
+                                aria-label="Statement period from"
+                                className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                                onChange={(event) => setReviewDateFrom(event.target.value)}
+                                ref={reviewPeriodInputRef}
+                                type="date"
+                                value={reviewDateFrom}
+                              />
+                            </div>
+                            <div className="relative">
+                              <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                              <input
+                                aria-label="Statement period to"
+                                className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                                onChange={(event) => setReviewDateTo(event.target.value)}
+                                type="date"
+                                value={reviewDateTo}
+                              />
+                            </div>
                           </div>
                         </label>
-                        <label className="block">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                            To date
-                          </span>
-                          <div className="relative mt-1.5">
-                            <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                            <input
-                              className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                              onChange={(event) => setReviewDateTo(event.target.value)}
-                              type="date"
-                              value={reviewDateTo}
-                            />
-                          </div>
-                        </label>
+                        {tallyCheckAttempted ? (
+                          <label className="block">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                              Receipt allocation
+                            </span>
+                            <select
+                              className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                              onChange={(event) => setReviewAllocationFilter(event.target.value as ReviewAllocationFilter)}
+                              value={reviewAllocationFilter}
+                            >
+                              <option value="all">All allocations</option>
+                              <option value="needs_action">Needs allocation action</option>
+                              <option value="ready">Ready to post</option>
+                              <option value="completed">Allocation completed</option>
+                              <option value="not_applicable">Not applicable</option>
+                            </select>
+                          </label>
+                        ) : null}
                         <button
                           className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
                           onClick={() => {
                             setReviewSearch("");
-                            setReviewStatusFilter("all");
+                            setReviewWorkStatusFilter("all");
+                            setReviewTallyResultFilter("all");
+                            setReviewLedgerFilter("all");
                             setReviewDirectionFilter("all");
+                            setReviewAllocationFilter("all");
                             setReviewDateFrom("");
                             setReviewDateTo("");
                           }}
                           type="button"
                         >
-                          Reset
+                          Reset all
                         </button>
                       </div>
                     </div>
@@ -6053,7 +6789,20 @@ export function BankStatementsPage() {
                           const ledgerMatchStatusClass = getReviewStatusClass(transaction);
 
                           return (
-                            <tr key={transaction.id} className="align-middle hover:bg-[#fcfbfa]/60 transition-colors">
+                            <tr
+                              aria-selected={activeReviewTransactionId === transaction.id}
+                              className={`align-middle transition-colors ${
+                                activeReviewTransactionId === transaction.id
+                                  ? "bg-amber-50/70 shadow-[inset_3px_0_0_#f59e0b]"
+                                  : "hover:bg-[#fcfbfa]/60"
+                              }`}
+                              key={transaction.id}
+                              onMouseDown={() => setActiveReviewTransactionId(transaction.id)}
+                              ref={(node) => {
+                                if (node) reviewRowRefs.current.set(transaction.id, node);
+                                else reviewRowRefs.current.delete(transaction.id);
+                              }}
+                            >
                               <td className="px-3 py-4 text-xs font-bold text-slate-500">
                                 {formatShortDate(transaction.transactionDate)}
                               </td>
@@ -6075,10 +6824,37 @@ export function BankStatementsPage() {
                               <td className="px-3 py-4 text-right text-sm font-extrabold text-emerald-700">
                                 {credit || "-"}
                               </td>
-                              <td className="px-3 py-4 align-top">
+                              <td
+                                className={`px-3 py-4 align-top ${
+                                  !showLedgerSelect && !statementReviewLocked
+                                    ? "cursor-pointer outline-none transition hover:bg-[#fbf7f1] focus-visible:bg-[#fbf7f1] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-300"
+                                    : ""
+                                }`}
+                                onClick={() => {
+                                  if (showLedgerSelect || statementReviewLocked) return;
+                                  setEditingLedgerIds(new Set([transaction.id]));
+                                }}
+                                onKeyDown={(event) => {
+                                  if (showLedgerSelect || statementReviewLocked) return;
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    setEditingLedgerIds(new Set([transaction.id]));
+                                  }
+                                }}
+                                role={!showLedgerSelect && !statementReviewLocked ? "button" : undefined}
+                                tabIndex={!showLedgerSelect && !statementReviewLocked ? 0 : undefined}
+                                title={!showLedgerSelect && !statementReviewLocked ? "Click to change Tally ledger" : undefined}
+                              >
                                 {showLedgerSelect ? (
                                   <LedgerReviewSelect
                                     ledgerMasters={ledgerMasters}
+                                    onCancel={() => {
+                                      setEditingLedgerIds((current) => {
+                                        const next = new Set(current);
+                                        next.delete(transaction.id);
+                                        return next;
+                                      });
+                                    }}
                                     onChange={(selection) => {
                                       updateLedgerSelection(transaction.id, selection);
                                       setEditingLedgerIds((current) => {
@@ -6177,6 +6953,7 @@ export function BankStatementsPage() {
                               </td>
                               <td className="px-2 py-4 text-right align-top">
                                 <button
+                                  data-ledger-editor-toggle
                                   className={`inline-flex h-7 w-7 items-center justify-center rounded-lg transition ${
                                     isEditingLedger
                                       ? "bg-[#2d2d2d] text-white hover:bg-[#1a1a1a]"
@@ -6185,9 +6962,9 @@ export function BankStatementsPage() {
                                   onClick={() =>
                                     setEditingLedgerIds((current) => {
                                       const next = new Set(current);
-                                      if (next.has(transaction.id)) next.delete(transaction.id);
-                                      else next.add(transaction.id);
-                                      return next;
+                                       if (next.has(transaction.id)) next.delete(transaction.id);
+                                       else return new Set([transaction.id]);
+                                       return next;
                                     })
                                   }
                                   disabled={statementReviewLocked}
@@ -6553,7 +7330,7 @@ export function BankStatementsPage() {
               {outgoingReviewTransaction ? (
                 <div className="fixed inset-0 z-50 flex justify-end bg-black/20">
                   <button
-                    aria-label="Close outgoing payment review"
+                    aria-label="Close Tally match details"
                     className="absolute inset-0 cursor-default"
                     onClick={() => setOutgoingReviewTransactionId(null)}
                     type="button"
@@ -6562,7 +7339,11 @@ export function BankStatementsPage() {
                     <div className="flex items-start justify-between border-b border-[#e5ddd0] bg-white px-5 py-4">
                       <div>
                         <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                          Payment Check
+                          {tallyResultReviewDraft?.status === "found" || tallyResultReviewDraft?.status === "ambiguous"
+                            ? "Tally Match Details"
+                            : tallyResultReviewIsIncoming
+                              ? "Receipt Check"
+                              : "Payment Check"}
                         </div>
                         <h2 className="mt-1 text-xl font-extrabold text-[#1a1a1a]">
                           {getTransactionPartyTitle(outgoingReviewTransaction)}
@@ -6570,7 +7351,7 @@ export function BankStatementsPage() {
                         <div className="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-500">
                           <span>{formatShortDate(outgoingReviewTransaction.transactionDate)}</span>
                           <span>-</span>
-                          <span>{formatCurrencyAmount(outgoingReviewTransaction.debitAmount)}</span>
+                          <span>{formatCurrencyAmount(tallyResultReviewAmount)}</span>
                           {getTransactionReference(outgoingReviewTransaction) ? (
                             <>
                               <span>-</span>
@@ -6590,10 +7371,10 @@ export function BankStatementsPage() {
                     </div>
 
                     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-                      <div className="hidden grid gap-3 sm:grid-cols-2">
+                      <div className="mb-4 grid gap-3 rounded-xl border border-[#e5ddd0] bg-white p-4 sm:grid-cols-2">
                         {[
                           ["Bank Date", formatShortDate(outgoingReviewTransaction.transactionDate)],
-                          ["Amount", formatCurrencyAmount(outgoingReviewTransaction.debitAmount)],
+                          ["Amount", formatCurrencyAmount(tallyResultReviewAmount)],
                           ["UTR / Ref", getTransactionReference(outgoingReviewTransaction) || "-"],
                           ["Matched Ledger", outgoingReviewTransaction.selectedLedgerName || "-"],
                           ["Ledger Group", getLedgerGroupLabel(outgoingReviewTransaction, ledgerMasters)],
@@ -6610,45 +7391,52 @@ export function BankStatementsPage() {
 
                       <div className="rounded-xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.01)]">
                         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
-                          <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${getOutgoingVerificationClass(outgoingReviewDraft)}`}>
-                            {getOutgoingVerificationLabel(outgoingReviewDraft)}
-                          </span>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${getOutgoingVerificationClass(tallyResultReviewDraft)}`}>
+                              {getOutgoingVerificationLabel(tallyResultReviewDraft)}
+                            </span>
+                            {tallyResultReviewDraft?.status === "found" && !tallyResultReviewDraft.duplicateInTally ? (
+                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                                No action required
+                              </span>
+                            ) : null}
+                          </div>
                           <span className="text-xs font-semibold text-slate-400">
                             Ledger: {outgoingReviewTransaction.selectedLedgerName || "-"}
                           </span>
                         </div>
                         <p className="mt-3 text-sm leading-6 text-slate-600">
-                          {outgoingReviewDraft?.reason || "Run Check Tally Matches to verify this outgoing row against Tally."}
+                          {tallyResultReviewReason}
                         </p>
                       </div>
 
-                      <section className={outgoingReviewDraft?.matches?.length ? "mt-5" : "hidden"}>
+                      <section className={tallyResultReviewEvidence.length ? "mt-5" : "hidden"}>
                         <div className="flex flex-wrap items-end justify-between gap-2">
                           <div>
                             <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                               Tally evidence
                             </div>
                             <h3 className="mt-1 text-sm font-bold text-[#1a1a1a]">
-                              {outgoingReviewDraft?.status === "found"
-                                ? outgoingReviewDraft.duplicateInTally
+                              {tallyResultReviewDraft?.status === "found"
+                                ? tallyResultReviewDraft.duplicateInTally
                                   ? "Matching Tally vouchers"
                                   : "Matched Tally voucher"
                                 : "Possible Tally vouchers"}
                             </h3>
                           </div>
-                          {outgoingReviewDraft?.status === "found" ? (
+                          {tallyResultReviewDraft?.status === "found" ? (
                             <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${
-                              outgoingReviewDraft.duplicateInTally
+                              tallyResultReviewDraft.duplicateInTally
                                 ? "border-amber-200 bg-amber-50 text-amber-800"
                                 : "border-emerald-200 bg-emerald-50 text-emerald-800"
                             }`}>
-                              {outgoingReviewDraft.duplicateInTally ? "Posted with duplicates" : "Verified match"}
+                              {tallyResultReviewDraft.duplicateInTally ? "Posted with duplicates" : "Verified match"}
                             </span>
                           ) : null}
                         </div>
                         <div className="mt-2 space-y-3">
-                          {outgoingReviewDraft?.matches?.length ? (
-                            outgoingReviewDraft.matches.map((match, index) => (
+                          {tallyResultReviewEvidence.length ? (
+                            tallyResultReviewEvidence.map((match, index) => (
                               <div
                                 key={`${match.masterId || match.voucherNumber || index}`}
                                 className="rounded-xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.01)]"
@@ -6698,7 +7486,9 @@ export function BankStatementsPage() {
                                           </span>
                                         ))
                                       ) : (
-                                        <span className="text-xs font-semibold text-slate-400">No reason returned</span>
+                                        <span className="text-xs font-semibold text-slate-400">
+                                          Unique voucher returned by the live Tally check
+                                        </span>
                                       )}
                                     </div>
                                   </div>
