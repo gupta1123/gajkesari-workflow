@@ -4690,7 +4690,7 @@ export function BankStatementsPage() {
     await syncCompanyData();
   }
 
-  async function fetchOpenBillsForLedgers(connection: TallyConnection, ledgerNames: string[]) {
+  async function fetchOpenBillsForLedgers(connection: TallyConnection, ledgerNames: string[], asOfDate?: string | null) {
     const requestedLedgerNames = Array.from(
       new Set(ledgerNames.map((ledgerName) => ledgerName.trim()).filter(Boolean))
     );
@@ -4707,6 +4707,8 @@ export function BankStatementsPage() {
           ledgerName: requestedLedgerNames[0],
           ledgerNames: requestedLedgerNames,
           companyName: selectedCompanyName || connection.lastCompanyName,
+          asOfDate: asOfDate || undefined,
+          queryPurpose: "bank_statement_match",
         },
       }),
     });
@@ -4992,7 +4994,8 @@ export function BankStatementsPage() {
       const nextDrafts: Record<string, BillAllocationDraft> = {};
       if (receiptTransactionsToMatch.length > 0) {
         const ledgers = Array.from(new Set(receiptTransactionsToMatch.map((transaction) => transaction.selectedLedgerName)));
-        const billDataByLedger = await fetchOpenBillsForLedgers(connection, ledgers);
+        const asOfDate = receiptTransactionsToMatch.map((transaction) => transaction.transactionDate).filter(Boolean).sort().at(-1);
+        const billDataByLedger = await fetchOpenBillsForLedgers(connection, ledgers, asOfDate);
 
         for (const transaction of receiptTransactionsToMatch) {
           if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) {

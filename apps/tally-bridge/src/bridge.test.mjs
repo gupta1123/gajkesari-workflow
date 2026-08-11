@@ -2,14 +2,73 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildCollectionExportXml,
   buildPurchaseVoucherXml,
+  buildRequestedLedgerFormula,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   findBankLedgersFromMasters,
+  fetchCustomerOpenBillsFromTally,
+  openBillBlockRequiresVoucherFallback,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("collection exports apply Tally-side formula filters", () => {
+  const xml = buildCollectionExportXml({ collectionName: "Filtered Bills", tallyType: "Bill", fetchFields: "Name,LedgerName,ClosingBalance", companyName: "Solution Nyx", dateTo: "2026-08-17", formulae: [{ name: "RequestedLedger", formula: '$$IsEqual:$LedgerName:"Customer A"' }], filterNames: ["RequestedLedger"] });
+  assert.match(xml, /<FILTER>RequestedLedger<\/FILTER>/);
+  assert.match(xml, /<SYSTEM TYPE="Formulae" NAME="RequestedLedger"/);
+  assert.match(xml, /<SVTODATE TYPE="Date">20260817<\/SVTODATE>/);
+});
+
+test("ledger filters remain targeted and deduplicated", () => {
+  const formula = buildRequestedLedgerFormula(["Customer A", "Customer A", "Customer B"], ["$LedgerName"]);
+  assert.equal((formula.match(/Customer A/g) || []).length, 1);
+  assert.equal((formula.match(/Customer B/g) || []).length, 1);
+});
+
+test("voucher fallback is required only for incomplete Bill exports", () => {
+  const complete = '<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>';
+  const incomplete = '<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><OPENINGBALANCE>500</OPENINGBALANCE></BILL>';
+  assert.equal(openBillBlockRequiresVoucherFallback(complete), false);
+  assert.equal(openBillBlockRequiresVoucherFallback(incomplete), true);
+});
+
+test("zero targeted bills avoids the voucher export", async () => {
+  const calls = [];
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(result.result.openBills, []);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
+});
+
+test("complete Bill data avoids the voucher fallback", async () => {
+  const calls = [];
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"] }, { exportCollection: async (_url, options) => { calls.push(options); return '<ENVELOPE><STATUS>1</STATUS><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>'; } });
+  assert.equal(calls.length, 1);
+  assert.equal(result.result.openBills[0].pendingAmount, 500);
+});
+
+test("incomplete Bill data performs a targeted voucher fallback", async () => {
+  const calls = [];
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return options.tallyType === "Bill" ? '<ENVELOPE><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><OPENINGBALANCE>500</OPENINGBALANCE></BILL></ENVELOPE>' : '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>'; } });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.tallyType), ["Bill", "Voucher"]);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, true);
+});
+
+test("large ledger sets use one full Bill collection", async () => {
+  const calls = [];
+  const ledgerNames = Array.from({ length: 51 }, (_, index) => `Customer ${index + 1}`);
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames, queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
+  assert.equal(calls.length, 1);
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
+});
+
+test("a failed Bill query is not reported as an empty result", async () => {
+  await assert.rejects(() => fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"] }, { exportCollection: async () => { throw new Error("Tally timed out"); } }), /Tally timed out/);
+});
 
 function bankVoucher({ reference = "", party = "Customer A" } = {}) {
   return {
@@ -42,6 +101,7 @@ test("strict bank presence uses exact reference independently of a wrong selecte
   assert.equal(result.candidates.length, 1);
   assert.equal(result.hasUsableReference, true);
 });
+
 test("strict bank presence requires the exact party when no usable reference exists", () => {
   const result = strictBankTransactionCandidates(
     [bankVoucher({ party: "Actual Customer" })],

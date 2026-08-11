@@ -13,6 +13,7 @@ const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
+const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
 const CONFIG_DIR = path.join(os.homedir(), ".gajkesari-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
@@ -255,7 +256,17 @@ function buildTallyReadinessXml(companyName) {
   ].join("");
 }
 
-function buildCollectionExportXml({ collectionName, tallyType, fetchFields, companyName, childOf, dateFrom, dateTo }) {
+function buildCollectionExportXml({
+  collectionName,
+  tallyType,
+  fetchFields,
+  companyName,
+  childOf,
+  dateFrom,
+  dateTo,
+  formulae = [],
+  filterNames = [],
+}) {
   const companyVariable = companyName
     ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
     : "";
@@ -266,6 +277,18 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
   const childOfFilter = childOf
     ? `<ADD>CHILD OF : ${escapeXml(childOf)}</ADD>`
     : "";
+  const safeFormulae = formulae.filter(
+    (formula) => formula && /^[A-Za-z][A-Za-z0-9_]*$/.test(String(formula.name || "")) && String(formula.formula || "").trim()
+  );
+  const availableFormulaNames = new Set(safeFormulae.map((formula) => formula.name));
+  const appliedFilterNames = filterNames.filter((name) => availableFormulaNames.has(name));
+  const collectionFilter = appliedFilterNames.length > 0
+    ? `<FILTER>${escapeXml(appliedFilterNames.join(","))}</FILTER>`
+    : "";
+  const formulaDefinitions = safeFormulae.map(
+    ({ name, formula }) =>
+      `<SYSTEM TYPE="Formulae" NAME="${escapeXml(name)}" ISMODIFY="No">${escapeXml(String(formula).trim())}</SYSTEM>`
+  );
 
   return [
     "<ENVELOPE>",
@@ -287,14 +310,30 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
     `<COLLECTION NAME="${escapeXml(collectionName)}" ISMODIFY="No">`,
     `<TYPE>${escapeXml(tallyType)}</TYPE>`,
     childOfFilter,
+    collectionFilter,
     `<FETCH>${escapeXml(fetchFields)}</FETCH>`,
     "</COLLECTION>",
+    ...formulaDefinitions,
     "</TDLMESSAGE>",
     "</TDL>",
     "</DESC>",
     "</BODY>",
     "</ENVELOPE>",
   ].join("");
+}
+
+function tallyFormulaString(value) {
+  return `"${String(value ?? "").replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function buildRequestedLedgerFormula(ledgerNames, methodNames = ["$LedgerName"]) {
+  const names = uniquePayloadLedgerNames({ ledgerNames });
+  const methods = Array.from(new Set(methodNames.map((method) => String(method || "").trim()).filter(Boolean)));
+  if (names.length === 0 || methods.length === 0) return "$$IsEmpty:$Name AND NOT $$IsEmpty:$Name";
+  return names
+    .flatMap((ledgerName) => methods.map((method) => `$$IsEqual:${method}:${tallyFormulaString(ledgerName)}`))
+    .map((condition) => `(${condition})`)
+    .join(" OR ");
 }
 
 function buildLedgerBalanceExportXml({ companyName, ledgerName, dateFrom, dateTo }) {
@@ -2560,6 +2599,8 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
   const dates = normalizedTransactions.map((transaction) => transaction.voucherDate).sort();
   const dateFrom = dates[0];
   const dateTo = dates.at(-1);
+  const bankEntryFormulaName = "AutodealerBankLedgerEntry";
+  const bankVoucherFormulaName = "AutodealerBankVoucher";
 
   const xml = await exportTallyCollection(tallyUrl, {
     collectionName: "Gajkesari Bank Statement Reconciliation",
@@ -2569,6 +2610,19 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     companyName,
     dateFrom,
     dateTo,
+    formulae: [
+      {
+        name: bankEntryFormulaName,
+        formula: buildRequestedLedgerFormula([bankLedgerName], ["$LedgerName"]),
+      },
+      {
+        name: bankVoucherFormulaName,
+        formula: `$$FilterCount:AllLedgerEntries:${bankEntryFormulaName} > 0`,
+      },
+    ],
+    // Do not filter by exact VoucherTypeName: Tally companies frequently use
+    // custom voucher types derived from Receipt/Payment/Contra/Journal.
+    filterNames: [bankVoucherFormulaName],
   });
   const vouchers = parseVoucherCollection(xml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
@@ -3133,7 +3187,70 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
   };
 }
 
-async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
+function chunkValues(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) chunks.push(values.slice(index, index + size));
+  return chunks;
+}
+
+function openBillBlockRequiresVoucherFallback(block) {
+  const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
+  if (!referenceName) return false;
+  const hasReferenceType = Boolean(billReferenceType(block));
+  const hasReliablePendingAmount = ["CLOSINGBALANCE", "BALANCE", "PENDINGAMOUNT"].some((tagName) => Boolean(getTagText(block, tagName)));
+  return !hasReferenceType || !hasReliablePendingAmount;
+}
+
+function earliestBillDate(blocks) {
+  const dates = blocks.map((block) => parseTallyDate(getTagText(block, "DATE") || getTagText(block, "BILLDATE"))).filter(Boolean).sort();
+  return dates[0] || null;
+}
+
+async function exportTargetedOpenBillXml(tallyUrl, { companyName, ledgerNames, asOfDate, forceTargeted = false }, exportCollection = exportTallyCollection) {
+  if (!forceTargeted && ledgerNames.length > OPEN_BILL_LEDGER_BATCH_SIZE) {
+    const xml = await exportCollection(tallyUrl, {
+      collectionName: "Gajkesari Customer Open Bills", tallyType: "Bill",
+      fetchFields: "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+      companyName, dateTo: asOfDate,
+    });
+    return { xml, batchCount: 1, queryMode: "full" };
+  }
+  const batches = chunkValues(ledgerNames, OPEN_BILL_LEDGER_BATCH_SIZE);
+  const responses = [];
+  for (const [index, batch] of batches.entries()) {
+    const ledgerFilterName = "GajkesariRequestedBillLedger";
+    responses.push(await exportCollection(tallyUrl, {
+      collectionName: `Gajkesari Customer Open Bills ${index + 1}`, tallyType: "Bill",
+      fetchFields: "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+      companyName, dateTo: asOfDate,
+      formulae: [{ name: ledgerFilterName, formula: buildRequestedLedgerFormula(batch, ["$LedgerName", "$PartyLedgerName", "$Parent"]) }],
+      filterNames: [ledgerFilterName],
+    }));
+  }
+  return { xml: responses.join("\n"), batchCount: batches.length, queryMode: "targeted" };
+}
+
+async function exportTargetedBillEvidenceXml(tallyUrl, { companyName, ledgerNames, dateFrom, dateTo }, exportCollection = exportTallyCollection) {
+  const batches = chunkValues(ledgerNames, OPEN_BILL_LEDGER_BATCH_SIZE);
+  const responses = [];
+  for (const [index, batch] of batches.entries()) {
+    const ledgerEntryFilterName = "GajkesariRequestedPartyEntry";
+    const ledgerVoucherFilterName = "GajkesariRequestedPartyVoucher";
+    responses.push(await exportCollection(tallyUrl, {
+      collectionName: `Gajkesari Customer Bill Evidence ${index + 1}`, tallyType: "Voucher",
+      fetchFields: "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
+      companyName, dateFrom, dateTo,
+      formulae: [
+        { name: ledgerEntryFilterName, formula: buildRequestedLedgerFormula(batch, ["$LedgerName"]) },
+        { name: ledgerVoucherFilterName, formula: `$$FilterCount:AllLedgerEntries:${ledgerEntryFilterName} > 0` },
+      ],
+      filterNames: [ledgerVoucherFilterName],
+    }));
+  }
+  return { xml: responses.join("\n"), batchCount: batches.length };
+}
+
+async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, dependencies = {}) {
   const ledgerNames = uniquePayloadLedgerNames(commandPayload);
   if (ledgerNames.length === 0) {
     throw new Error("Party open bill fetch requires ledgerName.");
@@ -3142,36 +3259,38 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
 
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
+  const forceTargeted = commandPayload.queryPurpose === "bank_statement_match" && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
   // Tally's local HTTP listener processes reports serially. Concurrent large
   // collection exports can leave one request waiting indefinitely, which
   // previously locked the whole connector cycle and surfaced as a dashboard
   // refresh timeout.
-  const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Gajkesari Customer Open Bills",
-    tallyType: "Bill",
-    fetchFields:
-      "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
-    companyName,
-  });
-  const voucherXml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Gajkesari Customer Invoice Narrations",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
-    companyName,
-    dateFrom: "2000-04-01",
-    dateTo: "2099-03-31",
-  });
+  const billExport = await exportTargetedOpenBillXml(tallyUrl, { companyName, ledgerNames, asOfDate, forceTargeted }, exportCollection);
+  const billBlocks = extractBlocks(billExport.xml, "BILL").filter((block) => requestedLedgerByKey.has(normalizeLooseName(billLedgerName(block))));
+  const fallbackBlocks = billBlocks.filter(openBillBlockRequiresVoucherFallback);
+  const fallbackLedgerNames = Array.from(new Set(fallbackBlocks.flatMap((block) => {
+    const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(billLedgerName(block)));
+    return requestedLedgerName ? [requestedLedgerName] : [];
+  })));
+  const voucherExport = fallbackLedgerNames.length > 0
+    ? await exportTargetedBillEvidenceXml(tallyUrl, {
+        companyName,
+        ledgerNames: fallbackLedgerNames,
+        dateFrom: earliestBillDate(fallbackBlocks),
+        dateTo: asOfDate,
+      }, exportCollection)
+    : { xml: "", batchCount: 0 };
   const {
     narrationByBill,
     receiptEvidenceByBill,
     salesLedgerByBill,
     invoiceReferenceKeys,
     advanceReferenceKeys,
-  } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
+  } = indexInvoiceNarrations(voucherExport.xml, requestedLedgerByKey);
   const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
 
-  for (const block of extractBlocks(xml, "BILL")) {
+  for (const block of billBlocks) {
     const rowLedgerName = billLedgerName(block);
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(rowLedgerName));
     if (!requestedLedgerName) continue;
@@ -3234,6 +3353,16 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
       openBills: firstLedgerBucket.openBills,
       existingAdvances: firstLedgerBucket.existingAdvances,
       rawCount: Object.values(byLedger).reduce((total, bucket) => total + bucket.rawCount, 0),
+      queryDiagnostics: {
+        requestedLedgerCount: ledgerNames.length,
+        billBatchCount: billExport.batchCount,
+        billQueryMode: billExport.queryMode,
+        billObjectCount: billBlocks.length,
+        voucherFallbackUsed: fallbackLedgerNames.length > 0,
+        voucherFallbackLedgerCount: fallbackLedgerNames.length,
+        voucherBatchCount: voucherExport.batchCount,
+        asOfDate,
+      },
     },
   };
 }
@@ -4922,6 +5051,8 @@ export {
   createBridgeRunner,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
+  buildCollectionExportXml,
+  buildRequestedLedgerFormula,
   buildPurchaseVoucherXml,
   deleteConfig,
   disconnectBridge,
@@ -4931,6 +5062,7 @@ export {
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   normalizeTallyUrl,
+  openBillBlockRequiresVoucherFallback,
   pairBridge,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
