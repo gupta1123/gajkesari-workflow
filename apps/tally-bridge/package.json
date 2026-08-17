@@ -1,0 +1,17 @@
+{
+  "name": "@gajkesari/tally-bridge",
+  "version": "0.1.41",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/bridge.mjs",
+    "./bridge": "./src/bridge.mjs"
+  },
+  "scripts": {
+    "pair": "node src/bridge.mjs pair",
+    "start": "node src/bridge.mjs start",
+    "disconnect": "node src/bridge.mjs disconnect",
+    "test": "node src/bridge.mjs test",
+    "sync": "node src/bridge.mjs sync-masters"
+  }
+}

@@ -1,0 +1,44 @@
+;; Gajkesari native Debit Note exporter for TallyPrime.
+;;
+;; This add-on is invoked by the Gajkesari connector, never by a user navigating
+;; Tally screens. The connector supplies the voucher MasterID and a PDF path.
+;; The print report is bound to that MasterID, so the currently visible Tally
+;; screen cannot change which document is exported.
+
+[Variable : GajkesariVoucherMasterID]
+Type : String
+
+[Variable : GajkesariDebitNotePdfPath]
+Type : String
+
+[Report : Gajkesari Native Debit Note Print]
+Form   : VCH Display
+Object : Voucher : "ID:" + ##GajkesariVoucherMasterID
+
+[Report : Gajkesari Native Debit Note Export Trigger]
+Form     : Gajkesari Native Debit Note Export Trigger
+Variable : GajkesariVoucherMasterID, GajkesariDebitNotePdfPath
+;; Report events require an explicit condition between the event and action.
+;; `Yes` makes this non-interactive trigger run as soon as Tally loads it.
+On : Load : Yes : Call : Gajkesari Export Native Debit Note PDF
+
+;; Tally's HTTP report runner still instantiates a form, even though the
+;; report only performs a background export.  Keep that form deliberately
+;; empty: it is never shown because the export action suppresses UI.
+[Form : Gajkesari Native Debit Note Export Trigger]
+Part : Gajkesari Native Debit Note Export Trigger
+
+[Part : Gajkesari Native Debit Note Export Trigger]
+Line : Gajkesari Native Debit Note Export Trigger
+
+[Line : Gajkesari Native Debit Note Export Trigger]
+Field : Gajkesari Native Debit Note Export Trigger
+
+[Field : Gajkesari Native Debit Note Export Trigger]
+Set As : ""
+
+[Function : Gajkesari Export Native Debit Note PDF]
+00 : SET : SVPrintFileName : ##GajkesariDebitNotePdfPath
+10 : SET : SVExportFormat : $$SysName:PDF
+20 : SET : SVOutputType : "Export Button"
+30 : EXPORT REPORT : Gajkesari Native Debit Note Print : Yes
