@@ -1,5 +1,6 @@
-import { DashboardHome } from "@/components/dashboard/DashboardHome";
+import { redirect } from "next/navigation";
 
-export default function DashboardPage() {
-  return <DashboardHome />;
+export default function RootPage() {
+  redirect("/tally-prime?view=connection");
 }
+

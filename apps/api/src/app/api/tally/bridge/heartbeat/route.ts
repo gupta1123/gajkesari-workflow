@@ -95,6 +95,13 @@ function resolveStatus(input: {
   return "bridge_connected";
 }
 
+function snapshotChanged(
+  previous: Array<Record<string, unknown>> | null | undefined,
+  next: Array<Record<string, unknown>>
+) {
+  return JSON.stringify(previous ?? []) !== JSON.stringify(next);
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -155,6 +162,7 @@ export async function POST(request: Request) {
         companyLoaded,
         companyName: companyLoaded ? companyName : null,
         error: errorMessage,
+        companies,
       });
 
       if (!connection) {
@@ -218,6 +226,13 @@ export async function POST(request: Request) {
 
     const now = new Date().toISOString();
     const resolvedCompanyName = companyLoaded ? companyName : null;
+    const heartbeatStateChanged =
+      connection.status !== status ||
+      connection.last_tally_reachable !== tallyReachable ||
+      connection.last_company_loaded !== companyLoaded ||
+      (connection.last_company_name ?? null) !== resolvedCompanyName ||
+      (connection.last_error ?? null) !== errorMessage ||
+      snapshotChanged(connection.last_companies_snapshot, companies);
 
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
@@ -232,6 +247,7 @@ export async function POST(request: Request) {
         last_company_loaded: companyLoaded,
         last_company_name: resolvedCompanyName,
         last_error: errorMessage,
+        last_companies_snapshot: companies,
       })
       .eq("id", connection.id)
       .eq("installation_id", bridgeMachineId)
@@ -243,23 +259,26 @@ export async function POST(request: Request) {
       throw updateError;
     }
 
-    await supabase.from("tally_connection_events").insert({
-      connection_id: connection.id,
-      owner_user_id: connection.owner_user_id,
-      event_type: "bridge_heartbeat",
-      message: errorMessage ?? "Bridge heartbeat received.",
-      payload: {
-        status,
-        tallyReachable,
-        companyLoaded,
-        companyName: resolvedCompanyName,
-        heartbeatCompanyName: companyName,
-        bridgeVersion,
-        bridgeMachineId,
-        bridgeMachineName,
-        companies,
-      },
-    });
+    if (heartbeatStateChanged) {
+      const { error: eventError } = await supabase.from("tally_connection_events").insert({
+        connection_id: connection.id,
+        owner_user_id: connection.owner_user_id,
+        event_type: "bridge_heartbeat",
+        message: errorMessage ?? "Bridge heartbeat state changed.",
+        payload: {
+          status,
+          tallyReachable,
+          companyLoaded,
+          companyName: resolvedCompanyName,
+          heartbeatCompanyName: companyName,
+          bridgeVersion,
+          bridgeMachineId,
+          bridgeMachineName,
+          companies,
+        },
+      });
+      if (eventError) throw eventError;
+    }
 
     return jsonWithCors(request, {
       connection: serializeTallyConnectionStatus(updatedData as unknown as TallyConnectionRow),
@@ -269,4 +288,3 @@ export async function POST(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
-

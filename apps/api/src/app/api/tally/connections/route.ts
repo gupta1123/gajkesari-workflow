@@ -75,10 +75,9 @@ function pickRelevantConnections(rows: TallyConnectionRow[]) {
     // in the workstation list.
     .filter(
       (row) =>
-        Boolean(row.bridge_token_hash) &&
         Boolean(row.installation_id) &&
-        Boolean(row.paired_at) &&
-        !row.revoked_at
+        !row.revoked_at &&
+        (Boolean(row.bridge_token_hash) || row.status === "waiting_for_bridge")
     )
     .map(serializeTallyConnectionStatus);
   // A user can legitimately have connectors on multiple Tally machines.
@@ -207,6 +206,51 @@ export async function POST(request: Request) {
     const pairingCode = createPairingCode();
     const controlToken = createBridgeToken();
     const supabase = createSupabaseAdminClient();
+    const reuseConnectionId =
+      typeof body.reuseConnectionId === "string" && body.reuseConnectionId.trim()
+        ? body.reuseConnectionId.trim()
+        : null;
+
+    if (reuseConnectionId) {
+      const { data: existing, error: existingError } = await supabase
+        .from("tally_connections")
+        .select(TALLY_CONNECTION_SELECT)
+        .eq("id", reuseConnectionId)
+        .eq("owner_user_id", user.id)
+        .is("revoked_at", null)
+        .is("bridge_token_hash", null)
+        .maybeSingle();
+      if (existingError) throw existingError;
+      if (existing) {
+        const { data: resumed, error: resumeError } = await supabase
+          .from("tally_connections")
+          .update({
+            status: "waiting_for_bridge",
+            pairing_code_hash: hashSecret(pairingCode),
+            pairing_code_expires_at: createPairingExpiry(),
+            control_token_hash: hashSecret(controlToken),
+            last_error: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", reuseConnectionId)
+          .select(TALLY_CONNECTION_SELECT)
+          .single();
+        if (resumeError) throw resumeError;
+        await logConnectionEvent(
+          reuseConnectionId,
+          user.id,
+          "connection_resume_requested",
+          "Temporary Tally connection resume requested.",
+          { reused: true },
+        );
+        return jsonWithCors(request, {
+          connection: serializeTallyConnection(resumed as unknown as TallyConnectionRow),
+          pairingCode,
+          controlToken,
+          reused: true,
+        });
+      }
+    }
     const retiredAt = new Date().toISOString();
     const { error: retirePendingError } = await supabase
       .from("tally_connections")

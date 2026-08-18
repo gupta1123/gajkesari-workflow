@@ -17,15 +17,18 @@ function disconnectedUpdatePayload(disconnectedAt: string) {
     pairing_code_expires_at: null,
     bridge_token_hash: null,
     control_token_hash: null,
+    // This is a temporary pause. Preserve the connection identity and
+    // installation_id so the next pairing can reuse the same catalogue.
     paired_at: null,
     last_heartbeat_at: null,
     last_tested_at: null,
     last_tally_reachable: null,
     last_company_loaded: null,
     last_company_name: null,
-    revoked_at: disconnectedAt,
-    revoked_reason: "Disconnected by user.",
-    last_error: "Disconnected by user.",
+    revoked_at: null,
+    revoked_reason: null,
+    last_error: "Temporarily disconnected by user.",
+    updated_at: disconnectedAt,
   };
 }
 

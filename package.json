@@ -26,6 +26,7 @@
     "typecheck:api": "npm run typecheck --workspace @gajkesari/api",
     "typecheck": "npm run typecheck:web && npm run typecheck:api",
     "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
+    "evaluate:ledger-matching": "node --env-file=apps/api/.env.local scripts/evaluate-ledger-matching.mjs",
     "worker": "npm run worker --workspace @gajkesari/api",
     "worker:local": "npm run worker:local --workspace @gajkesari/api"
   },

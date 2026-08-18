@@ -10,7 +10,7 @@ export default async function LoginPage() {
   } = await supabase.auth.getUser();
 
   if (user) {
-    redirect("/");
+    redirect("/tally-prime?view=connection");
   }
 
   return <Login />;

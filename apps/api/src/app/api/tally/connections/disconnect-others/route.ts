@@ -10,7 +10,7 @@ import {
 } from "@/lib/tally/connections";
 
 function disconnectedUpdatePayload(disconnectedAt: string) {
-  const reason = "Disconnected from another device by user.";
+  const reason = "Temporarily disconnected from another device by user.";
   return {
     status: "waiting_for_bridge",
     pairing_code_hash: null,
@@ -23,8 +23,9 @@ function disconnectedUpdatePayload(disconnectedAt: string) {
     last_tally_reachable: null,
     last_company_loaded: null,
     last_company_name: null,
-    revoked_at: disconnectedAt,
-    revoked_reason: reason,
+    // Keep the connection reusable; this is a temporary session pause.
+    revoked_at: null,
+    revoked_reason: null,
     last_error: reason,
     updated_at: disconnectedAt,
   };
@@ -143,10 +144,9 @@ export async function POST(request: Request) {
       connections: ((remainingRows ?? []) as unknown as TallyConnectionRow[])
         .filter(
           (row) =>
-            Boolean(row.bridge_token_hash) &&
             Boolean(row.installation_id) &&
-            Boolean(row.paired_at) &&
-            !row.revoked_at,
+            !row.revoked_at &&
+            (Boolean(row.bridge_token_hash) || row.status === "waiting_for_bridge"),
         )
         .map(serializeTallyConnectionStatus),
     });

@@ -34,6 +34,12 @@ export type BankLedgerSuggestionTransaction = {
   transaction: MatchableTransaction;
 };
 
+export type OfflineLedgerCatalogueEntry = {
+  id?: string | null;
+  name: string;
+  parent?: string | null;
+};
+
 type AiLedgerMatch = {
   index: number;
   matchType: "direct_match" | "close_match" | "suspense";
@@ -88,6 +94,11 @@ Allowed matchType values: direct_match, close_match, suspense.
 
 Direct match:
 Use direct_match only when the transaction evidence uniquely identifies exactly one existing ledger. The closest or highest-scoring name is not enough when another ledger remains plausible.
+Collision precedence is absolute: enumerate all plausible ledger collisions before
+considering any exact-name, shortened-name, OCR, or prefix match. If two or more
+ledgers share the meaningful narrated party root, the result must be close_match
+or suspense; never direct_match. The unique-shortened-name rule below applies
+only after this collision scan proves that exactly one ledger shares the root.
 For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
 
 Close match:
@@ -104,6 +115,15 @@ A shortened, OCR-damaged, misspelled, or incomplete party name can still be a di
 Do not call something a close match only because the bank narration does not exactly equal the ledger name.
 Use close_match only when there is a real collision.
 If the narration contains only a shared party root and multiple ledgers extend or vary that root, return close_match and keep the posting ledger in Suspense, even when one candidate has a somewhat stronger textual similarity.
+
+Company-context rule:
+The supplied companyName is the owner of the bank statement. When the raw
+narration contains both an external party and companyName (or a clear legal,
+spacing, or abbreviation variant of companyName), treat the company occurrence
+as account-owner context, not as a competing counterparty. Do not add the
+company's own ledger to candidateLedgerNames unless the narration explicitly
+describes a self-transfer, own-account transfer, inter-company transfer, or
+company loan. Match the external party named before or alongside that context.
 
 Exact complete-name precedence:
 After removing bank-system noise and normalizing only case, spacing, and punctuation, if the narrated party identity exactly equals one complete allowed ledger name, treat that ledger as a direct_match.
@@ -137,6 +157,11 @@ For example, with ledgers Orchid Foundry and Orchid Foundry Supplies, narration 
 
 Do not use ledger group, customer/supplier role, debit/credit direction, amount, or category to choose between colliding names.
 When a real collision exists, return close_match and include every plausible colliding ledger, not only the closest one. A candidate list is never permission to select a candidate.
+If the raw narration contains a distinguishing descriptor that belongs to one
+ledger (for example a product, business type, or location) and the other root-
+matching ledgers do not contain that descriptor, that descriptor resolves the
+collision and the matching ledger may be direct_match. If the descriptor is
+absent or shared, keep close_match.
 Use token boundaries when identifying roots: OM may match ledgers beginning with the separate token OM, but OM must not match OMKAR merely because the letters are a prefix.
 
 Collision examples:
@@ -195,8 +220,24 @@ Reference and memory safety:
 referenceNumber is normally a bank UTR/RRN/reference and does not identify a Tally ledger by itself. A visible invoice or bill reference may support a direct match only when the supplied evidence explicitly connects that reference to one ledger; do not invent that connection. Saved narration mappings are validated before this AI request and are therefore not represented by a guessed AI match.
 
 Final decision rules:
-First verify that the raw description contains identity or purpose evidence. Then check for an exact complete-name match, apply the exact complete-name precedence and its exceptions, and finally run the remaining collision veto. Use direct_match only when exactly one ledger remains possible after these checks; "more likely than the others" is not unique identification.
+First verify that the raw description contains identity or purpose evidence. Then
+perform the complete collision scan. Collision results take precedence over every
+exact, shortened, prefix, OCR, phonetic, or legal-suffix rule. Only after the
+scan confirms exactly one plausible ledger may you apply exact-name or
+shortened-name matching. Use direct_match only when exactly one ledger remains
+possible after these checks; "more likely than the others" is not unique
+identification.
 A unique shortened party name is a direct match when no competing ledger shares that root.
+A shortened-name direct-match rule:
+When the normalized narration contains a contiguous sequence of the complete
+meaningful party-root tokens from exactly one allowed ledger, use direct_match
+even if that ledger has additional descriptive words, products, divisions,
+locations, or legal suffixes that are absent from the bank narration. Bank
+narrations are often truncated after the party root. Missing trailing
+descriptors do not create ambiguity by themselves. Keep suspense or close_match
+only when another allowed ledger shares the same meaningful root, the omitted
+words could identify a different entity, or the narration does not establish a
+credible party root at all.
 A character-for-character match to a shorter ledger is still close_match when another ledger extends that complete name with additional identity words.
 A character-for-character match to one complete ledger is direct_match when the only alternatives are spelling, phonetic, OCR, singular/plural, or legal-suffix variants of that same complete name and no extension or derived-field conflict exists.
 A typo, OCR issue, joined word, missing space, or phonetic variation can still be a direct match when one ledger clearly fits.
@@ -409,6 +450,7 @@ function validateAiLedgerMatch(
 
 async function aiMatchLedgersForTransactions(input: {
   ledgers: TallyMasterRow[];
+  companyName?: string | null;
   transactions: Array<{
     transaction: MatchableTransaction;
     counterpartyName: string | null;
@@ -436,6 +478,7 @@ async function aiMatchLedgersForTransactions(input: {
       {
         role: "user",
         content: compactPromptJson({
+          companyName: input.companyName ?? null,
           transactions: input.transactions.map(({ transaction, counterpartyName }, index) => ({
             index,
             transactionDate: transaction.transactionDate ?? null,
@@ -595,6 +638,7 @@ export async function suggestBankLedgersForTransactions(input: {
   supabase: SupabaseClient;
   ownerUserId: string;
   connectionId?: string | null;
+  companyName?: string | null;
   transactions: BankLedgerSuggestionTransaction[];
 }): Promise<BankLedgerSuggestion[]> {
   if (input.transactions.length === 0) return [];
@@ -681,6 +725,7 @@ export async function suggestBankLedgersForTransactions(input: {
       try {
         const aiMatches = await aiMatchLedgersForTransactions({
           ledgers,
+          companyName: input.companyName,
           transactions: chunk.map((item) => ({
             transaction: item.transaction,
             counterpartyName: item.counterpartyName,
@@ -740,6 +785,113 @@ export async function suggestBankLedgersForTransactions(input: {
   }
 
   return suggestions as BankLedgerSuggestion[];
+}
+
+/**
+ * Run the production AI matcher against a supplied catalogue without
+ * fetching Tally masters or reading saved mappings. This is intentionally
+ * useful for repeatable prompt/quality audits from a Markdown fixture.
+ */
+export async function suggestBankLedgersFromCatalogue(input: {
+  ledgers: OfflineLedgerCatalogueEntry[];
+  companyName?: string | null;
+  transactions: BankLedgerSuggestionTransaction[];
+}): Promise<BankLedgerSuggestion[]> {
+  if (input.transactions.length === 0) return [];
+
+  const ledgers: TallyMasterRow[] = input.ledgers
+    .filter((ledger) => typeof ledger.name === "string" && ledger.name.trim())
+    .map((ledger, index) => ({
+      id: ledger.id ?? `offline-ledger-${index + 1}`,
+      connection_id: "offline-catalogue",
+      owner_user_id: "offline-catalogue",
+      company_name: "offline-catalogue",
+      sync_run_id: null,
+      master_type: "ledger" as const,
+      master_key: normalizeName(ledger.name),
+      tally_guid: null,
+      tally_name: ledger.name.trim(),
+      parent_name: ledger.parent?.trim() || null,
+      gstin: null,
+      hsn_code: null,
+      unit_name: null,
+      tax_rate: null,
+      raw_payload: {},
+      is_active: true,
+      last_synced_at: "",
+      created_at: "",
+      updated_at: "",
+    }));
+
+  const prepared = input.transactions.map((item, index) => ({
+    ...item,
+    index,
+    counterpartyName:
+      item.transaction.counterpartyName ?? extractCounterpartyName(item.transaction.description),
+  }));
+  const suggestions: Array<BankLedgerSuggestion | undefined> = input.transactions.map(() => undefined);
+  let nextChunkIndex = 0;
+  const chunks = chunkValues(prepared, BANK_LEDGER_AI_BATCH_SIZE);
+
+  const runWorker = async () => {
+    while (nextChunkIndex < chunks.length) {
+      const chunk = chunks[nextChunkIndex++];
+      try {
+        const aiMatches = await aiMatchLedgersForTransactions({
+          ledgers,
+          companyName: input.companyName,
+          transactions: chunk.map((item) => ({
+            transaction: item.transaction,
+            counterpartyName: item.counterpartyName,
+          })),
+        });
+        chunk.forEach((item, chunkIndex) => {
+          const aiMatch = aiMatches[chunkIndex];
+          suggestions[item.index] = {
+            counterpartyName: item.counterpartyName,
+            ledgerName: aiMatch?.ledgerName ?? null,
+            confidence: aiMatch?.confidence ?? 0,
+            reason: aiMatch?.reason ?? "AI ledger matching returned no validated result.",
+            mappingSource: aiMatch?.matchType === "close_match" ? "close_match" : aiMatch?.matchType === "direct_match" ? "ai_match" : "none",
+            matchType: aiMatch?.matchType ?? "suspense",
+            candidateLedgerNames: aiMatch?.candidateLedgerNames ?? [],
+          };
+        });
+      } catch (error) {
+        console.warn("Offline ledger matching batch failed; retrying transaction-by-transaction:", error);
+        for (const item of chunk) {
+          try {
+            const [aiMatch] = await aiMatchLedgersForTransactions({
+              ledgers,
+              companyName: input.companyName,
+              transactions: [{ transaction: item.transaction, counterpartyName: item.counterpartyName }],
+            });
+            suggestions[item.index] = {
+              counterpartyName: item.counterpartyName,
+              ledgerName: aiMatch?.ledgerName ?? null,
+              confidence: aiMatch?.confidence ?? 0,
+              reason: aiMatch?.reason ?? "AI ledger matching returned no validated result.",
+              mappingSource: aiMatch?.matchType === "close_match" ? "close_match" : aiMatch?.matchType === "direct_match" ? "ai_match" : "none",
+              matchType: aiMatch?.matchType ?? "suspense",
+              candidateLedgerNames: aiMatch?.candidateLedgerNames ?? [],
+            };
+          } catch (singleError) {
+            console.warn("Offline ledger matching transaction failed:", singleError);
+            suggestions[item.index] = deterministicLedgerSuggestion(item.counterpartyName);
+          }
+        }
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(BANK_LEDGER_AI_BATCH_CONCURRENCY, chunks.length) },
+      () => runWorker()
+    )
+  );
+
+  return suggestions.map((suggestion, index) => suggestion ?? deterministicLedgerSuggestion(prepared[index]?.counterpartyName ?? null));
 }
 
 export async function suggestBankLedgerForTransaction(input: {

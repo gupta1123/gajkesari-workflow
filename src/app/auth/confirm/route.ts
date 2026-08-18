@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 function resolveNextPath(next: string | null) {
-  return next && next.startsWith("/") ? next : "/";
+  return next && next.startsWith("/") ? next : "/tally-prime?view=connection";
 }
 
 export async function GET(request: NextRequest) {

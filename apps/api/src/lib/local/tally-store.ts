@@ -53,6 +53,7 @@ const CONNECTION_FIELDS = [
   "last_company_loaded",
   "last_company_name",
   "last_error",
+  "last_companies_snapshot",
   "created_at",
   "updated_at",
 ] as const;
@@ -173,6 +174,7 @@ export async function createLocalTallyConnection(input: {
     last_company_loaded: null,
     last_company_name: null,
     last_error: null,
+    last_companies_snapshot: [],
     created_at: createdAt,
     updated_at: createdAt,
   };
@@ -321,6 +323,7 @@ export async function updateLocalTallyHeartbeat(input: {
   companyLoaded: boolean;
   companyName?: string | null;
   error?: string | null;
+  companies?: Array<Record<string, unknown>>;
 }) {
   const state = await readState();
   const row = state.connections.find(
@@ -350,6 +353,7 @@ export async function updateLocalTallyHeartbeat(input: {
   row.last_company_loaded = input.companyLoaded;
   row.last_company_name = input.companyName || null;
   row.last_error = input.error || null;
+  row.last_companies_snapshot = input.companies ?? row.last_companies_snapshot ?? [];
   row.updated_at = now;
   await writeState(state);
   return publicConnection(row);

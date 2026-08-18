@@ -85,7 +85,7 @@ export type ParsedBankStatement = {
 };
 
 export type BankStatementExtractionResult = ParsedBankStatement & {
-  extractionSource: "csv_text_v1" | "openrouter_bank_statement_v1" | "manual_review_required_v1";
+  extractionSource: "csv_text_v1" | "anydoc_markdown_v1" | "openrouter_bank_statement_v1" | "manual_review_required_v1";
   extractionError?: string | null;
   extractionDiagnostics?: {
     rawAiTransactionCount?: number;

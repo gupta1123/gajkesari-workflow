@@ -14,6 +14,25 @@ function parseMasterType(value: string | null): TallyMasterType | null {
   return MASTER_TYPES.includes(value as TallyMasterType) ? (value as TallyMasterType) : null;
 }
 
+const MASTER_LIST_SELECT = [
+  "id",
+  "connection_id",
+  "company_name",
+  "master_type",
+  "master_key",
+  "tally_guid",
+  "tally_name",
+  "parent_name",
+  "gstin",
+  "hsn_code",
+  "unit_name",
+  "tax_rate",
+  "is_active",
+  "last_synced_at",
+].join(", ");
+
+const MASTER_METADATA_SELECT = `${MASTER_LIST_SELECT}, raw_payload`;
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -34,6 +53,7 @@ export async function GET(
     const query = url.searchParams.get("q")?.trim() ?? "";
     const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
     const fetchAll = url.searchParams.get("all") === "true";
+    const includeRawMetadata = url.searchParams.get("includeRawMetadata") === "true";
 
     const supabase = createSupabaseAdminClient();
     const { data: connection, error: connectionError } = await supabase
@@ -54,7 +74,7 @@ export async function GET(
     const buildMasterQuery = () => {
       let builder = supabase
         .from("tally_masters")
-        .select("*")
+        .select(includeRawMetadata ? MASTER_METADATA_SELECT : MASTER_LIST_SELECT)
         .eq("connection_id", id)
         .eq("owner_user_id", user.id)
         .eq("company_name", connection.last_company_name ?? "Unknown company")
@@ -104,7 +124,7 @@ export async function GET(
       for (let from = 0; from < 20000; from += pageSize) {
         const { data, error } = await supabase
           .from("tally_masters")
-          .select("*")
+          .select(MASTER_LIST_SELECT)
           .eq("connection_id", id)
           .eq("owner_user_id", user.id)
           .eq("company_name", connection.last_company_name ?? "Unknown company")
@@ -147,4 +167,3 @@ export async function GET(
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
-

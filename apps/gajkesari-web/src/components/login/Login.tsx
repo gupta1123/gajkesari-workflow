@@ -14,7 +14,7 @@ import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import styles from "./Login.module.css";
 
 function safeNextPath(value: string | null) {
-  if (!value || !value.startsWith("/")) return "/";
+  if (!value || !value.startsWith("/")) return "/tally-prime?view=connection";
   return value;
 }
 

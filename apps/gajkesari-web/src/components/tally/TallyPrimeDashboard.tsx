@@ -488,6 +488,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           displayName:
             setupMode === "same_machine" ? "Tally Prime" : "Tally Prime LAN",
           tallyUrl,
+          reuseConnectionId:
+            selectedConnection && !connectorActive ? selectedConnection.id : null,
         }),
       });
       if (!response.ok) {
@@ -984,46 +986,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               </div>
 
               <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
-                  <Button
-                    className="whitespace-nowrap rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                    disabled={loading}
-                    onClick={() => void loadConnections()}
-                    type="button"
-                    variant="outline"
-                  >
-                    <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                    Refresh
-                  </Button>
-                  <Button
-                    className="w-fit whitespace-nowrap rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                    disabled={testing}
-                    onClick={() => void requestTest()}
-                    type="button"
-                    variant="outline"
-                  >
-                    {testing ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                    ) : (
-                      <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
-                    )}
-                    Test Connection
-                  </Button>
-                  {connectorActive ? (
-                    <Button
-                      className="w-fit whitespace-nowrap rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
-                      disabled={disconnecting}
-                      onClick={() => void disconnectConnector()}
-                      type="button"
-                      variant="outline"
-                    >
-                      {disconnecting ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                      ) : (
-                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                      )}
-                      Disconnect
-                    </Button>
-                  ) : (
+                  {!connectorActive ? (
                     <Button
                       className="w-fit whitespace-nowrap rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-bold text-white shadow-md transition-all"
                       disabled={creating}
@@ -1035,7 +998,22 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       ) : (
                         <PlugZap className="h-3.5 w-3.5 mr-1.5" />
                       )}
-                      Connect
+                      Reconnect
+                    </Button>
+                  ) : (
+                    <Button
+                      className="w-fit whitespace-nowrap rounded-xl border-amber-250 bg-amber-50 text-xs font-bold text-amber-800 hover:bg-amber-100 hover:text-amber-900 shadow-sm transition-all"
+                      disabled={disconnecting}
+                      onClick={() => void disconnectConnector()}
+                      type="button"
+                      variant="outline"
+                    >
+                      {disconnecting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                      ) : (
+                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                      )}
+                      Pause connection
                     </Button>
                   )}
                 {otherActiveConnectionCount > 0 ? (
@@ -1117,4 +1095,3 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     </div>
   );
 }
-

@@ -315,6 +315,7 @@ type PreviewResponse = {
   transactionsPageSize?: number;
   transactionsTotal?: number;
   requiresManualExtraction?: boolean;
+  extractionSource?: string | null;
   extractionError?: string | null;
   extractionDiagnostics?: {
     rawAiTransactionCount?: number;
@@ -353,6 +354,25 @@ type ApiErrorPayload = {
   userAction?: string;
   diagnostics?: unknown;
 };
+
+function ExtractionEngineBadge({ source }: { source?: string | null }) {
+  if (!source) return null;
+  const isQuick = source === "anydoc_markdown_v1" || source === "csv_text_v1";
+
+  return (
+    <span
+      aria-label={isQuick ? "Quick AnyDoc extraction" : "Slow extraction path"}
+      title={isQuick ? "Quick AnyDoc Markdown extraction" : "Slow PDF/image extraction"}
+      className={`inline-flex h-5 min-w-5 items-center justify-center rounded-full border px-1.5 text-[10px] font-black transition-all ${
+        isQuick
+          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+          : "border-amber-200 bg-amber-50 text-amber-800"
+      }`}
+    >
+      {isQuick ? "Q" : "S"}
+    </span>
+  );
+}
 
 type TallyMaster = {
   key: string;
@@ -2758,6 +2778,7 @@ export function BankStatementsPage() {
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [analysisEngineSource, setAnalysisEngineSource] = useState<string | null>(null);
   const [, setRecentImports] = useState<BankStatementImport[]>([]);
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
@@ -3696,7 +3717,7 @@ export function BankStatementsPage() {
     }
 
     const response = await apiFetch(
-      `/api/tally/connections/${connectionId}/masters?type=ledger&all=true`,
+      `/api/tally/connections/${connectionId}/masters?type=ledger&all=true&includeRawMetadata=true`,
       { cache: "no-store" }
     );
     if (!response.ok) {
@@ -3836,6 +3857,7 @@ export function BankStatementsPage() {
 
   const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
+    setAnalysisEngineSource(null);
     setTransactions([]);
     setReviewPage(1);
     if (!options?.preserveSelectedFile) {
@@ -4538,6 +4560,7 @@ export function BankStatementsPage() {
       await wait(attempt < 10 ? 3000 : 5000);
       const payload = await loadImportPreviewMetadata(importId);
       if (payload.processing) {
+        setAnalysisEngineSource(payload.extractionSource ?? null);
         setBanner({
           tone: "info",
           text: payload.job?.stage
@@ -4553,6 +4576,7 @@ export function BankStatementsPage() {
 
       const fullPayload = await loadImportPreviewWithPagedTransactions(importId);
       applyPreviewPayload(fullPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
+      setAnalysisEngineSource(null);
       setBanner(getAnalysisCompleteMessage(fullPayload));
       return fullPayload;
     }
@@ -4805,6 +4829,7 @@ export function BankStatementsPage() {
     }
     try {
       clearStatementReview({ preserveSelectedFile: true });
+      setAnalysisEngineSource(null);
       setLoading(true);
       setBanner(null);
       setStatementPasswordError(null);
@@ -6073,7 +6098,7 @@ export function BankStatementsPage() {
 
           {banner && (!preview || banner.tone !== "success") && (
             <div
-              className={`flex items-start gap-2 rounded-xl border px-4 py-3 text-sm font-semibold ${
+              className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-4 py-3 text-sm font-semibold ${
                 banner.tone === "success"
                   ? "border-emerald-200 bg-emerald-50 text-emerald-800"
                   : banner.tone === "info"
@@ -6081,12 +6106,17 @@ export function BankStatementsPage() {
                     : "border-rose-200 bg-rose-50 text-rose-800"
               }`}
             >
-              {banner.tone === "success" ? (
-                <CheckCircle2 className="mt-0.5 h-4 w-4" />
-              ) : (
-                <AlertTriangle className="mt-0.5 h-4 w-4" />
-              )}
-              <span>{banner.text}</span>
+              <div className="flex items-center gap-2">
+                {banner.tone === "success" ? (
+                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+                ) : (
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                )}
+                <span>{banner.text}</span>
+              </div>
+              {loading || preview?.processing ? (
+                <ExtractionEngineBadge source={analysisEngineSource || preview?.extractionSource} />
+              ) : null}
             </div>
           )}
 

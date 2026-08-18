@@ -33,6 +33,8 @@ export type TallyConnectionRow = {
   last_company_loaded: boolean | null;
   last_company_name: string | null;
   last_error: string | null;
+  /** Compact company metadata from the latest bridge heartbeat. */
+  last_companies_snapshot: Array<Record<string, unknown>> | null;
   created_at: string;
   updated_at: string;
 };
@@ -64,6 +66,7 @@ export const TALLY_CONNECTION_SELECT = [
   "last_company_loaded",
   "last_company_name",
   "last_error",
+  "last_companies_snapshot",
   "created_at",
   "updated_at",
 ].join(", ");
@@ -170,4 +173,3 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
     revoked,
   };
 }
-
