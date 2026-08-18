@@ -1,10 +1,6 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
 
 export type AnydocParseResult = {
   success: boolean;
@@ -16,15 +12,20 @@ export type AnydocParseResult = {
   error?: string | null;
 };
 
+type AnydocModule = {
+  toMarkdown?: (inputPath: string) => Promise<string> | string;
+  toMarkdownBytes?: (buffer: Uint8Array, extension: string) => Promise<string> | string;
+};
+
 // Dynamically load @firecrawl/anydoc native module
-let anydocModule: any = null;
+let anydocModule: AnydocModule | null = null;
 
 async function loadAnydocModule() {
   if (anydocModule) return anydocModule;
 
   // 1. Try standard package import
   try {
-    anydocModule = await import("@firecrawl/anydoc");
+    anydocModule = (await import("@firecrawl/anydoc")) as AnydocModule;
     return anydocModule;
   } catch {
     // 2. Try resolving from local Anydoc directory node_modules
@@ -36,7 +37,7 @@ async function loadAnydocModule() {
     for (const modPath of localModulePaths) {
       if (fs.existsSync(modPath)) {
         try {
-          anydocModule = await import(/* @vite-ignore */ `file:///${path.resolve(modPath).replace(/\\/g, "/")}`);
+          anydocModule = (await import(/* @vite-ignore */ `file:///${path.resolve(modPath).replace(/\\/g, "/")}`)) as AnydocModule;
           return anydocModule;
         } catch {
           // Try next path
