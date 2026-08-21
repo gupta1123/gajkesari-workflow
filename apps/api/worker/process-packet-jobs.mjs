@@ -76,6 +76,8 @@ const BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION = Number(
 const BANK_STATEMENT_BUCKET = "bank-statement-files";
 const BANK_STATEMENT_PAGE_MANIFEST_INSTRUCTION =
   " Every transaction must include sourcePage with the visible PDF page number. Also return pageResults with exactly one entry for every supplied page: pageNumber, status (transactions or no_transactions), and transactionCount. Never omit a supplied page from pageResults.";
+const BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION =
+  " Preserve the balance direction: return every DR/debit balance (including openingBalance) as a negative number and every CR/credit balance as a positive number. Never discard a visible DR or CR suffix.";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL =
   process.env.OPENROUTER_QUALITY_MODEL ||
@@ -359,8 +361,12 @@ function parseAmount(value) {
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   const raw = String(value).trim();
   if (!raw) return null;
-  const negative = /^\(.*\)$/.test(raw) || /^-/.test(raw);
-  const cleaned = raw.replace(/[(),₹$€£\s]/g, "").replace(/^-/, "");
+  const debitBalance = /\bDR\.?\s*$/i.test(raw);
+  const negative = /^\(.*\)$/.test(raw) || /^-/.test(raw) || debitBalance;
+  const cleaned = raw
+    .replace(/\b(?:DR|CR)\.?\s*$/i, "")
+    .replace(/[(),₹$€£\s]/g, "")
+    .replace(/^-/, "");
   if (!cleaned || !/^\d+(\.\d+)?$/.test(cleaned)) return null;
   const parsed = Number(cleaned);
   return Number.isFinite(parsed) ? (negative ? -parsed : parsed) : null;
@@ -1051,6 +1057,7 @@ async function extractBankStatementFromImages(fileName, images, bankAccountCandi
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
         "Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
         "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty." +
+        BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION +
         bankAccountCandidateInstruction(bankAccountCandidates),
     },
     {
@@ -1090,6 +1097,7 @@ async function extractBankStatementFromPdfFile(fileName, mimeType, bytes, bankAc
             "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
             "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
             "Do not invent rows or amounts. If the PDF contains only summary information and no ledger rows, extract account/period only and leave transactions empty." +
+            BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION +
             bankAccountCandidateInstruction(bankAccountCandidates),
         },
       ],
@@ -1113,6 +1121,7 @@ async function extractBankStatementFromText(fileName, pages, bankAccountCandidat
         "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
         "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
         "Do not invent rows or amounts. If the text is only summary information and no ledger rows are present, extract account/period only and leave transactions empty." +
+        BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION +
         bankAccountCandidateInstruction(bankAccountCandidates),
     },
     {
@@ -1139,6 +1148,7 @@ async function extractAndMatchBankStatementFromMarkdown(
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, suggestedLedgerName, suggestionConfidence, and suggestionReason. Dates must be ISO YYYY-MM-DD. Use positive numbers for debit and credit in their own columns. Do not invent rows or amounts. Preserve complete narration text. " +
         "For suggestedLedgerName, choose only an exact name from the supplied tallyLedgers list. If no ledger is uniquely supported, return null, suggestionConfidence 0, and explain briefly in suggestionReason. Never invent a ledger. " +
         "If the Markdown contains only summary information and no ledger rows, return an empty transactions array." +
+        BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION +
         bankAccountCandidateInstruction(bankAccountCandidates),
     },
     {
@@ -1291,6 +1301,7 @@ async function extractBankStatementFromTextBatch(fileName, pages) {
         "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
         "Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, page footers, reward-points sections, summary totals, and bank notices unless they have a real debit or credit transaction amount. " +
         "Do not invent rows. If this batch contains only summary/header information and no ledger rows, return account/period if visible and an empty transactions array." +
+        BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION +
         BANK_STATEMENT_PAGE_MANIFEST_INSTRUCTION,
     },
     {
@@ -1313,6 +1324,7 @@ async function extractBankStatementFromImageBatch(fileName, images, rangeLabel) 
         "Dates must be ISO YYYY-MM-DD. Each transaction must include only transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, and balanceAmount. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. " +
         "Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, summary totals, page footers, and bank notices. Do not invent rows." +
+        BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION +
         BANK_STATEMENT_PAGE_MANIFEST_INSTRUCTION,
     },
     {
