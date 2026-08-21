@@ -20,6 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const installDir = path.resolve(__dirname, "..", "..");
 const logPath = path.join(installDir, "bridge.log");
 const errPath = path.join(installDir, "bridge.err.log");
+const nodeFetch = globalThis.fetch.bind(globalThis);
 
 let mainWindow = null;
 let runner = null;
@@ -34,8 +35,20 @@ let lastStatus = {
 function installSystemNetworkFetch() {
   // Use Windows' proxy and certificate store, matching the user's browser.
   // This avoids TLS failures on machines with corporate/antivirus inspection.
-  globalThis.fetch = (input, init) =>
-    net.fetch(input instanceof URL ? input.toString() : input, init);
+  globalThis.fetch = async (input, init) => {
+    try {
+      return await net.fetch(input instanceof URL ? input.toString() : input, init);
+    } catch (error) {
+      // Chromium networking can return the opaque net::ERR_FAILED before a
+      // request reaches Heroku. Node's fetch uses a separate HTTPS stack and
+      // is a safe fallback for the same standards-based RequestInit payload.
+      appendLog(
+        errPath,
+        `Electron network request failed (${formatConnectorError(error)}); retrying with Node HTTPS.`
+      );
+      return nodeFetch(input, init);
+    }
+  };
 }
 
 function formatConnectorError(error) {
