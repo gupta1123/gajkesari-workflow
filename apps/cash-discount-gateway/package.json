@@ -1,0 +1,17 @@
+{
+  "name": "@gajkesari/tally-live-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x",
+    "npm": "11.x"
+  },
+  "scripts": {
+    "dev": "node --use-system-ca src/server.mjs",
+    "start": "node --use-system-ca src/server.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.1"
+  }
+}

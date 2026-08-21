@@ -26,6 +26,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
 import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 import { pdfToImagePages } from "@/services/pdf";
 
@@ -75,6 +76,14 @@ type LocalBankLedger = {
   bankAccountNumber?: string | null;
   closingBalance?: number | null;
   closingBalanceType?: "Dr" | "Cr" | null;
+};
+
+type LiveBankLedgerResult = {
+  companyName?: string | null;
+  companyNames?: string[];
+  bankLedgers?: LocalBankLedger[];
+  byCompany?: Record<string, LocalBankLedger[]>;
+  errors?: Array<{ companyName?: string; error?: string }>;
 };
 
 const BANK_STATEMENT_COMPANY_SELECTION_KEY = "gajkesari.bankStatements.selectedCompany.v1";
@@ -3716,20 +3725,22 @@ export function BankStatementsPage() {
       return [];
     }
 
-    const response = await apiFetch(
-      `/api/tally/connections/${connectionId}/masters?type=ledger&all=true&includeRawMetadata=true`,
-      { cache: "no-store" }
-    );
-    if (!response.ok) {
-      throw new Error(await readError(response));
-    }
-    const payload = (await response.json()) as { masters?: TallyMaster[] };
-    const masters = payload.masters ?? [];
+    const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
+    const payload = await runCashDiscountLiveRequest<{
+      ledgers?: TallyMaster[];
+      groups?: TallyMaster[];
+    }>({
+      connectionId,
+      companyName: selectedCompanyName || connectionCompany?.companyName || "",
+      operation: "ledger_masters",
+      payload: { requestedMasterTypes: ["ledger", "group"] },
+    });
+    const masters = payload.ledgers ?? [];
     if (loadSeq === ledgerLoadSeqRef.current) {
       setLedgerMasters(masters);
     }
     return masters;
-  }, []);
+  }, [companyOptions, selectedCompanyName]);
 
   useEffect(() => {
     if (!tallyConnectionId) {
@@ -3820,14 +3831,21 @@ export function BankStatementsPage() {
 
     try {
       setLoadingBankLedgers(true);
-      const byCompany = Object.fromEntries(
-        cleanCompanyNames.map((companyName) => {
-          const company = companyOptions.find(
-            (option) => normalizeName(option.companyName) === normalizeName(companyName)
-          );
-          return [companyName, company?.bankLedgers ?? []];
-        })
-      ) as Record<string, LocalBankLedger[]>;
+      const requestedCompanyName = selectedCompanyName || cleanCompanyNames[0] || "";
+      const payload = await runCashDiscountLiveRequest<LiveBankLedgerResult>({
+        connectionId,
+        companyName: requestedCompanyName,
+        companyNames: [requestedCompanyName],
+        operation: "bank_ledgers",
+        onProgress: (message) => {
+          if (!options?.quiet) setBanner({ tone: "info", text: message });
+        },
+      });
+      const returnedCompanyName = String(payload.companyName || requestedCompanyName).trim();
+      const returnedLedgers = payload.byCompany?.[returnedCompanyName] ?? payload.bankLedgers ?? [];
+      const byCompany = { [returnedCompanyName]: returnedLedgers } as Record<string, LocalBankLedger[]>;
+      const firstError = payload.errors?.find((item) => item.error)?.error;
+      if (returnedLedgers.length === 0 && firstError) throw new Error(firstError);
       setTallyBankLedgersByCompany((current) => ({
         ...current,
         ...byCompany,
@@ -4036,16 +4054,6 @@ export function BankStatementsPage() {
       cancelled = true;
     };
   }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
-
-  useEffect(() => {
-    const connectionId = companyOptions[0]?.connectionId || tallyConnectionId;
-    const companyNames = companyOptions.map((company) => company.companyName).filter(Boolean);
-    const key = `${connectionId}::${companyNames.join("|")}`;
-    if (!connectionId || companyNames.length === 0 || bankLedgerLoadKeyRef.current === key) return;
-
-    bankLedgerLoadKeyRef.current = key;
-    void fetchTallyBankLedgersForCompanies(connectionId, companyNames, { quiet: true });
-  }, [companyOptions, tallyConnectionId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4414,10 +4422,9 @@ export function BankStatementsPage() {
           current && loadedCompanies.some((company) => company.id === current) ? current : restoredCompany?.id ?? ""
         );
         setTallyConnectionId(nextConnectionId);
-        const companyNames = loadedCompanies.map((company) => company.companyName).filter(Boolean);
         bankLedgerLoadKeyRef.current = "";
-        await fetchTallyBankLedgersForCompanies(nextConnectionId, companyNames, { quiet: true });
-        await loadLedgerMasters(nextConnectionId).catch(() => setLedgerMasters([]));
+        ledgerLoadSeqRef.current += 1;
+        setLedgerMasters([]);
       }
       showToast("success", "Tally connection refreshed.");
     } catch (error) {
@@ -4838,11 +4845,8 @@ export function BankStatementsPage() {
       setPostUploadSyncImportId(null);
       setPostUploadSyncError(null);
       setFile(nextFile);
-      const syncedMasters = await syncCompanyData({
-        quiet: true,
-        statusText: "Fetching the latest ledgers directly from Tally before analysis...",
-      });
-      if (!syncedMasters) {
+      const syncedMasters = await loadLedgerMasters(tallyConnectionId);
+      if (!syncedMasters || syncedMasters.length === 0) {
         throw new Error(
           "Could not fetch the latest ledgers from Tally. Keep Tally Prime and the connector open, then retry analysis."
         );
@@ -4857,6 +4861,17 @@ export function BankStatementsPage() {
       formData.set("financialYear", selectedFinancialYear);
       formData.set("bankLedgerName", "");
       formData.set("syncBeforeAnalysis", "true");
+      formData.set(
+        "liveTallyLedgerNames",
+        JSON.stringify(Array.from(new Set(ledgerMastersForReview.map((ledger) => ledger.name.trim()).filter(Boolean))))
+      );
+      formData.set(
+        "liveTallyBankAccountCandidates",
+        JSON.stringify(ledgerMastersForReview.flatMap((ledger) => {
+          const accountNumber = normalizeBankAccountNumber(ledger.bankAccountNumber);
+          return accountNumber ? [{ ledgerName: ledger.name.trim(), accountNumber }] : [];
+        }))
+      );
       if (isPdfFile(nextFile) && statementPassword.trim()) {
         formData.set("statementPassword", statementPassword);
       }
@@ -4929,8 +4944,8 @@ export function BankStatementsPage() {
       setLoading(true);
       setPostUploadSyncError(null);
       setBanner({ tone: "info", text: "Retrying Tally company sync after upload..." });
-      const syncedMasters = await syncCompanyData({ quiet: true });
-      if (!syncedMasters) {
+      const syncedMasters = await loadLedgerMasters(tallyConnectionId);
+      if (!syncedMasters || syncedMasters.length === 0) {
         const message = "Tally company sync is still not complete. Keep the connector open, then retry.";
         setPostUploadSyncError(message);
         setBanner({ tone: "error", text: message });
@@ -4977,7 +4992,7 @@ export function BankStatementsPage() {
           commandType: "sync_masters",
           payload: {
             companyName: selectedCompanyName || connection.lastCompanyName,
-            requestedMasterTypes: ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"],
+            requestedMasterTypes: ["ledger", "group"],
           },
         }),
       });
@@ -5062,40 +5077,18 @@ export function BankStatementsPage() {
       return new Map<string, { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] }>();
     }
 
-    const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        commandType: "fetch_customer_open_bills",
-        payload: {
-          ledgerName: requestedLedgerNames[0],
-          ledgerNames: requestedLedgerNames,
-          companyName: selectedCompanyName || connection.lastCompanyName,
-          asOfDate: asOfDate || undefined,
-          queryPurpose: "bank_statement_match",
-        },
-      }),
+    const result = await runCashDiscountLiveRequest<Record<string, unknown>>({
+      connectionId: connection.id,
+      companyName: selectedCompanyName || connection.lastCompanyName || "",
+      operation: "fetch_customer_open_bills",
+      payload: {
+        ledgerName: requestedLedgerNames[0],
+        ledgerNames: requestedLedgerNames,
+        companyName: selectedCompanyName || connection.lastCompanyName,
+        asOfDate: asOfDate || undefined,
+        queryPurpose: "bank_statement_match",
+      },
     });
-
-    if (!response.ok) {
-      throw new Error(await readError(response));
-    }
-
-    const payload = (await response.json()) as { command?: TallyCommand };
-    const command = payload.command;
-    if (!command?.id) {
-      throw new Error("Open bill fetch was queued, but no command id was returned.");
-    }
-
-    const completedCommand = await waitForCommand(connection.id, command.id);
-    if (!completedCommand) {
-      throw new Error("Open bill fetch is still pending.");
-    }
-    if (completedCommand.status !== "succeeded") {
-      throw new Error(completedCommand.error || `Open bill fetch ${completedCommand.status}.`);
-    }
-
-    const result = completedCommand.result ?? {};
     const billDataByLedger = new Map<string, { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] }>();
     const rawByLedger = result.byLedger && typeof result.byLedger === "object"
       ? result.byLedger as Record<string, unknown>
@@ -5180,17 +5173,19 @@ export function BankStatementsPage() {
           .filter(Boolean)
       )
     );
-    const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        commandType: "verify_bank_transaction",
-        payload: {
-          companyName: selectedCompanyName || connection.lastCompanyName,
-          bankLedgerName,
-          relevantLedgerNames,
-          voucherTypes: ["Receipt", "Payment", "Contra", "Journal"],
-          transactions: rows.map((transaction) => {
+    const result = await runCashDiscountLiveRequest<{
+      transactions?: Array<Record<string, unknown>>;
+      balanceProof?: Record<string, unknown>;
+    }>({
+      connectionId: connection.id,
+      companyName: selectedCompanyName || connection.lastCompanyName || "",
+      operation: "verify_bank_transaction",
+      payload: {
+        companyName: selectedCompanyName || connection.lastCompanyName,
+        bankLedgerName,
+        relevantLedgerNames,
+        voucherTypes: ["Receipt", "Payment", "Contra", "Journal"],
+        transactions: rows.map((transaction) => {
             const incoming = isIncomingReceiptRow(transaction);
             const debitAmount = parseNumber(transaction.debitAmount) ?? 0;
             const creditAmount = parseNumber(transaction.creditAmount) ?? 0;
@@ -5209,21 +5204,9 @@ export function BankStatementsPage() {
               narration: transaction.description,
               referenceNumber: transaction.referenceNumber || getTransactionReference(transaction),
             };
-          }),
-        },
-      }),
+        }),
+      },
     });
-    if (!response.ok) throw new Error(await readError(response));
-    const payload = (await response.json()) as { command?: TallyCommand };
-    if (!payload.command?.id) throw new Error("Tally statement check was queued without a command id.");
-
-    const completed = await waitForCommands(connection.id, [payload.command.id]);
-    const command = completed.find((item) => item.id === payload.command?.id);
-    if (!command) throw new Error("Tally statement check timed out.");
-    if (command.status !== "succeeded") {
-      throw new Error(command.error || `Tally statement check ${command.status}.`);
-    }
-    const result = command.result ?? {};
     const resultRows = Array.isArray(result.transactions) ? result.transactions : [];
     const drafts = Object.fromEntries(resultRows.flatMap((value) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
@@ -5231,9 +5214,11 @@ export function BankStatementsPage() {
       const transactionId = typeof row.transactionId === "string" ? row.transactionId : "";
       if (!transactionId) return [];
       return [[transactionId, outgoingVerificationFromCommand({
-        ...command,
+        id: transactionId,
+        status: "succeeded",
+        error: null,
         result: row,
-      })]];
+      } as TallyCommand)]];
     })) as Record<string, OutgoingVerificationDraft>;
     const balanceProof = result.balanceProof && typeof result.balanceProof === "object" && !Array.isArray(result.balanceProof)
       ? result.balanceProof as TallyBalanceProof

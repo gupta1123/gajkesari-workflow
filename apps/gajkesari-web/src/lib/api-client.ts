@@ -98,6 +98,10 @@ export function buildApiUrl(path: string) {
   return `${API_BASE_URL}${normalizedPath}`;
 }
 
+export async function getApiAccessToken() {
+  return readAccessToken();
+}
+
 export async function apiFetch(path: string, init?: RequestInit) {
   const accessToken = await readAccessToken();
   const apiUrl = buildApiUrl(path);

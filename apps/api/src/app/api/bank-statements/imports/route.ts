@@ -28,6 +28,26 @@ function readTextField(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function readLiveLedgerNames(value: FormDataEntryValue | null) {
+  return Array.from(new Set(
+    readJsonField<unknown[]>(value, [])
+      .map((name) => typeof name === "string" ? name.trim().slice(0, 500) : "")
+      .filter(Boolean)
+  )).slice(0, 20_000);
+}
+
+function readLiveBankCandidates(value: FormDataEntryValue | null) {
+  return readJsonField<unknown[]>(value, []).flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+    const row = candidate as Record<string, unknown>;
+    const ledgerName = typeof row.ledgerName === "string" ? row.ledgerName.trim().slice(0, 500) : "";
+    const accountNumber = typeof row.accountNumber === "string"
+      ? row.accountNumber.replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(0, 40)
+      : "";
+    return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
+  }).slice(0, 1_000);
+}
+
 function isPdfUpload(file: File) {
   return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 }
@@ -161,6 +181,10 @@ export async function POST(request: Request) {
     const financialYear = readTextField(formData.get("financialYear"));
     const bankLedgerName = readTextField(formData.get("bankLedgerName"));
     const syncBeforeAnalysis = readTextField(formData.get("syncBeforeAnalysis")) !== "false";
+    const liveTallyLedgerNames = readLiveLedgerNames(formData.get("liveTallyLedgerNames"));
+    const liveTallyBankAccountCandidates = readLiveBankCandidates(
+      formData.get("liveTallyBankAccountCandidates")
+    );
     const statementPasswordValue = formData.get("statementPassword");
     const statementPassword = typeof statementPasswordValue === "string" ? statementPasswordValue : "";
 
@@ -198,6 +222,8 @@ export async function POST(request: Request) {
           financialYear,
           bankLedgerName,
           syncBeforeAnalysis,
+          liveTallyLedgerNames,
+          liveTallyBankAccountCandidates,
         },
         analysis: {
           status: "queued",
@@ -209,6 +235,8 @@ export async function POST(request: Request) {
           financialYear,
           bankLedgerName,
           syncBeforeAnalysis,
+          liveTallyLedgerNames,
+          liveTallyBankAccountCandidates,
           manualAccount,
           startedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),

@@ -95,6 +95,12 @@ export const MASTER_TYPES: TallyMasterType[] = [
   "tax_ledger",
 ];
 
+export const TALLY_MASTER_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
+
+export function tallyMasterFreshnessCutoff(now = Date.now()) {
+  return new Date(now - TALLY_MASTER_CACHE_MAX_AGE_MS).toISOString();
+}
+
 export const MAPPING_TYPES: TallyMappingType[] = [
   "supplier_gstin",
   "buyer_gstin",

@@ -5,8 +5,9 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.41";
+const BRIDGE_VERSION = "0.1.42";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -3293,27 +3294,58 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
-  const forceTargeted = commandPayload.queryPurpose === "bank_statement_match" && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
+  const requestedDateFrom = normalizeDateForCompare(commandPayload.dateFrom) || null;
+  const forceTargeted =
+    commandPayload.queryPurpose === "bank_statement_match" && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   // Tally's local HTTP listener processes reports serially. Concurrent large
   // collection exports can leave one request waiting indefinitely, which
   // previously locked the whole connector cycle and surfaced as a dashboard
   // refresh timeout.
-  const billExport = await exportTargetedOpenBillXml(tallyUrl, { companyName, ledgerNames, asOfDate, forceTargeted }, exportCollection);
-  const billBlocks = extractBlocks(billExport.xml, "BILL").filter((block) => requestedLedgerByKey.has(normalizeLooseName(billLedgerName(block))));
+  const billExport = dependencies.billExport || await exportTargetedOpenBillXml(
+    tallyUrl,
+    { companyName, ledgerNames, dateFrom: requestedDateFrom, asOfDate, forceTargeted },
+    exportCollection
+  );
+  const billBlocks = extractBlocks(billExport.xml, "BILL").filter((block) =>
+    requestedLedgerByKey.has(normalizeLooseName(billLedgerName(block)))
+  );
   const fallbackBlocks = billBlocks.filter(openBillBlockRequiresVoucherFallback);
   const fallbackLedgerNames = Array.from(new Set(fallbackBlocks.flatMap((block) => {
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(billLedgerName(block)));
     return requestedLedgerName ? [requestedLedgerName] : [];
   })));
-  const voucherExport = fallbackLedgerNames.length > 0
-    ? await exportTargetedBillEvidenceXml(tallyUrl, {
-        companyName,
-        ledgerNames: fallbackLedgerNames,
-        dateFrom: earliestBillDate(fallbackBlocks),
-        dateTo: asOfDate,
-      }, exportCollection)
-    : { xml: "", batchCount: 0 };
+  // Cash Discount calculation always needs invoice narration and receipt
+  // allocation evidence. For other consumers, retain the narrower structural
+  // fallback behaviour.
+  const evidenceLedgerNames = dependencies.forceVoucherEvidence && billBlocks.length > 0
+    ? ledgerNames
+    : fallbackLedgerNames;
+  const evidenceDateFrom =
+    requestedDateFrom ||
+    earliestBillDate(dependencies.forceVoucherEvidence ? billBlocks : fallbackBlocks);
+  const voucherExport = dependencies.voucherExport || (evidenceLedgerNames.length > 0
+    ? dependencies.forceVoucherEvidence
+      ? await exportCompactCashDiscountEvidenceXml(
+          tallyUrl,
+          {
+            companyName,
+            dateFrom: evidenceDateFrom,
+            dateTo: asOfDate,
+          },
+          exportCollection
+        )
+      : await exportTargetedBillEvidenceXml(
+          tallyUrl,
+          {
+            companyName,
+            ledgerNames: evidenceLedgerNames,
+            dateFrom: evidenceDateFrom,
+            dateTo: asOfDate,
+          },
+          exportCollection
+        )
+    : { xml: "", batchCount: 0 });
   const {
     narrationByBill,
     receiptEvidenceByBill,
@@ -3391,9 +3423,13 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
         billBatchCount: billExport.batchCount,
         billQueryMode: billExport.queryMode,
         billObjectCount: billBlocks.length,
-        voucherFallbackUsed: fallbackLedgerNames.length > 0,
-        voucherFallbackLedgerCount: fallbackLedgerNames.length,
+        voucherFallbackUsed: evidenceLedgerNames.length > 0,
+        voucherFallbackLedgerCount: evidenceLedgerNames.length,
+        voucherEvidenceMode: dependencies.forceVoucherEvidence ? "required" : "fallback",
         voucherBatchCount: voucherExport.batchCount,
+        voucherQueryMode: voucherExport.queryMode || "targeted_chunks",
+        voucherDateChunkCount: voucherExport.dateChunkCount ?? 0,
+        voucherRetrySplitCount: voucherExport.retrySplitCount ?? 0,
         asOfDate,
       },
     },
@@ -3559,48 +3595,49 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
 async function collectTallyMasters(config, commandPayload = {}) {
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
-
-  const [ledgerXml, groupXml, stockItemXml, unitXml, voucherTypeXml, companyXml] = await Promise.all([
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Gajkesari Ledgers Sync",
-      tallyType: "Ledger",
-      fetchFields:
-        "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation",
+  const requestedMasterTypes = new Set(
+    Array.isArray(commandPayload.requestedMasterTypes)
+      ? commandPayload.requestedMasterTypes.map((value) => String(value || "").trim())
+      : []
+  );
+  const shouldFetch = (type) => {
+    if (requestedMasterTypes.size === 0 || requestedMasterTypes.has(type)) return true;
+    // GST/tax master rows are classified from Ledger exports, not a separate
+    // Tally collection.
+    return type === "ledger" && (requestedMasterTypes.has("gst_ledger") || requestedMasterTypes.has("tax_ledger"));
+  };
+  const fetches = [];
+  const fetchMaster = (key, type, collectionName, fetchFields) => {
+    if (!shouldFetch(type)) return;
+    fetches.push([key, exportTallyCollection(tallyUrl, {
+      collectionName,
+      tallyType: type === "stock_item" ? "StockItem" : type === "voucher_type" ? "VoucherType" : type[0].toUpperCase() + type.slice(1),
+      fetchFields,
       companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Gajkesari Groups Sync",
-      tallyType: "Group",
-      fetchFields: "Name,Parent,GUID",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Gajkesari Stock Items Sync",
-      tallyType: "StockItem",
-      fetchFields:
-        "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Gajkesari Units Sync",
-      tallyType: "Unit",
-      fetchFields: "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Gajkesari Voucher Types Sync",
-      tallyType: "VoucherType",
-      fetchFields: "Name,Parent,GUID",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
+    })]);
+  };
+  fetchMaster("ledgerXml", "ledger", "Gajkesari Ledgers Sync",
+    "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation");
+  fetchMaster("groupXml", "group", "Gajkesari Groups Sync", "Name,Parent,GUID");
+  fetchMaster("stockItemXml", "stock_item", "Gajkesari Stock Items Sync",
+    "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable");
+  fetchMaster("unitXml", "unit", "Gajkesari Units Sync", "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit");
+  fetchMaster("voucherTypeXml", "voucher_type", "Gajkesari Voucher Types Sync", "Name,Parent,GUID");
+  if (shouldFetch("ledger")) {
+    fetches.push(["companyXml", exportTallyCollection(tallyUrl, {
       collectionName: "Gajkesari Company Profile Sync",
       tallyType: "Company",
-      fetchFields:
-        "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
+      fetchFields: "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
       companyName,
-    }).catch(() => ""),
-  ]);
+    }).catch(() => "")]);
+  }
+  const resolved = Object.fromEntries(await Promise.all(fetches.map(async ([key, request]) => [key, await request])));
+  const ledgerXml = resolved.ledgerXml || "";
+  const groupXml = resolved.groupXml || "";
+  const stockItemXml = resolved.stockItemXml || "";
+  const unitXml = resolved.unitXml || "";
+  const voucherTypeXml = resolved.voucherTypeXml || "";
+  const companyXml = resolved.companyXml || "";
 
   const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
   const groups = parseMasterCollection(groupXml, "GROUP");
@@ -3619,6 +3656,10 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const { gstLedgers, taxLedgers } = classifyTaxLedgers(ledgers);
 
   return {
+    // Keep the requested scope with the result. syncMastersFromTally uses this
+    // to avoid sending omitted master types as empty arrays, which would retire
+    // a previously-good snapshot for those types on the API.
+    requestedMasterTypes: Array.from(requestedMasterTypes),
     ledgers,
     groups,
     stockItems,
@@ -3670,6 +3711,11 @@ async function syncMastersFromTally(config, commandPayload = {}) {
 
   const resolvedCompanyName = companyName || readiness.companyName || null;
 
+  const requestedMasterTypes = new Set(
+    Array.isArray(commandPayload.requestedMasterTypes)
+      ? commandPayload.requestedMasterTypes.map((value) => String(value || "").trim())
+      : []
+  );
   const masters = await collectTallyMasters(
     {
       ...config,
@@ -3682,23 +3728,42 @@ async function syncMastersFromTally(config, commandPayload = {}) {
     }
   );
 
-  if (masters.ledgers.length === 0) {
+  const isFullMasterSync = masters.requestedMasterTypes.length === 0;
+  const requestedTypes = new Set(masters.requestedMasterTypes);
+  if ((isFullMasterSync || requestedTypes.has("ledger")) && masters.ledgers.length === 0) {
     throw new Error("Tally returned zero ledgers. Open the correct company and try sync again.");
+  }
+
+  const masterPayload = {};
+  if (isFullMasterSync || requestedTypes.has("ledger")) {
+    masterPayload.ledgers = masters.ledgers;
+  }
+  if (isFullMasterSync || requestedTypes.has("group")) {
+    masterPayload.groups = masters.groups;
+  }
+  if (isFullMasterSync || requestedTypes.has("stock_item")) {
+    masterPayload.stockItems = masters.stockItems;
+  }
+  if (isFullMasterSync || requestedTypes.has("unit")) {
+    masterPayload.units = masters.units;
+  }
+  if (isFullMasterSync || requestedTypes.has("voucher_type")) {
+    masterPayload.voucherTypes = masters.voucherTypes;
+  }
+  // GST and tax ledgers are derived from the Ledger collection. They remain
+  // opt-in so a Bank Statements refresh writes only its ledger/group scope.
+  if (isFullMasterSync || requestedTypes.has("gst_ledger")) {
+    masterPayload.gstLedgers = masters.gstLedgers;
+  }
+  if (isFullMasterSync || requestedTypes.has("tax_ledger")) {
+    masterPayload.taxLedgers = masters.taxLedgers;
   }
 
   const payload = {
     connectionId: config.connectionId,
     companyName: resolvedCompanyName,
     bridgeVersion: BRIDGE_VERSION,
-    masters: {
-      ledgers: masters.ledgers,
-      groups: masters.groups,
-      stockItems: masters.stockItems,
-      units: masters.units,
-      voucherTypes: masters.voucherTypes,
-      gstLedgers: masters.gstLedgers,
-      taxLedgers: masters.taxLedgers,
-    },
+    masters: masterPayload,
     companyProfile: masters.companyProfile,
   };
   const syncResult = await postMastersToBackend(config, payload);
@@ -4444,6 +4509,163 @@ async function runOnce(config, options = {}) {
   };
 }
 
+function tallyLiveGatewayUrl(config) {
+  const configured = String(process.env.TALLY_LIVE_GATEWAY_URL || process.env.CASH_DISCOUNT_GATEWAY_URL || "").trim();
+  if (configured) return configured;
+  const url = new URL(config.apiBase);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  if (["localhost", "127.0.0.1"].includes(url.hostname)) {
+    url.port = "3002";
+    url.pathname = "/";
+  } else {
+    url.pathname = "/cash-discount-live";
+  }
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function startTallyLiveChannel(config, executeExclusive, options = {}) {
+  let socket = null;
+  let reconnectTimer = null;
+  let stopped = false;
+
+  const log = (level, message) => emitLog(options, level, message);
+  const send = (payload) => {
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+  };
+  const scheduleReconnect = () => {
+    if (stopped || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, 3000);
+    reconnectTimer.unref?.();
+  };
+
+  const handleOperation = async (message) => {
+    const requestId = String(message.requestId || "").trim();
+    const operation = String(message.operation || "");
+    if (!requestId) return;
+    try {
+      const data = await executeExclusive(async () => {
+        if (operation === "company_check") return collectTallyCompanyCheck(config);
+        if (operation === "bank_ledgers") {
+          const outcome = await fetchBankLedgersFromTally(config, {
+            companyNames: message.companyNames,
+            companyName: message.companyName,
+          });
+          return outcome.result || outcome;
+        }
+        if (operation === "ledger_masters") {
+          const requestedMasterTypes =
+            Array.isArray(message.payload?.requestedMasterTypes) && message.payload.requestedMasterTypes.length > 0
+              ? message.payload.requestedMasterTypes
+              : ["ledger", "group"];
+          const masters = await collectTallyMasters(config, {
+            companyName: message.companyName,
+            requestedMasterTypes,
+          });
+          const requestedTypes = new Set(requestedMasterTypes);
+          const masterPayload = {};
+          if (requestedTypes.has("ledger")) masterPayload.ledgers = masters.ledgers;
+          if (requestedTypes.has("group")) masterPayload.groups = masters.groups;
+          if (requestedTypes.has("stock_item")) masterPayload.stockItems = masters.stockItems;
+          if (requestedTypes.has("unit")) masterPayload.units = masters.units;
+          if (requestedTypes.has("voucher_type")) masterPayload.voucherTypes = masters.voucherTypes;
+          if (requestedTypes.has("gst_ledger")) masterPayload.gstLedgers = masters.gstLedgers;
+          if (requestedTypes.has("tax_ledger")) masterPayload.taxLedgers = masters.taxLedgers;
+          const syncPayload = {
+            connectionId: config.connectionId,
+            companyName: message.companyName || config.companyName || null,
+            bridgeVersion: BRIDGE_VERSION,
+            masters: masterPayload,
+            companyProfile: masters.companyProfile,
+            requestedMasterTypes: masters.requestedMasterTypes,
+          };
+          const syncResult = await postMastersToBackend(config, syncPayload);
+          return {
+            source: "live_tally",
+            companyName: message.companyName,
+            fetchedAt: new Date().toISOString(),
+            syncRunId: syncResult.syncRunId,
+            ledgers: masters.ledgers,
+            groups: masters.groups,
+            stockItems: masters.stockItems,
+            units: masters.units,
+            companyProfile: masters.companyProfile,
+            masters: {
+              ledgers: masters.ledgers,
+              groups: masters.groups,
+              stockItems: masters.stockItems,
+              units: masters.units,
+            },
+          };
+        }
+        if (operation === "verify_bank_transaction") {
+          const outcome = await reconcileBankTransactionsInTally(config, message.payload || {});
+          return outcome.result || outcome;
+        }
+        if (operation === "fetch_customer_open_bills") {
+          const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {});
+          return outcome.result || outcome;
+        }
+        throw new Error("Unsupported live Tally operation.");
+      });
+      send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
+    } catch (error) {
+      send({
+        type: "operation_result",
+        requestId,
+        success: false,
+        companyName: message.companyName,
+        error: error instanceof Error ? error.message : String(error || "Live Tally operation failed."),
+      });
+    }
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    try {
+      socket = new WebSocket(tallyLiveGatewayUrl(config));
+      socket.addEventListener("open", () => {
+        send({
+          type: "authenticate",
+          role: "connector",
+          connectionId: config.connectionId,
+          token: config.bridgeToken,
+        });
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const message = JSON.parse(String(event.data || "{}"));
+          if (message.type === "authenticated") {
+            log("info", "Live Tally channel connected.");
+          } else if (message.type === "operation") {
+            void handleOperation(message);
+          } else if (message.type === "error") {
+            log("error", `Live Tally channel: ${message.error || "unknown error"}`);
+          }
+        } catch (error) {
+          log("error", error instanceof Error ? error.message : "Invalid live Tally message.");
+        }
+      });
+      socket.addEventListener("error", () => log("error", "Live Tally channel is unavailable; retrying."));
+      socket.addEventListener("close", scheduleReconnect);
+    } catch (error) {
+      log("error", error instanceof Error ? error.message : "Could not start the live Tally channel.");
+      scheduleReconnect();
+    }
+  };
+
+  connect();
+  return () => {
+    stopped = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    socket?.close();
+  };
+}
+
 async function startBridge(args) {
   const config = readConfig();
   if (!config) {
@@ -4460,6 +4682,15 @@ async function startBridge(args) {
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
   let running = false;
+  const executeExclusive = async (task) => {
+    while (running) await new Promise((resolve) => setTimeout(resolve, 100));
+    running = true;
+    try {
+      return await task();
+    } finally {
+      running = false;
+    }
+  };
   const runSerially = async () => {
     if (running) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
@@ -4475,6 +4706,7 @@ async function startBridge(args) {
   };
 
   await runOnce(config);
+  startTallyLiveChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
       console.error(error instanceof Error ? error.message : error);
@@ -4518,6 +4750,18 @@ function createBridgeRunner(options = {}) {
   let timer = null;
   let running = false;
   let stopped = false;
+  let stopTallyLiveChannel = null;
+
+  const executeExclusive = async (task) => {
+    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (stopped) throw new Error("The connector has stopped.");
+    running = true;
+    try {
+      return await task();
+    } finally {
+      running = false;
+    }
+  };
 
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
@@ -4526,6 +4770,8 @@ function createBridgeRunner(options = {}) {
       clearInterval(timer);
       timer = null;
     }
+    stopTallyLiveChannel?.();
+    stopTallyLiveChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -4571,6 +4817,7 @@ function createBridgeRunner(options = {}) {
     async start() {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
+      stopTallyLiveChannel = startTallyLiveChannel(config, executeExclusive, options);
       await runSerially();
       if (!stopped) {
         timer = setInterval(() => {

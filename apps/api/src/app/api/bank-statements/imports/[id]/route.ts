@@ -8,6 +8,7 @@ import {
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
+import { tallyMasterFreshnessCutoff } from "@/lib/tally/masters";
 
 export const runtime = "nodejs";
 
@@ -106,6 +107,7 @@ async function resolveStatementBankLedger(
         .eq("connection_id", connectionId)
         .eq("master_type", masterType)
         .eq("is_active", true)
+        .gte("last_synced_at", tallyMasterFreshnessCutoff())
         .order("tally_name", { ascending: true })
         .range(from, from + pageSize - 1);
       if (error) throw error;
