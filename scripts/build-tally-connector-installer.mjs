@@ -26,6 +26,7 @@ const outputDir = path.join(installerRoot, "output");
 const outputExe = path.join(outputDir, connector.setupName);
 const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
 const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
+const webSocketPackageSource = path.join(repoRoot, "node_modules", "ws");
 const powerShellSource = path.join(bridgeRoot, "powershell");
 const samplesSource = path.join(bridgeRoot, "samples");
 const tdlSource = path.join(bridgeRoot, "tdl");
@@ -62,6 +63,7 @@ function ensureContains(filePath, expected, label) {
 
 function validateSources() {
   ensureFile(bridgeSource, "Tally bridge source");
+  ensureFile(path.join(webSocketPackageSource, "package.json"), "ws runtime dependency");
   ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
   ensureFile(path.join(electronAppSource, "package.json"), "Electron wrapper package");
   ensureFile(tdlFile, "native Tally PDF TDL");
@@ -263,12 +265,13 @@ fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
+copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
 fs.writeFileSync(
   path.join(payloadDir, "package.json"),
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.43",
+      version: "0.1.44",
       private: true,
       type: "module",
     },
