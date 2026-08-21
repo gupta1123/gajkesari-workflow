@@ -22,7 +22,7 @@ import { apiFetch } from "@/lib/api-client";
 const WINDOWS_BRIDGE_ROOT = "C:\\Gajkesari\\tally-bridge";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_UTM_API_BASE =
-  process.env.NEXT_PUBLIC_TALLY_CONNECT_API_BASE || "https://gajkesari-workflow-6127a3ee98e5.herokuapp.com";
+  process.env.NEXT_PUBLIC_TALLY_CONNECT_API_BASE || "https://gajkesari-workflow-b626b81159b6.herokuapp.com";
 
 type TallyConnection = {
   id: string;

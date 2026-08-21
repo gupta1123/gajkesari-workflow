@@ -126,7 +126,7 @@ function getStatusTone(connection?: TallyConnection | null) {
 }
 
 const DEFAULT_BRIDGE_API_BASE_URL =
-  "https://gajkesari-workflow-6127a3ee98e5.herokuapp.com";
+  "https://gajkesari-workflow-b626b81159b6.herokuapp.com";
 
 function getBridgeApiBaseUrl() {
   // In local development the connector runs on the same workstation as this
