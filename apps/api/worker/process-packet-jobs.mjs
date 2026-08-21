@@ -10,7 +10,10 @@ import sharp from "sharp";
 import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
-import { correctRowsFromRunningBalance } from "./bank-statement-running-balance.mjs";
+import {
+  correctRowsFromRunningBalance,
+  validateRunningBalanceContinuity,
+} from "./bank-statement-running-balance.mjs";
 import {
   addBankStatementPageProvenance,
   shouldAttemptBankStatementSingleShot,
@@ -77,7 +80,7 @@ const BANK_STATEMENT_BUCKET = "bank-statement-files";
 const BANK_STATEMENT_PAGE_MANIFEST_INSTRUCTION =
   " Every transaction must include sourcePage with the visible PDF page number. Also return pageResults with exactly one entry for every supplied page: pageNumber, status (transactions or no_transactions), and transactionCount. Never omit a supplied page from pageResults.";
 const BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION =
-  " Preserve the balance direction: return every DR/debit balance (including openingBalance) as a negative number and every CR/credit balance as a positive number. Never discard a visible DR or CR suffix.";
+  " Preserve the balance direction: return every DR/debit balance (including openingBalance) as a negative number and every CR/credit balance as a positive number. Never discard a visible DR or CR suffix. Copy the physical Debit/Dr/Withdrawal/Paid Out and Credit/Cr/Deposit/Paid In columns exactly as printed. Never swap them because a balance is DR, negative, or overdrawn. Preserve the statement's printed row order. Narration words such as Dr or Cr are supporting evidence only and must not replace a visible amount column. Each transaction must have at most one positive debitAmount or creditAmount.";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL =
   process.env.OPENROUTER_QUALITY_MODEL ||
@@ -1218,37 +1221,6 @@ function mergeBankStatementResults(results) {
     merged.openingBalance
   );
   return merged;
-}
-
-function validateRunningBalanceContinuity(transactions, openingBalance = null) {
-  let previousBalance = typeof openingBalance === "number" && Number.isFinite(openingBalance)
-    ? openingBalance
-    : null;
-  const breaks = [];
-  for (const transaction of transactions) {
-    const balance = transaction.balance_amount;
-    const debit = transaction.debit_amount ?? 0;
-    const credit = transaction.credit_amount ?? 0;
-    if (
-      previousBalance !== null &&
-      typeof balance === "number" && Number.isFinite(balance)
-    ) {
-      const expectedBalance = Number((previousBalance - debit + credit).toFixed(2));
-      if (Math.abs(expectedBalance - balance) >= 0.01) {
-        const provenance = transaction?.raw_payload?.extractionProvenance ?? {};
-        breaks.push({
-          page: Number(provenance.startPage) || null,
-          sourceIndex: Number(provenance.sourceIndex) || 0,
-          previousBalance,
-          expectedBalance,
-          actualBalance: balance,
-          referenceNumber: transaction.reference_number ?? null,
-        });
-      }
-    }
-    if (typeof balance === "number" && Number.isFinite(balance)) previousBalance = balance;
-  }
-  return { valid: breaks.length === 0, checkedTransitions: Math.max(0, transactions.length - 1), breaks };
 }
 
 function likelyHasTransactionRows(page) {

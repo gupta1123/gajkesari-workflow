@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle,
-  ArrowLeftRight,
   ArrowRight,
   CalendarDays,
   CheckCircle2,
@@ -2811,7 +2810,6 @@ export function BankStatementsPage() {
   const sending = sendingMode !== null;
   const [matchingBills, setMatchingBills] = useState(false);
   const [tallyCheckAttempted, setTallyCheckAttempted] = useState(false);
-  const [statementDirectionsSwapped, setStatementDirectionsSwapped] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
   const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
@@ -3901,7 +3899,6 @@ export function BankStatementsPage() {
     setTallyPresenceByTransactionId({});
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
-    setStatementDirectionsSwapped(false);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }, []);
@@ -4179,31 +4176,6 @@ export function BankStatementsPage() {
     });
     setBillAllocationReviewTransactionId((current) => (current === id ? null : current));
     setOutgoingReviewTransactionId((current) => (current === id ? null : current));
-  }
-
-  function swapStatementPaymentAndReceipt() {
-    if (tallyCheckAttempted || matchingBills || validTransactions.length === 0) return;
-
-    setTransactions((current) =>
-      current.map((transaction) => ({
-        ...transaction,
-        debitAmount: transaction.creditAmount,
-        creditAmount: transaction.debitAmount,
-      }))
-    );
-    setStatementDirectionsSwapped((current) => !current);
-    setBillAllocationsByTransactionId({});
-    setOutgoingVerificationsByTransactionId({});
-    setTallyPresenceByTransactionId({});
-    setTallyBalanceProof(null);
-    setStatementDoneSummary(null);
-    setTallyPostingStatus(null);
-    setBanner({
-      tone: "info",
-      text: statementDirectionsSwapped
-        ? "Payment and receipt amounts restored. Run Check Tally Matches when ready."
-        : "Payment and receipt amounts swapped. This corrected direction will be used for Tally checking and posting.",
-    });
   }
 
   function updateManualBillAmount(transaction: ReviewTransaction, referenceName: string, value: string) {
@@ -4546,7 +4518,6 @@ export function BankStatementsPage() {
     setTallyPresenceByTransactionId({});
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
-    setStatementDirectionsSwapped(false);
     setReviewFiltersOpen(false);
     setReviewSearch("");
     setReviewWorkStatusFilter("all");
@@ -7026,23 +6997,6 @@ export function BankStatementsPage() {
                           ? `${validTransactions.length} transaction${validTransactions.length === 1 ? "" : "s"}`
                           : `${filteredTransactions.length} of ${validTransactions.length} transactions`}
                       </span>
-                      {!tallyCheckAttempted && validTransactions.length > 0 ? (
-                        <button
-                          aria-pressed={statementDirectionsSwapped}
-                          className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-[10px] font-bold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 ${
-                            statementDirectionsSwapped
-                              ? "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100"
-                              : "border-[#e5ddd0] bg-white text-[#5a5046] hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900"
-                          }`}
-                          disabled={matchingBills || sending || tallyPostingInProgress}
-                          onClick={swapStatementPaymentAndReceipt}
-                          title="Swap every statement row between the Payment and Receipt columns before checking Tally"
-                          type="button"
-                        >
-                          <ArrowLeftRight className="h-3.5 w-3.5" />
-                          {statementDirectionsSwapped ? "Undo Payment / Receipt" : "Swap Payment / Receipt"}
-                        </button>
-                      ) : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[#e5ddd0] bg-[#faf8f4]/70 px-3 py-1.5 text-[10px] font-bold">
                       {bankPostingCompleted ? (
