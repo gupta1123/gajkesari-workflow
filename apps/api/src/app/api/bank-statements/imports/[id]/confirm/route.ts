@@ -1,4 +1,5 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { createHash } from "node:crypto";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   BANK_STATEMENT_BUCKET,
@@ -444,6 +445,7 @@ export async function POST(
       ? body.accountId || null
       : importRow.bank_account_id || null;
     let accountRow = null;
+    const submittedAccount = body.account ?? {};
 
     if (accountId) {
       const { data, error } = await supabase
@@ -457,14 +459,23 @@ export async function POST(
       }
       accountRow = data;
     } else {
-      const account = body.account ?? {};
+      const account = submittedAccount;
       const accountNumber =
         account.accountNumber || importRow.extracted_account_number || "";
       const normalizedAccountNumber = normalizeAccountNumber(accountNumber);
-      if (!normalizedAccountNumber) {
+      const manualLedgerName = String(account.tallyLedgerName ?? "").trim();
+      // A statement without a readable account number can still be posted when
+      // the user deliberately selects a bank ledger. Use a stable internal key
+      // for the bank-account record; it is never presented as a real account.
+      const accountKey = normalizedAccountNumber || (
+        manualLedgerName
+          ? `MANUAL-${createHash("sha256").update(`${user.id}|${manualLedgerName.toLowerCase()}`).digest("hex").slice(0, 24).toUpperCase()}`
+          : ""
+      );
+      if (!accountKey) {
         return jsonWithCors(
           request,
-          { error: "Account number is required when creating a new bank account." },
+          { error: "Select and confirm a Tally bank ledger before posting." },
           { status: 400 }
         );
       }
@@ -472,10 +483,11 @@ export async function POST(
       const insertPayload = {
         owner_user_id: user.id,
         bank_name: account.bankName || importRow.extracted_bank_name || null,
-        account_number_normalized: normalizedAccountNumber,
-        account_number_masked: maskAccountNumber(accountNumber),
+        account_number_normalized: accountKey,
+        account_number_masked: normalizedAccountNumber ? maskAccountNumber(accountNumber) : "UNVERIFIED",
         account_holder_name: account.accountHolderName || importRow.extracted_account_holder_name || null,
         ifsc_code: normalizeIfscCode(account.ifscCode || importRow.extracted_ifsc_code || null) || null,
+        tally_ledger_name: manualLedgerName || null,
       };
 
       const { data, error } = await supabase
@@ -489,7 +501,7 @@ export async function POST(
           .from("bank_accounts")
           .select("*")
           .eq("owner_user_id", user.id)
-          .eq("account_number_normalized", normalizedAccountNumber)
+          .eq("account_number_normalized", accountKey)
           .single();
         if (existingError || !existing) throw error;
         accountRow = existing;
@@ -764,6 +776,15 @@ export async function POST(
               appendCompletedAt: new Date().toISOString(),
               alreadyPostedTransactionCount: postedByFingerprint.size,
               reconciledAgainstLiveTally: reconcileAgainstLiveTally,
+              bankLedgerSelection: {
+                ledgerName: String(submittedAccount.tallyLedgerName ?? "").trim() || null,
+                mode: normalizeAccountNumber(
+                  submittedAccount.accountNumber || importRow.extracted_account_number || ""
+                )
+                  ? "verified_or_existing_account"
+                  : "manual_override",
+                confirmedAt: new Date().toISOString(),
+              },
             },
           })
           .eq("id", id)
