@@ -186,6 +186,12 @@ function isValidTransactionDate(value: unknown) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? "").trim());
 }
 
+function getVoucherDate(transaction: Pick<BankTransactionRow, "transaction_date" | "value_date">) {
+  return isValidTransactionDate(transaction.value_date)
+    ? String(transaction.value_date)
+    : transaction.transaction_date;
+}
+
 function getVoucherType(transaction: BankTransactionRow) {
   const debit = toNumber(transaction.debit_amount);
   const credit = toNumber(transaction.credit_amount);
@@ -676,11 +682,12 @@ export async function POST(request: Request) {
         }
         const account = accountsById.get(transaction.bank_account_id);
         const amount = getTransactionAmount(transaction);
+        const voucherDate = getVoucherDate(transaction);
         const bankLedgerName = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
         if (!account) {
           return skipTransaction(transaction, "missingAccount");
         }
-        if (!isValidTransactionDate(transaction.transaction_date)) {
+        if (!isValidTransactionDate(voucherDate)) {
           return skipTransaction(transaction, "invalidDate");
         }
         if (!bankLedgerName) {
@@ -726,7 +733,7 @@ export async function POST(request: Request) {
               bankAccountId: account.id,
               fingerprint: transaction.fingerprint,
               companyName: expectedCompanyName,
-              voucherDate: transaction.transaction_date,
+              voucherDate,
               bankLedgerName,
               counterpartyLedgerName: counterpartyLedgerName || null,
               matchedLedgerName: counterpartyLedgerName || null,
@@ -801,7 +808,7 @@ export async function POST(request: Request) {
             fingerprint: transaction.fingerprint,
             companyName: expectedCompanyName,
             voucherType: outgoingPayment && counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
-            voucherDate: transaction.transaction_date,
+            voucherDate,
             bankLedgerName,
             counterpartyLedgerName,
             matchedLedgerName: counterpartyLedgerName,

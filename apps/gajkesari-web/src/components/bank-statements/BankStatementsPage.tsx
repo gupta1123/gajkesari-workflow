@@ -994,9 +994,25 @@ function hasValidTransactionDate(value: string | null | undefined) {
   return !Number.isNaN(date.getTime());
 }
 
+function getEffectiveTransactionDate(transaction: {
+  transactionDate: string;
+  valueDate?: string | null;
+}) {
+  return hasValidTransactionDate(transaction.valueDate)
+    ? String(transaction.valueDate)
+    : transaction.transactionDate;
+}
+
+function getEffectiveTransactionDateLabel(transaction: {
+  transactionDate: string;
+  valueDate?: string | null;
+}) {
+  return hasValidTransactionDate(transaction.valueDate) ? "Value Date" : "Transaction Date";
+}
+
 function transactionIsValid(transaction: ReviewTransaction) {
   return Boolean(
-    hasValidTransactionDate(transaction.transactionDate) &&
+    hasValidTransactionDate(getEffectiveTransactionDate(transaction)) &&
     transaction.description.trim() &&
     transactionHasPostingAmount(transaction)
   );
@@ -2105,7 +2121,7 @@ function sortOpenBills(openBills: OpenBillReference[]) {
 }
 
 function buildAdvanceReference(transaction: ReviewTransaction) {
-  const date = transaction.transactionDate.replace(/-/g, "");
+  const date = getEffectiveTransactionDate(transaction).replace(/-/g, "");
   const suffix = normalizeReferenceToken(transaction.referenceNumber || transaction.id).slice(-8) || transaction.id.slice(0, 8);
   return `ADV-${date}-${suffix}`.slice(0, 80);
 }
@@ -2296,13 +2312,14 @@ function allocateBillsForTransaction(
 
 function transactionQueueKey(transaction: {
   transactionDate: string;
+  valueDate?: string | null;
   description: string;
   referenceNumber?: string | null;
   debitAmount?: string | number | null;
   creditAmount?: string | number | null;
 }) {
   return [
-    transaction.transactionDate,
+    getEffectiveTransactionDate(transaction),
     transaction.referenceNumber || "",
     transaction.description,
     String(transaction.debitAmount ?? ""),
@@ -3267,10 +3284,11 @@ export function BankStatementsPage() {
       if (reviewDirectionFilter === "credit" && (parseNumber(transaction.creditAmount) ?? 0) <= 0) {
         return false;
       }
-      if (reviewDateFrom && transaction.transactionDate < reviewDateFrom) {
+      const effectiveDate = getEffectiveTransactionDate(transaction);
+      if (reviewDateFrom && effectiveDate < reviewDateFrom) {
         return false;
       }
-      if (reviewDateTo && transaction.transactionDate > reviewDateTo) {
+      if (reviewDateTo && effectiveDate > reviewDateTo) {
         return false;
       }
       if (
@@ -3288,7 +3306,7 @@ export function BankStatementsPage() {
       if (!normalizedSearch) return true;
 
       const searchable = [
-        transaction.transactionDate,
+        effectiveDate,
         transaction.description,
         transaction.referenceNumber,
         transaction.transactionType,
@@ -5162,7 +5180,7 @@ export function BankStatementsPage() {
             const creditAmount = parseNumber(transaction.creditAmount) ?? 0;
             return {
               transactionId: transaction.id,
-              voucherDate: transaction.transactionDate,
+              voucherDate: getEffectiveTransactionDate(transaction),
               bankLedgerName,
               amount: incoming ? creditAmount : debitAmount,
               debitAmount,
@@ -5219,7 +5237,7 @@ export function BankStatementsPage() {
         };
         continue;
       }
-      if (!transaction.transactionDate || amount <= 0) {
+      if (!hasValidTransactionDate(getEffectiveTransactionDate(transaction)) || amount <= 0) {
         nextDrafts[transaction.id] = {
           status: "cannot_check_yet",
           label: "Cannot Check",
@@ -5248,7 +5266,7 @@ export function BankStatementsPage() {
             commandType: "verify_bank_transaction",
             payload: {
               companyName: selectedCompanyName || connection.lastCompanyName,
-              voucherDate: transaction.transactionDate,
+              voucherDate: getEffectiveTransactionDate(transaction),
               bankLedgerName,
               amount: parseNumber(transaction.debitAmount) ?? 0,
               counterpartyLedgerName: isSuspenseLedgerName(transaction.selectedLedgerName)
@@ -5325,7 +5343,7 @@ export function BankStatementsPage() {
       if (receiptTransactionsToMatch.length > 0) {
         const ledgers = Array.from(new Set(receiptTransactionsToMatch.map((transaction) => transaction.selectedLedgerName)));
         const asOfDate = receiptTransactionsToMatch
-          .map((transaction) => transaction.transactionDate)
+          .map(getEffectiveTransactionDate)
           .filter(Boolean)
           .sort()
           .at(-1);
@@ -7262,7 +7280,7 @@ export function BankStatementsPage() {
                               }}
                             >
                               <td className="px-3 py-4 text-xs font-bold text-slate-500">
-                                {formatShortDate(transaction.transactionDate)}
+                                {formatShortDate(getEffectiveTransactionDate(transaction))}
                               </td>
                               <td className="px-3 py-4 align-top">
                                 <div className="whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={partyTitle}>
@@ -7564,7 +7582,10 @@ export function BankStatementsPage() {
                     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
                       <div className="hidden grid gap-3 sm:grid-cols-2">
                         {[
-                          ["Bank Date", formatShortDate(billAllocationReviewTransaction.transactionDate)],
+                          [
+                            getEffectiveTransactionDateLabel(billAllocationReviewTransaction),
+                            formatShortDate(getEffectiveTransactionDate(billAllocationReviewTransaction)),
+                          ],
                           ["Type", getTransactionDirection(billAllocationReviewTransaction) || "-"],
                           [
                             "Amount",
@@ -8013,7 +8034,10 @@ export function BankStatementsPage() {
                     <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
                       <div className="mb-4 grid gap-3 rounded-xl border border-[#e5ddd0] bg-white p-4 sm:grid-cols-2">
                         {[
-                          ["Bank Date", formatShortDate(outgoingReviewTransaction.transactionDate)],
+                          [
+                            getEffectiveTransactionDateLabel(outgoingReviewTransaction),
+                            formatShortDate(getEffectiveTransactionDate(outgoingReviewTransaction)),
+                          ],
                           ["Amount", formatCurrencyAmount(tallyResultReviewAmount)],
                           ["UTR / Ref", getTransactionReference(outgoingReviewTransaction) || "-"],
                           ["Matched Ledger", outgoingReviewTransaction.selectedLedgerName || "-"],
