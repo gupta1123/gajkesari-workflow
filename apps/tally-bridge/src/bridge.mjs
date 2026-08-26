@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, X509Certificate } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { rootCertificates } from "node:tls";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.44";
+const BRIDGE_VERSION = "0.1.45";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -28,6 +30,49 @@ const PURCHASE_DOCUMENT_UDFS = {
 };
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
+let cachedWindowsTlsCertificates;
+
+function windowsTlsCertificates() {
+  if (cachedWindowsTlsCertificates) return cachedWindowsTlsCertificates;
+  cachedWindowsTlsCertificates = [...rootCertificates];
+  if (process.platform !== "win32") return cachedWindowsTlsCertificates;
+
+  try {
+    const powershell = path.join(
+      process.env.SystemRoot || "C:\\Windows",
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe"
+    );
+    const output = execFileSync(
+      powershell,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$locations = [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine,[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser; foreach ($location in $locations) { foreach ($name in 'Root','CA') { $store = [System.Security.Cryptography.X509Certificates.X509Store]::new($name,$location); try { $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly); foreach ($certificate in $store.Certificates) { [Convert]::ToBase64String($certificate.RawData) } } finally { $store.Close() } } }",
+      ],
+      { encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024 }
+    );
+    const windowsRoots = output
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .flatMap((value) => {
+        try {
+          return [new X509Certificate(Buffer.from(value, "base64")).toString()];
+        } catch {
+          return [];
+        }
+      });
+    cachedWindowsTlsCertificates.push(...windowsRoots);
+  } catch {
+    // The standard Node root set remains available if Windows certificate
+    // discovery is blocked by local policy.
+  }
+  return cachedWindowsTlsCertificates;
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -3595,6 +3640,7 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
 async function collectTallyMasters(config, commandPayload = {}) {
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const fieldProfile = String(commandPayload.fieldProfile || "").trim();
   const requestedMasterTypes = new Set(
     Array.isArray(commandPayload.requestedMasterTypes)
       ? commandPayload.requestedMasterTypes.map((value) => String(value || "").trim())
@@ -3616,14 +3662,16 @@ async function collectTallyMasters(config, commandPayload = {}) {
       companyName,
     })]);
   };
-  fetchMaster("ledgerXml", "ledger", "Gajkesari Ledgers Sync",
-    "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation");
+  const ledgerFetchFields = fieldProfile === "bank_statement"
+    ? "Name,Parent,GUID,ClosingBalance,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName"
+    : "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation";
+  fetchMaster("ledgerXml", "ledger", "Gajkesari Ledgers Sync", ledgerFetchFields);
   fetchMaster("groupXml", "group", "Gajkesari Groups Sync", "Name,Parent,GUID");
   fetchMaster("stockItemXml", "stock_item", "Gajkesari Stock Items Sync",
     "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable");
   fetchMaster("unitXml", "unit", "Gajkesari Units Sync", "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit");
   fetchMaster("voucherTypeXml", "voucher_type", "Gajkesari Voucher Types Sync", "Name,Parent,GUID");
-  if (shouldFetch("ledger")) {
+  if (shouldFetch("ledger") && fieldProfile !== "bank_statement") {
     fetches.push(["companyXml", exportTallyCollection(tallyUrl, {
       collectionName: "Gajkesari Company Profile Sync",
       tallyType: "Company",
@@ -4558,13 +4606,20 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "ledger_masters") {
+          const operationStartedAt = Date.now();
           const requestedMasterTypes =
             Array.isArray(message.payload?.requestedMasterTypes) && message.payload.requestedMasterTypes.length > 0
               ? message.payload.requestedMasterTypes
               : ["ledger", "group"];
+          const isBankStatementMasterRead =
+            requestedMasterTypes.length === 2 &&
+            requestedMasterTypes.includes("ledger") &&
+            requestedMasterTypes.includes("group") &&
+            message.payload?.persistSnapshot !== true;
           const masters = await collectTallyMasters(config, {
             companyName: message.companyName,
             requestedMasterTypes,
+            fieldProfile: message.payload?.fieldProfile || (isBankStatementMasterRead ? "bank_statement" : ""),
           });
           const requestedTypes = new Set(requestedMasterTypes);
           const masterPayload = {};
@@ -4575,20 +4630,31 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           if (requestedTypes.has("voucher_type")) masterPayload.voucherTypes = masters.voucherTypes;
           if (requestedTypes.has("gst_ledger")) masterPayload.gstLedgers = masters.gstLedgers;
           if (requestedTypes.has("tax_ledger")) masterPayload.taxLedgers = masters.taxLedgers;
-          const syncPayload = {
-            connectionId: config.connectionId,
-            companyName: message.companyName || config.companyName || null,
-            bridgeVersion: BRIDGE_VERSION,
-            masters: masterPayload,
-            companyProfile: masters.companyProfile,
-            requestedMasterTypes: masters.requestedMasterTypes,
-          };
-          const syncResult = await postMastersToBackend(config, syncPayload);
+          // Interactive ledger reads must remain local and fast. Persisting a
+          // 12k+ master snapshot here blocked the browser for about a minute
+          // and could disconnect the live socket. Explicit sync_masters
+          // commands still use syncMastersFromTally and persist the snapshot.
+          let syncRunId = null;
+          if (message.payload?.persistSnapshot === true) {
+            const syncResult = await postMastersToBackend(config, {
+              connectionId: config.connectionId,
+              companyName: message.companyName || config.companyName || null,
+              bridgeVersion: BRIDGE_VERSION,
+              masters: masterPayload,
+              companyProfile: masters.companyProfile,
+              requestedMasterTypes: masters.requestedMasterTypes,
+            });
+            syncRunId = syncResult.syncRunId || null;
+          }
+          log(
+            "info",
+            `Live ledger fetch completed in ${Date.now() - operationStartedAt} ms (${masters.ledgers.length} ledgers, ${masters.groups.length} groups, persistence ${message.payload?.persistSnapshot === true ? "enabled" : "skipped"}).`
+          );
           return {
             source: "live_tally",
             companyName: message.companyName,
             fetchedAt: new Date().toISOString(),
-            syncRunId: syncResult.syncRunId,
+            syncRunId,
             ledgers: masters.ledgers,
             groups: masters.groups,
             stockItems: masters.stockItems,
@@ -4627,7 +4693,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   const connect = () => {
     if (stopped) return;
     try {
-      socket = new WebSocket(tallyLiveGatewayUrl(config));
+      socket = new WebSocket(tallyLiveGatewayUrl(config), {
+        ca: windowsTlsCertificates(),
+      });
       socket.addEventListener("open", () => {
         send({
           type: "authenticate",
@@ -4650,8 +4718,18 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           log("error", error instanceof Error ? error.message : "Invalid live Tally message.");
         }
       });
-      socket.addEventListener("error", () => log("error", "Live Tally channel is unavailable; retrying."));
-      socket.addEventListener("close", scheduleReconnect);
+      socket.addEventListener("error", (event) => {
+        const detail = String(event?.message || event?.error?.message || "").trim();
+        log("error", `Live Tally channel is unavailable${detail ? `: ${detail}` : ""}; retrying.`);
+      });
+      socket.addEventListener("close", (event) => {
+        const code = Number(event?.code || 0);
+        const reason = String(event?.reason || "").trim();
+        if (!stopped && (code !== 1000 || reason)) {
+          log("error", `Live Tally channel closed (code ${code || "unknown"}${reason ? `: ${reason}` : ""}); retrying.`);
+        }
+        scheduleReconnect();
+      });
     } catch (error) {
       log("error", error instanceof Error ? error.message : "Could not start the live Tally channel.");
       scheduleReconnect();

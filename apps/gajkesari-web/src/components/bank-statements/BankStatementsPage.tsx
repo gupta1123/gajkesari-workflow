@@ -3802,7 +3802,10 @@ export function BankStatementsPage() {
       connectionId,
       companyName: selectedCompanyName || connectionCompany?.companyName || "",
       operation: "ledger_masters",
-      payload: { requestedMasterTypes: ["ledger", "group"] },
+      payload: {
+        requestedMasterTypes: ["ledger", "group"],
+        fieldProfile: "bank_statement",
+      },
     });
     const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
     if (loadSeq === ledgerLoadSeqRef.current) {
