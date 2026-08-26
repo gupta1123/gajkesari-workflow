@@ -9,9 +9,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.45";
+const BRIDGE_VERSION = "0.1.46";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
+const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
@@ -1866,13 +1867,114 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
     }
   }
 
-  const primaryXml = buildBankVoucherXml(payload, companyName);
+  // Tally's documented voucher-import envelope includes VERSION, TYPE and ID.
+  // The shorter header is accepted by some releases, but recent TallyPrime
+  // builds can route it through Import Exceptions and misleadingly report that
+  // DATE is missing even though DATE and EFFECTIVEDATE are present.
+  const primaryXml = buildBankVoucherXml(payload, companyName, { legacyHeader: true });
   const primaryOutcome = explainBankVoucherTallyError(
     requireCreatedVoucher(await invokeTallyXml(tallyUrl, primaryXml)),
     payload
   );
 
   return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+}
+
+async function runBankVoucherCommandBatch(config, commands, options = {}) {
+  const groups = new Map();
+  for (const command of commands) {
+    const payload = command?.payload || {};
+    const key = [
+      normalizeLooseName(payload.companyName || config.companyName),
+      normalizeLooseName(payload.bankLedgerName),
+    ].join("::");
+    const group = groups.get(key) || [];
+    group.push(command);
+    groups.set(key, group);
+  }
+
+  for (const group of groups.values()) {
+    let preflightByTransactionId = null;
+    try {
+      const firstPayload = group[0]?.payload || {};
+      const batchPreflight = await reconcileBankTransactionsInTally(config, {
+        companyName: firstPayload.companyName || config.companyName || null,
+        bankLedgerName: firstPayload.bankLedgerName,
+        transactions: group.map((command) => ({
+          ...command.payload,
+          expectedDirection:
+            command.payload?.expectedDirection ||
+            (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
+        })),
+      });
+      preflightByTransactionId = new Map(
+        (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+    } catch (error) {
+      console.warn(
+        `Batch duplicate preflight was unavailable; falling back to independent checks: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+
+    for (const command of group) {
+      try {
+        const transactionId = String(command.payload?.transactionId || "");
+        const preflight = preflightByTransactionId?.get(transactionId) || null;
+        if (preflight?.verificationStatus === "found") {
+          await sendCommandResult(config, command, {
+            success: true,
+            result: {
+              alreadyInTally: true,
+              created: 0,
+              altered: 0,
+              voucherId: preflight.voucherId,
+              voucherNumber: preflight.voucherNumber,
+              voucherDate: preflight.voucherDate,
+              duplicateCheck: preflight,
+              transactionId,
+            },
+          });
+          console.log(`Command ${command.id} completed: bank transaction already existed in Tally.`);
+          continue;
+        }
+        if (preflight?.verificationStatus === "ambiguous") {
+          await sendCommandResult(config, command, {
+            success: false,
+            error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
+            result: {
+              possibleDuplicateInTally: true,
+              duplicateCheck: preflight,
+              transactionId,
+            },
+          });
+          console.log(`Command ${command.id} needs review: possible duplicate bank transaction.`);
+          continue;
+        }
+
+        await runCommand(
+          config,
+          {
+            ...command,
+            payload: {
+              ...command.payload,
+              // One targeted Tally export above checked every voucher in this
+              // company/bank group. Do not repeat the same export per row.
+              preflightVerifyExisting: preflightByTransactionId === null,
+            },
+          },
+          options
+        );
+      } catch (error) {
+        console.error(
+          `Command ${command.id} failed without blocking the remaining vouchers: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+  }
 }
 
 async function postCustomerAdvanceAdjustment(tallyUrl, payload, companyName) {
@@ -4529,17 +4631,19 @@ async function runOnce(config, options = {}) {
   // and the local PDF renderer, not a fresh Tally HTTP call. Claim and finish
   // it before a slow/unreachable Tally heartbeat can hold the customer send
   // flow hostage for a minute.
-  let deferredCommand = null;
+  const deferredCommands = [];
   try {
-    const command = await receiveNextCommand(config);
-    const isVerifiedDebitNotePdf =
-      command &&
-      (command.commandType === "export_debit_note_pdf" ||
-        (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf"));
-    if (isVerifiedDebitNotePdf) {
-      await runCommand(config, command, options);
-    } else {
-      deferredCommand = command;
+    for (let index = 0; index < MAX_COMMANDS_PER_CYCLE; index += 1) {
+      const command = await receiveNextCommand(config);
+      if (!command) break;
+      const isVerifiedDebitNotePdf =
+        command.commandType === "export_debit_note_pdf" ||
+        (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf");
+      if (isVerifiedDebitNotePdf) {
+        await runCommand(config, command, options);
+      } else {
+        deferredCommands.push(command);
+      }
     }
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
@@ -4561,8 +4665,24 @@ async function runOnce(config, options = {}) {
   );
 
   try {
-    if (deferredCommand) {
-      await runCommand(config, deferredCommand, options);
+    const bankVoucherCommands = deferredCommands.filter(
+      (command) => command.commandType === "post_bank_voucher"
+    );
+    for (const command of deferredCommands) {
+      if (command.commandType !== "post_bank_voucher") {
+        try {
+          await runCommand(config, command, options);
+        } catch (error) {
+          console.error(
+            `Command ${command.id} failed without blocking the remaining queue: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
+    }
+    if (bankVoucherCommands.length > 0) {
+      await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
     }
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);

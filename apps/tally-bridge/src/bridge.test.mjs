@@ -64,7 +64,7 @@ test("outgoing supplier payments create Payment vouchers with bill allocations",
   assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>/);
 });
 
-+test("direct party posting creates an Advance without settling an existing bill", () => {
+test("direct party posting creates an Advance without settling an existing bill", () => {
   const xml = buildBankVoucherXml({
     companyName: "Solution Nyx",
     voucherType: "Receipt",
@@ -84,6 +84,27 @@ test("outgoing supplier payments create Payment vouchers with bill allocations",
   assert.match(xml, /<NAME>ADV-20260817-0900001<\/NAME>/);
   assert.match(xml, /<BILLTYPE>Advance<\/BILLTYPE>/);
   assert.doesNotMatch(xml, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
+});
+
+test("bank voucher supports Tally's documented complete import header", () => {
+  const xml = buildBankVoucherXml(
+    {
+      companyName: "Solution Nyx",
+      voucherType: "Receipt",
+      voucherDate: "2026-08-11",
+      bankLedgerName: "State Bank of India",
+      counterpartyLedgerName: "Indus Metal Recovery",
+      bankLedgerEntryIsDebit: true,
+      amount: 140000,
+      referenceNumber: "SBIN1108260001",
+    },
+    null,
+    { legacyHeader: true }
+  );
+
+  assert.match(xml, /<HEADER><VERSION>1<\/VERSION><TALLYREQUEST>Import Data<\/TALLYREQUEST><TYPE>Data<\/TYPE><ID>Vouchers<\/ID><\/HEADER>/);
+  assert.match(xml, /<DATE>20260811<\/DATE>/);
+  assert.match(xml, /<EFFECTIVEDATE>20260811<\/EFFECTIVEDATE>/);
 });
 
 
