@@ -384,11 +384,15 @@ function ExtractionEngineBadge({ source }: { source?: string | null }) {
 
 type TallyMaster = {
   key: string;
+  guid?: string | null;
   name: string;
   type: string;
   parent?: string | null;
   billWiseEnabled?: boolean | null;
   ledgerType?: string | null;
+  raw?: {
+    billWiseEnabled?: boolean | null;
+  } | null;
   bankName?: string | null;
   bankAccountNumber?: string | null;
   ifscCode?: string | null;
@@ -581,6 +585,55 @@ function normalizeName(value?: string | null) {
   return String(value ?? "")
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
+}
+
+function masterParentDescendsFromGroup(
+  parentName: string | null | undefined,
+  groups: TallyMaster[],
+  targetGroupName: string
+) {
+  const target = normalizeName(targetGroupName);
+  const parentByName = new Map(
+    groups
+      .map((group) => [normalizeName(group.name), group.parent ?? null] as const)
+      .filter(([name]) => Boolean(name))
+  );
+  const visited = new Set<string>();
+  let currentName = parentName;
+
+  while (currentName) {
+    const normalized = normalizeName(currentName);
+    if (!normalized || visited.has(normalized)) return false;
+    if (normalized === target) return true;
+    visited.add(normalized);
+    currentName = parentByName.get(normalized) ?? null;
+  }
+
+  return false;
+}
+
+function normalizeLiveLedgerMasters(ledgers: TallyMaster[], groups: TallyMaster[]) {
+  return ledgers.map((ledger) => {
+    const ledgerType = masterParentDescendsFromGroup(ledger.parent, groups, "Sundry Debtors")
+      ? "customer"
+      : masterParentDescendsFromGroup(ledger.parent, groups, "Sundry Creditors")
+        ? "supplier"
+        : ledger.ledgerType ?? "other";
+    const rawBillWiseEnabled = ledger.raw?.billWiseEnabled;
+
+    return {
+      ...ledger,
+      key: ledger.key || ledger.guid || normalizeName(ledger.name),
+      type: ledger.type || "ledger",
+      ledgerType,
+      billWiseEnabled:
+        typeof ledger.billWiseEnabled === "boolean"
+          ? ledger.billWiseEnabled
+          : typeof rawBillWiseEnabled === "boolean"
+            ? rawBillWiseEnabled
+            : null,
+    };
+  });
 }
 
 function ledgerNameTokens(value?: string | null) {
@@ -3751,7 +3804,7 @@ export function BankStatementsPage() {
       operation: "ledger_masters",
       payload: { requestedMasterTypes: ["ledger", "group"] },
     });
-    const masters = payload.ledgers ?? [];
+    const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
     if (loadSeq === ledgerLoadSeqRef.current) {
       setLedgerMasters(masters);
     }
