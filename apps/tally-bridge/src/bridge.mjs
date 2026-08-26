@@ -3481,6 +3481,25 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   };
 }
 
+function toBankStatementLiveMaster(master, type) {
+  const billWiseEnabled = master?.raw?.billWiseEnabled;
+  return {
+    name: master.name,
+    guid: master.guid || null,
+    parent: master.parent || null,
+    type,
+    ...(type === "ledger" ? {
+      billWiseEnabled: typeof billWiseEnabled === "boolean" ? billWiseEnabled : null,
+      bankName: master.bankName || null,
+      bankAccountNumber: master.bankAccountNumber || null,
+      ifscCode: master.ifscCode || null,
+      accountHolderName: master.accountHolderName || null,
+      closingBalance: master.closingBalance ?? null,
+      closingBalanceType: master.closingBalanceType ?? null,
+    } : {}),
+  };
+}
+
 function taxLedgerIdentity(master) {
   const name = master.name || "";
   const raw = master.raw || {};
@@ -4650,23 +4669,36 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             "info",
             `Live ledger fetch completed in ${Date.now() - operationStartedAt} ms (${masters.ledgers.length} ledgers, ${masters.groups.length} groups, persistence ${message.payload?.persistSnapshot === true ? "enabled" : "skipped"}).`
           );
-          return {
+          const responseLedgers = isBankStatementMasterRead
+            ? masters.ledgers.map((master) => toBankStatementLiveMaster(master, "ledger"))
+            : masters.ledgers;
+          const responseGroups = isBankStatementMasterRead
+            ? masters.groups.map((master) => toBankStatementLiveMaster(master, "group"))
+            : masters.groups;
+          const response = {
             source: "live_tally",
             companyName: message.companyName,
             fetchedAt: new Date().toISOString(),
             syncRunId,
-            ledgers: masters.ledgers,
-            groups: masters.groups,
+            ledgers: responseLedgers,
+            groups: responseGroups,
             stockItems: masters.stockItems,
             units: masters.units,
             companyProfile: masters.companyProfile,
-            masters: {
-              ledgers: masters.ledgers,
-              groups: masters.groups,
+          };
+          // Bank Statements consumes the top-level ledgers/groups. Do not add
+          // the legacy nested copy here: it doubled an already-large 12k row
+          // WebSocket message and caused Heroku to terminate the live socket.
+          if (!isBankStatementMasterRead) {
+            response.masters = {
+              ledgers: responseLedgers,
+              groups: responseGroups,
               stockItems: masters.stockItems,
               units: masters.units,
-            },
-          };
+            };
+          }
+          log("info", `Live ledger response size: ${Buffer.byteLength(JSON.stringify(response))} bytes.`);
+          return response;
         }
         if (operation === "verify_bank_transaction") {
           const outcome = await reconcileBankTransactionsInTally(config, message.payload || {});
