@@ -1,5 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createHash } from "node:crypto";
+import { after } from "next/server";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   BANK_STATEMENT_BUCKET,
@@ -25,18 +26,16 @@ type ConfirmPayload = {
   reconcileAgainstLiveTally?: boolean;
 };
 
-type PostedTransactionRow = {
+type QueueableTransactionRow = {
   id: string;
-  owner_user_id: string;
-  bank_account_id: string;
   transaction_date: string;
+  value_date: string | null;
   description: string;
   reference_number: string | null;
   debit_amount: number | string | null;
   credit_amount: number | string | null;
-  fingerprint: string;
-  tally_voucher_id: string | null;
-  tally_posted_at: string | null;
+  suggested_ledger_name: string | null;
+  confirmed_ledger_name: string | null;
 };
 
 type PostedLogRow = {
@@ -357,15 +356,18 @@ function hasPostingAmount(row: {
   return getTransactionAmount(row) > 0;
 }
 
-function getVoucherType(row: {
-  debit_amount?: number | string | null;
-  credit_amount?: number | string | null;
-}) {
-  const debit = normalizeCheckpointAmount(row.debit_amount) ?? 0;
-  const credit = normalizeCheckpointAmount(row.credit_amount) ?? 0;
-  if (debit > 0 && credit <= 0) return "Payment";
-  if (credit > 0 && debit <= 0) return "Receipt";
-  return "Contra";
+function serializeQueueableTransaction(row: QueueableTransactionRow) {
+  return {
+    id: row.id,
+    transactionDate: row.transaction_date,
+    valueDate: row.value_date,
+    description: row.description,
+    referenceNumber: row.reference_number,
+    debitAmount: row.debit_amount,
+    creditAmount: row.credit_amount,
+    suggestedLedgerName: row.confirmed_ledger_name || row.suggested_ledger_name || null,
+    confirmedLedgerName: row.confirmed_ledger_name || null,
+  };
 }
 
 export function OPTIONS(request: Request) {
@@ -560,81 +562,42 @@ export async function POST(
     );
     const rowsAfterCheckpoint = reconcileAgainstLiveTally ? rows : checkpointResult.rows;
 
-    const { data: existingPostedRows, error: existingPostedError } = await supabase
-      .from("bank_transactions")
-      .select(
-        "id, owner_user_id, bank_account_id, transaction_date, description, reference_number, debit_amount, credit_amount, fingerprint, tally_voucher_id, tally_posted_at"
-      )
-      .eq("owner_user_id", user.id)
-      .eq("bank_account_id", accountId)
-      .eq("tally_status", "posted");
-
-    if (existingPostedError) throw existingPostedError;
-
-    const postedRows = (existingPostedRows ?? []) as unknown as PostedTransactionRow[];
-    if (!reconcileAgainstLiveTally && postedRows.length > 0) {
-      const postedLogRows = postedRows.map((row) => ({
-        owner_user_id: user.id,
-        bank_account_id: accountId,
-        source_transaction_id: row.id,
-        fingerprint: row.fingerprint,
-        transaction_date: row.transaction_date,
-        reference_number: row.reference_number,
-        description: row.description,
-        debit_amount: row.debit_amount,
-        credit_amount: row.credit_amount,
-        amount: getTransactionAmount(row),
-        voucher_type: getVoucherType(row),
-        status: "posted",
-        tally_voucher_id: row.tally_voucher_id,
-        tally_posted_at: row.tally_posted_at ?? new Date().toISOString(),
-        result: {
-          migratedFromSnapshot: true,
-          migratedAt: new Date().toISOString(),
-        },
-      }));
-
-      const { error: postedLogError } = await supabase
-        .from("bank_transaction_posting_log")
-        .upsert(postedLogRows, {
-          onConflict: "owner_user_id,bank_account_id,fingerprint",
-        });
-
-      if (postedLogError) throw postedLogError;
-    }
-
     const submittedFingerprints = rows.map((row) => row.fingerprint);
-    if (reconcileAgainstLiveTally && submittedFingerprints.length > 0) {
-      const { error: stalePostingLogError } = await supabase
-        .from("bank_transaction_posting_log")
-        .delete()
-        .eq("owner_user_id", user.id)
-        .eq("bank_account_id", accountId)
-        .in("fingerprint", submittedFingerprints);
-      if (stalePostingLogError) throw stalePostingLogError;
-    }
-    const { data: postedLogData, error: postedLogReadError } = submittedFingerprints.length
-      ? await supabase
+    const existingTransactionsPromise = submittedFingerprints.length
+      ? supabase
+          .from("bank_transactions")
+          .select("id, fingerprint, statement_import_id, tally_status")
+          .eq("owner_user_id", user.id)
+          .eq("bank_account_id", accountId)
+          .in("fingerprint", submittedFingerprints)
+      : Promise.resolve({ data: [], error: null });
+    const postingLogPromise = !reconcileAgainstLiveTally && submittedFingerprints.length
+      ? supabase
           .from("bank_transaction_posting_log")
           .select("fingerprint, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
           .eq("status", "posted")
           .in("fingerprint", submittedFingerprints)
-      : { data: [], error: null };
-
-    if (postedLogReadError) throw postedLogReadError;
-
-    const { data: existingTransactionData, error: existingTransactionReadError } = submittedFingerprints.length
-      ? await supabase
-          .from("bank_transactions")
-          .select("id, fingerprint, statement_import_id, tally_status")
+      : Promise.resolve({ data: [], error: null });
+    const stalePostingLogPromise = reconcileAgainstLiveTally && submittedFingerprints.length
+      ? supabase
+          .from("bank_transaction_posting_log")
+          .delete()
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
           .in("fingerprint", submittedFingerprints)
-      : { data: [], error: null };
+      : Promise.resolve({ error: null });
+
+    const [
+      { data: existingTransactionData, error: existingTransactionReadError },
+      { data: postedLogData, error: postedLogReadError },
+      { error: stalePostingLogError },
+    ] = await Promise.all([existingTransactionsPromise, postingLogPromise, stalePostingLogPromise]);
 
     if (existingTransactionReadError) throw existingTransactionReadError;
+    if (postedLogReadError) throw postedLogReadError;
+    if (stalePostingLogError) throw stalePostingLogError;
 
     const existingFingerprints = new Set(
       ((existingTransactionData ?? []) as ExistingTransactionRow[]).flatMap((row) =>
@@ -750,7 +713,24 @@ export async function POST(
           .eq("owner_user_id", user.id)
           .single();
 
-    const [{ data: updatedAccount, error: accountUpdateError }, { data: updatedImport, error: importUpdateError }] =
+    const queueableTransactionsPromise = supabase
+      .from("bank_transactions")
+      .select(
+        "id, transaction_date, value_date, description, reference_number, debit_amount, credit_amount, suggested_ledger_name, confirmed_ledger_name"
+      )
+      .eq("owner_user_id", user.id)
+      .eq("bank_account_id", accountId)
+      .eq("statement_import_id", id)
+      .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
+      .or("debit_amount.gt.0,credit_amount.gt.0")
+      .order("transaction_date", { ascending: true })
+      .order("id", { ascending: true });
+
+    const [
+      { data: updatedAccount, error: accountUpdateError },
+      { data: updatedImport, error: importUpdateError },
+      { data: queueableTransactionData, error: queueableTransactionsError },
+    ] =
       await Promise.all([
         accountUpdatePromise,
         supabase
@@ -791,38 +771,51 @@ export async function POST(
           .eq("owner_user_id", user.id)
           .select("*")
           .single(),
+        queueableTransactionsPromise,
       ]);
 
     if (accountUpdateError) throw accountUpdateError;
     if (importUpdateError) throw importUpdateError;
+    if (queueableTransactionsError) throw queueableTransactionsError;
 
-    const { data: olderImports, error: olderImportsError } = await supabase
-      .from("bank_statement_imports")
-      .select("id, storage_path")
-      .eq("owner_user_id", user.id)
-      .eq("bank_account_id", accountId)
-      .neq("id", id);
+    const queueableTransactions = ((queueableTransactionData ?? []) as QueueableTransactionRow[])
+      .filter(hasPostingAmount)
+      .map(serializeQueueableTransaction);
 
-    if (olderImportsError) throw olderImportsError;
+    // Retention cleanup is useful, but it must not delay confirmation or Tally posting.
+    after(async () => {
+      try {
+        const { data: olderImports, error: olderImportsError } = await supabase
+          .from("bank_statement_imports")
+          .select("id, storage_path")
+          .eq("owner_user_id", user.id)
+          .eq("bank_account_id", accountId)
+          .neq("id", id);
+        if (olderImportsError) throw olderImportsError;
 
-    const olderStoragePaths = (olderImports ?? [])
-      .map((row) => (typeof row.storage_path === "string" ? row.storage_path : ""))
-      .filter(Boolean);
+        const olderStoragePaths = (olderImports ?? [])
+          .map((row) => (typeof row.storage_path === "string" ? row.storage_path : ""))
+          .filter(Boolean);
+        if (olderStoragePaths.length > 0) {
+          const { error: storageCleanupError } = await supabase.storage
+            .from(BANK_STATEMENT_BUCKET)
+            .remove(olderStoragePaths);
+          if (storageCleanupError) throw storageCleanupError;
+        }
 
-    if (olderStoragePaths.length > 0) {
-      await supabase.storage.from(BANK_STATEMENT_BUCKET).remove(olderStoragePaths);
-    }
-
-    if ((olderImports ?? []).length > 0) {
-      const { error: deleteOlderImportsError } = await supabase
-        .from("bank_statement_imports")
-        .delete()
-        .eq("owner_user_id", user.id)
-        .eq("bank_account_id", accountId)
-        .neq("id", id);
-
-      if (deleteOlderImportsError) throw deleteOlderImportsError;
-    }
+        if ((olderImports ?? []).length > 0) {
+          const { error: deleteOlderImportsError } = await supabase
+            .from("bank_statement_imports")
+            .delete()
+            .eq("owner_user_id", user.id)
+            .eq("bank_account_id", accountId)
+            .neq("id", id);
+          if (deleteOlderImportsError) throw deleteOlderImportsError;
+        }
+      } catch (cleanupError) {
+        console.error("Deferred bank statement import cleanup failed:", cleanupError);
+      }
+    });
 
     return jsonWithCors(request, {
       account: serializeAccount(updatedAccount),
@@ -833,6 +826,7 @@ export async function POST(
       existingTransactionCount: existingFingerprints.size,
       existingQueueableTransactionCount: existingQueueableRows.length,
       alreadyPostedTransactionCount: postedByFingerprint.size,
+      queueableTransactions,
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/imports/[id]/confirm:", error);

@@ -5620,13 +5620,16 @@ export function BankStatementsPage() {
         import: BankStatementImport;
         importedTransactionCount: number;
         duplicateTransactionCount: number;
+        queueableTransactions?: QueueTransaction[];
       };
 
-      const queueableTransactions = await fetchQueueableTransactions({
-        accountId: confirmPayload.account.id,
-        importId: confirmPayload.import.id,
-        connectionId: tallyConnectionId,
-      });
+      const queueableTransactions = Array.isArray(confirmPayload.queueableTransactions)
+        ? confirmPayload.queueableTransactions
+        : await fetchQueueableTransactions({
+            accountId: confirmPayload.account.id,
+            importId: confirmPayload.import.id,
+            connectionId: tallyConnectionId,
+          });
       const selectedQueueKeys = new Set(selectedTallyWorkTransactions.map(transactionQueueKey));
       const queueRows = queueableTransactions.filter((transaction) =>
         selectedQueueKeys.has(transactionQueueKey(transaction))
