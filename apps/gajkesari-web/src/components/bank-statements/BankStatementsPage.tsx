@@ -2168,20 +2168,6 @@ function buildAdvanceReference(transaction: ReviewTransaction) {
   return `ADV-${date}-${suffix}`.slice(0, 80);
 }
 
-function buildDirectPostingAdvanceAllocation(
-  transaction: ReviewTransaction,
-  ledgerMasters: TallyMaster[]
-) {
-  const context = getPartyBillMatchContext(transaction, ledgerMasters);
-  if (!context.eligible || context.amount <= 0) return [];
-
-  return [{
-    referenceType: "Advance" as const,
-    referenceName: buildAdvanceReference(transaction),
-    amount: context.amount,
-  }];
-}
-
 function isAllocationTotalValid(receiptAmount: number, totalAllocatedAmount: number) {
   return Math.abs(receiptAmount - totalAllocatedAmount) < 0.005;
 }
@@ -2864,7 +2850,6 @@ export function BankStatementsPage() {
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [sendingMode, setSendingMode] = useState<TallySendMode | null>(null);
-  const [pendingDirectPostMode, setPendingDirectPostMode] = useState<TallySendMode | null>(null);
   const [tallyPostingScope, setTallyPostingScope] = useState<TallyPostingScope>("all");
   const sending = sendingMode !== null;
   const [matchingBills, setMatchingBills] = useState(false);
@@ -3430,6 +3415,8 @@ export function BankStatementsPage() {
     selectedBlockingBillAllocationCount > 0;
   const postTallyButtonLabel = sendingMode
     ? "Sending..."
+    : !tallyCheckAttempted
+      ? `Check Tally Matches (${selectedPostingTransactions.length})`
     : ambiguousTallyPresenceCount > 0
       ? `Review ${ambiguousTallyPresenceCount} Ambiguous`
       : selectedBlockingBillAllocationCount > 0
@@ -5491,12 +5478,8 @@ export function BankStatementsPage() {
     }
   }
 
-  async function sendToTally(
-    mode: TallySendMode,
-    options: { skipBillMatching?: boolean } = {}
-  ) {
+  async function sendToTally(mode: TallySendMode) {
     if (!preview) return;
-    const skipBillMatching = options.skipBillMatching === true;
     if (preview.requiresManualExtraction || preview.extractionDiagnostics?.coverageComplete === false) {
       const unresolvedPages = preview.extractionDiagnostics?.unresolvedPages ?? [];
       showToast(
@@ -5546,7 +5529,7 @@ export function BankStatementsPage() {
       showToast("error", "Select a ledger for every row before sending to Tally.");
       return;
     }
-    if (!skipBillMatching && uncheckedTallyPresenceCount > 0) {
+    if (!tallyCheckAttempted || uncheckedTallyPresenceCount > 0) {
       showToast("error", "Check the full statement against Tally before sending anything.");
       return;
     }
@@ -5562,9 +5545,7 @@ export function BankStatementsPage() {
       });
       return;
     }
-    const blockingAllocations = skipBillMatching
-      ? []
-      : mode === "post_receipts"
+    const blockingAllocations = mode === "post_receipts"
         ? blockingReceiptBillAllocationTransactions
         : mode === "post_payments"
           ? blockingPaymentBillAllocationTransactions
@@ -5688,11 +5669,8 @@ export function BankStatementsPage() {
                   "Suspense",
                 createLedgerName: "",
                 createLedgerParentName: "",
-                billAllocations: skipBillMatching
-                  ? reviewedTransaction
-                    ? buildDirectPostingAdvanceAllocation(reviewedTransaction, ledgerMasters)
-                    : []
-                  : billAllocation?.status === "ready_to_post"
+                billMatchingVerified: billAllocation?.status === "ready_to_post",
+                billAllocations: billAllocation?.status === "ready_to_post"
                     ? billAllocation.allocations.map((allocation) => ({
                         referenceType: allocation.referenceType,
                         referenceName: allocation.referenceName,
@@ -5856,78 +5834,6 @@ export function BankStatementsPage() {
           </div>
         ))}
       </div>
-      {pendingDirectPostMode ? (
-        <div
-          aria-labelledby="direct-post-title"
-          aria-modal="true"
-          className="fixed inset-0 z-[1150] flex items-center justify-center bg-black/40 p-4 backdrop-blur-[2px]"
-          onMouseDown={(event) => {
-            if (event.currentTarget === event.target) setPendingDirectPostMode(null);
-          }}
-          role="dialog"
-        >
-          <div className="w-full max-w-lg rounded-2xl border border-[#ddd3c5] bg-white p-5 shadow-2xl">
-            <div className="flex items-start gap-3">
-              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-800">
-                <AlertTriangle className="h-5 w-5" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <h2 className="text-base font-black text-[#1a1a1a]" id="direct-post-title">
-                  Post without matching bills?
-                </h2>
-                <p className="mt-1 text-sm font-semibold leading-5 text-[#71695f]">
-                  Gajkesari will create the selected Receipt and Payment vouchers, but it will not settle any existing customer or supplier bills.
-                </p>
-              </div>
-            </div>
-            <div className="mt-4 space-y-2 rounded-xl border border-[#eadfce] bg-[#faf8f4] p-4 text-xs font-semibold text-[#5a5046]">
-              <div className="flex items-center justify-between gap-3">
-                <span>Vouchers selected</span>
-                <strong className="text-[#1a1a1a]">
-                  {pendingDirectPostMode === "post_receipts"
-                    ? newReceiptCount
-                    : pendingDirectPostMode === "post_payments"
-                      ? missingOutgoingCount
-                      : transactionsNeedingTallyWork.length}
-                </strong>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span>Bill settlement</span>
-                <strong className="text-amber-800">None</strong>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span>Party-ledger treatment</span>
-                <strong className="text-[#1a1a1a]">Advance</strong>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span>Duplicate protection</span>
-                <strong className="text-emerald-800">Runs before posting</strong>
-              </div>
-            </div>
-            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-              <Button
-                className="h-10 rounded-xl border-[#ddd3c5] bg-white px-4 text-xs font-bold text-[#5a5046]"
-                onClick={() => setPendingDirectPostMode(null)}
-                type="button"
-                variant="outline"
-              >
-                Cancel
-              </Button>
-              <Button
-                className="h-10 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white hover:bg-[#1a1a1a]"
-                onClick={() => {
-                  const mode = pendingDirectPostMode;
-                  setPendingDirectPostMode(null);
-                  void sendToTally(mode, { skipBillMatching: true });
-                }}
-                type="button"
-              >
-                Post without bill matching
-              </Button>
-            </div>
-          </div>
-        </div>
-      ) : null}
       {shortcutsOpen ? (
         <div
           aria-labelledby="bank-statement-shortcuts-title"
@@ -8356,7 +8262,7 @@ export function BankStatementsPage() {
                                   ? "post_payments"
                                   : "post_all";
                               if (!tallyCheckAttempted) {
-                                setPendingDirectPostMode(mode);
+                                void matchPendingBills();
                                 return;
                               }
                               void sendToTally(
