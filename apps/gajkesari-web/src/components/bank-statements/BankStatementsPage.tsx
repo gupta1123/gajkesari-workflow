@@ -587,17 +587,12 @@ function normalizeName(value?: string | null) {
     .replace(/[^a-z0-9]/g, "");
 }
 
-function masterParentDescendsFromGroup(
+function masterParentDescendsFromGroupMap(
   parentName: string | null | undefined,
-  groups: TallyMaster[],
+  parentByName: Map<string, string | null>,
   targetGroupName: string
 ) {
   const target = normalizeName(targetGroupName);
-  const parentByName = new Map(
-    groups
-      .map((group) => [normalizeName(group.name), group.parent ?? null] as const)
-      .filter(([name]) => Boolean(name))
-  );
   const visited = new Set<string>();
   let currentName = parentName;
 
@@ -612,11 +607,29 @@ function masterParentDescendsFromGroup(
   return false;
 }
 
+function masterParentDescendsFromGroup(
+  parentName: string | null | undefined,
+  groups: TallyMaster[],
+  targetGroupName: string
+) {
+  const parentByName = new Map(
+    groups
+      .map((group) => [normalizeName(group.name), group.parent ?? null] as const)
+      .filter(([name]) => Boolean(name))
+  );
+  return masterParentDescendsFromGroupMap(parentName, parentByName, targetGroupName);
+}
+
 function normalizeLiveLedgerMasters(ledgers: TallyMaster[], groups: TallyMaster[]) {
+  const parentByName = new Map(
+    groups
+      .map((group) => [normalizeName(group.name), group.parent ?? null] as const)
+      .filter(([name]) => Boolean(name))
+  );
   return ledgers.map((ledger) => {
-    const ledgerType = masterParentDescendsFromGroup(ledger.parent, groups, "Sundry Debtors")
+    const ledgerType = masterParentDescendsFromGroupMap(ledger.parent, parentByName, "Sundry Debtors")
       ? "customer"
-      : masterParentDescendsFromGroup(ledger.parent, groups, "Sundry Creditors")
+      : masterParentDescendsFromGroupMap(ledger.parent, parentByName, "Sundry Creditors")
         ? "supplier"
         : ledger.ledgerType ?? "other";
     const rawBillWiseEnabled = ledger.raw?.billWiseEnabled;

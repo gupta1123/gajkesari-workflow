@@ -296,12 +296,13 @@ export function startCashDiscountGateway(options = {}) {
     .replace(/\/+$/, "");
 
   const server = attachedServer
-    ? new WebSocketServer({ server: attachedServer, path: gatewayPath, maxPayload: MAX_MESSAGE_BYTES })
+    ? new WebSocketServer({ server: attachedServer, path: gatewayPath, maxPayload: MAX_MESSAGE_BYTES, perMessageDeflate: { threshold: 16 * 1024 } })
     : new WebSocketServer({
         host: options.host || HOST,
         port: Number(options.port ?? PORT),
         path: gatewayPath,
         maxPayload: MAX_MESSAGE_BYTES,
+        perMessageDeflate: { threshold: 16 * 1024 },
       });
 
   server.on("connection", (socket) => {

@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.47";
+const BRIDGE_VERSION = "0.1.48";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -2337,6 +2337,55 @@ function parseMasterCollection(xml, tagName) {
   );
 }
 
+// Bank-statement analysis only needs identity, hierarchy and bill-wise state for
+// the complete ledger list. Avoid the generic master parser here: it scans every
+// ledger for dozens of GST, contact, address and inventory fields that are not
+// used by this workflow.
+function parseBankStatementMasterCollection(xml, tagName, { bankDetails = false } = {}) {
+  return dedupeMasters(
+    extractBlocks(xml, tagName)
+      .map((block) => {
+        const name = getAttribute(block, "NAME") || getTagText(block, "NAME");
+        if (!name) return null;
+        const closingBalance = bankDetails
+          ? parseLedgerClosingBalance(getTagText(block, "CLOSINGBALANCE"))
+          : { amount: null, type: null };
+        const bankName = bankDetails
+          ? getTagText(block, "BANKNAME") || getTagText(block, "BANK") || getTagText(block, "BANKERNAME")
+          : null;
+        const bankAccountNumber = bankDetails
+          ? getTagText(block, "BANKACCOUNTNUMBER") || getTagText(block, "ACCOUNTNUMBER") ||
+            getTagText(block, "BANKACCOUNTNO") || getTagText(block, "BANKACNO") || getTagText(block, "ACNUMBER")
+          : null;
+        const ifscCode = bankDetails
+          ? getTagText(block, "IFSCCODE") || getTagText(block, "IFSCODE") ||
+            getTagText(block, "IFSC") || getTagText(block, "BANKIFSCCODE")
+          : null;
+        const accountHolderName = bankDetails
+          ? getTagText(block, "BANKACCHOLDERNAME") || getTagText(block, "BANKACCOUNTNAME") ||
+            getTagText(block, "BANKACCOUNTHOLDERNAME") || getTagText(block, "ACCOUNTHOLDERNAME")
+          : null;
+
+        return {
+          name,
+          guid: getTagText(block, "GUID") || null,
+          parent: getTagText(block, "PARENT") || null,
+          bankName,
+          bankAccountNumber,
+          ifscCode,
+          accountHolderName,
+          closingBalance: closingBalance.amount,
+          closingBalanceType: closingBalance.type,
+          raw: {
+            tallyTag: tagName,
+            billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON")),
+          },
+        };
+      })
+      .filter(Boolean)
+  );
+}
+
 function toVoucher(block) {
   const ledgerEntries = extractBlocks(block, "ALLLEDGERENTRIES.LIST")
     .map((entry) => ({
@@ -3894,6 +3943,7 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
 }
 
 async function collectTallyMasters(config, commandPayload = {}) {
+  const timings = {};
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const fieldProfile = String(commandPayload.fieldProfile || "").trim();
@@ -3911,7 +3961,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const fetches = [];
   const fetchMaster = (key, type, collectionName, fetchFields) => {
     if (!shouldFetch(type)) return;
-    fetches.push([key, exportTallyCollection(tallyUrl, {
+    fetches.push([key, () => exportTallyCollection(tallyUrl, {
       collectionName,
       tallyType: type === "stock_item" ? "StockItem" : type === "voucher_type" ? "VoucherType" : type[0].toUpperCase() + type.slice(1),
       fetchFields,
@@ -3919,7 +3969,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
     })]);
   };
   const ledgerFetchFields = fieldProfile === "bank_statement"
-    ? "Name,Parent,GUID,ClosingBalance,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName"
+    ? "Name,Parent,GUID,IsBillWiseOn"
     : "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation";
   fetchMaster("ledgerXml", "ledger", "Gajkesari Ledgers Sync", ledgerFetchFields);
   fetchMaster("groupXml", "group", "Gajkesari Groups Sync", "Name,Parent,GUID");
@@ -3928,14 +3978,24 @@ async function collectTallyMasters(config, commandPayload = {}) {
   fetchMaster("unitXml", "unit", "Gajkesari Units Sync", "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit");
   fetchMaster("voucherTypeXml", "voucher_type", "Gajkesari Voucher Types Sync", "Name,Parent,GUID");
   if (shouldFetch("ledger") && fieldProfile !== "bank_statement") {
-    fetches.push(["companyXml", exportTallyCollection(tallyUrl, {
+    fetches.push(["companyXml", () => exportTallyCollection(tallyUrl, {
       collectionName: "Gajkesari Company Profile Sync",
       tallyType: "Company",
       fetchFields: "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
       companyName,
     }).catch(() => "")]);
   }
-  const resolved = Object.fromEntries(await Promise.all(fetches.map(async ([key, request]) => [key, await request])));
+  let resolved;
+  if (fieldProfile === "bank_statement") {
+    resolved = {};
+    for (const [key, request] of fetches) {
+      const startedAt = Date.now();
+      resolved[key] = await request();
+      timings[`${key}ExportMs`] = Date.now() - startedAt;
+    }
+  } else {
+    resolved = Object.fromEntries(await Promise.all(fetches.map(async ([key, request]) => [key, await request()])));
+  }
   const ledgerXml = resolved.ledgerXml || "";
   const groupXml = resolved.groupXml || "";
   const stockItemXml = resolved.stockItemXml || "";
@@ -3943,8 +4003,62 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const voucherTypeXml = resolved.voucherTypeXml || "";
   const companyXml = resolved.companyXml || "";
 
-  const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
-  const groups = parseMasterCollection(groupXml, "GROUP");
+  const parseStartedAt = Date.now();
+  let ledgers = fieldProfile === "bank_statement"
+    ? parseBankStatementMasterCollection(ledgerXml, "LEDGER")
+    : parseMasterCollection(ledgerXml, "LEDGER");
+  const groups = fieldProfile === "bank_statement"
+    ? parseBankStatementMasterCollection(groupXml, "GROUP")
+    : parseMasterCollection(groupXml, "GROUP");
+  timings.parseMs = Date.now() - parseStartedAt;
+
+  if (fieldProfile === "bank_statement" && shouldFetch("ledger")) {
+    const groupParentByName = new Map(
+      groups.map((item) => [normalizeLooseName(item.name), item.parent || null])
+    );
+    const descendsFrom = (parentName, targetGroupName) => {
+      const target = normalizeLooseName(targetGroupName);
+      const visited = new Set();
+      let current = parentName;
+      while (current) {
+        const normalized = normalizeLooseName(current);
+        if (!normalized || visited.has(normalized)) return false;
+        if (normalized === target) return true;
+        visited.add(normalized);
+        current = groupParentByName.get(normalized) || null;
+      }
+      return false;
+    };
+    const bankLedgerNames = ledgers
+      .filter((ledger) =>
+        descendsFrom(ledger.parent, "Bank Accounts") || descendsFrom(ledger.parent, "Bank OD A/c")
+      )
+      .map((ledger) => ledger.name);
+
+    if (bankLedgerNames.length > 0) {
+      const detailStartedAt = Date.now();
+      const filterName = "GajkesariBankStatementLedgerFilter";
+      const bankXml = await exportTallyCollection(tallyUrl, {
+        collectionName: "Gajkesari Bank Statement Ledger Details",
+        tallyType: "Ledger",
+        fetchFields: "Name,Parent,GUID,ClosingBalance,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
+        companyName,
+        formulae: [{ name: filterName, formula: buildRequestedLedgerFormula(bankLedgerNames, ["$Name"]) }],
+        filterNames: [filterName],
+      });
+      timings.bankDetailExportMs = Date.now() - detailStartedAt;
+      const detailParseStartedAt = Date.now();
+      const detailsByName = new Map(
+        parseBankStatementMasterCollection(bankXml, "LEDGER", { bankDetails: true })
+          .map((master) => [normalizeLooseName(master.name), master])
+      );
+      ledgers = ledgers.map((ledger) => ({
+        ...ledger,
+        ...(detailsByName.get(normalizeLooseName(ledger.name)) || {}),
+      }));
+      timings.bankDetailParseMs = Date.now() - detailParseStartedAt;
+    }
+  }
   const stockItems = parseMasterCollection(stockItemXml, "STOCKITEM");
   const units = parseMasterCollection(unitXml, "UNIT");
   const voucherTypes = parseMasterCollection(voucherTypeXml, "VOUCHERTYPE");
@@ -3964,6 +4078,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
     // to avoid sending omitted master types as empty arrays, which would retire
     // a previously-good snapshot for those types on the API.
     requestedMasterTypes: Array.from(requestedMasterTypes),
+    timings,
     ledgers,
     groups,
     stockItems,
@@ -4881,7 +4996,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
     const operation = String(message.operation || "");
     if (!requestId) return;
     try {
+      const lockRequestedAt = Date.now();
       const data = await executeExclusive(async () => {
+        const lockWaitMs = Date.now() - lockRequestedAt;
         if (operation === "company_check") return collectTallyCompanyCheck(config);
         if (operation === "bank_ledgers") {
           const outcome = await fetchBankLedgersFromTally(config, {
@@ -4933,7 +5050,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           }
           log(
             "info",
-            `Live ledger fetch completed in ${Date.now() - operationStartedAt} ms (${masters.ledgers.length} ledgers, ${masters.groups.length} groups, persistence ${message.payload?.persistSnapshot === true ? "enabled" : "skipped"}).`
+            `Live ledger fetch completed in ${Date.now() - operationStartedAt} ms (${masters.ledgers.length} ledgers, ${masters.groups.length} groups, lock ${lockWaitMs} ms, phases ${JSON.stringify(masters.timings || {})}, persistence ${message.payload?.persistSnapshot === true ? "enabled" : "skipped"}).`
           );
           const responseLedgers = isBankStatementMasterRead
             ? masters.ledgers.map((master) => toBankStatementLiveMaster(master, "ledger"))
@@ -4946,6 +5063,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             companyName: message.companyName,
             fetchedAt: new Date().toISOString(),
             syncRunId,
+            timings: { lockWaitMs, ...(masters.timings || {}), totalMs: Date.now() - lockRequestedAt },
             ledgers: responseLedgers,
             groups: responseGroups,
             stockItems: masters.stockItems,
@@ -5058,8 +5176,11 @@ async function startBridge(args) {
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
   let running = false;
+  let pendingExclusive = 0;
   const executeExclusive = async (task) => {
-    while (running) await new Promise((resolve) => setTimeout(resolve, 100));
+    pendingExclusive += 1;
+    while (running) await new Promise((resolve) => setTimeout(resolve, 25));
+    pendingExclusive -= 1;
     running = true;
     try {
       return await task();
@@ -5068,7 +5189,7 @@ async function startBridge(args) {
     }
   };
   const runSerially = async () => {
-    if (running) {
+    if (running || pendingExclusive > 0) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
@@ -5125,11 +5246,14 @@ function createBridgeRunner(options = {}) {
   const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
   let timer = null;
   let running = false;
+  let pendingExclusive = 0;
   let stopped = false;
   let stopTallyLiveChannel = null;
 
   const executeExclusive = async (task) => {
-    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 100));
+    pendingExclusive += 1;
+    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 25));
+    pendingExclusive -= 1;
     if (stopped) throw new Error("The connector has stopped.");
     running = true;
     try {
@@ -5155,7 +5279,7 @@ function createBridgeRunner(options = {}) {
 
   const runSerially = async () => {
     if (stopped) return;
-    if (running) {
+    if (running || pendingExclusive > 0) {
       emitLog(options, "info", "Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
@@ -5722,6 +5846,7 @@ export {
   normalizeTallyUrl,
   openBillBlockRequiresVoucherFallback,
   pairBridge,
+  parseBankStatementMasterCollection,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   readConfig,

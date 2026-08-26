@@ -12,11 +12,34 @@ import {
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   openBillBlockRequiresVoucherFallback,
+  parseBankStatementMasterCollection,
   parseLedgerClosingBalance,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("bank-statement master parser keeps lean ledger identity and targeted bank details", () => {
+  const lean = parseBankStatementMasterCollection(
+    '<ENVELOPE><LEDGER NAME="Customer A"><PARENT>Sundry Debtors</PARENT><GUID>L-1</GUID><ISBILLWISEON>Yes</ISBILLWISEON><EMAIL>unused@example.com</EMAIL></LEDGER></ENVELOPE>',
+    "LEDGER"
+  );
+  assert.equal(lean.length, 1);
+  assert.equal(lean[0].name, "Customer A");
+  assert.equal(lean[0].parent, "Sundry Debtors");
+  assert.equal(lean[0].raw.billWiseEnabled, true);
+  assert.equal(lean[0].email, undefined);
+
+  const detailed = parseBankStatementMasterCollection(
+    '<ENVELOPE><LEDGER NAME="State Bank"><PARENT>Bank Accounts</PARENT><GUID>B-1</GUID><BANKNAME>SBI</BANKNAME><BANKACCOUNTNUMBER>1234</BANKACCOUNTNUMBER><IFSCCODE>SBIN0001</IFSCCODE><CLOSINGBALANCE>500 Cr</CLOSINGBALANCE></LEDGER></ENVELOPE>',
+    "LEDGER",
+    { bankDetails: true }
+  );
+  assert.equal(detailed[0].bankName, "SBI");
+  assert.equal(detailed[0].bankAccountNumber, "1234");
+  assert.equal(detailed[0].closingBalance, 500);
+  assert.equal(detailed[0].closingBalanceType, "Cr");
+});
 
 test("ledger closing balances preserve Tally Dr and Cr meaning", () => {
   assert.deepEqual(parseLedgerClosingBalance("1,24,500.00 Dr"), {
