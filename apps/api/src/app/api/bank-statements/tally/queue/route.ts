@@ -647,16 +647,6 @@ export async function POST(request: Request) {
       ) !== "other";
     }
 
-    function partyLedgerKind(ledgerName: string) {
-      return classifyPartyLedgerFromGroups(
-        {
-          name: ledgerName,
-          parent: ledgerParentByName.get(normalizeName(ledgerName)) || "",
-        },
-        groupIdentities
-      );
-    }
-
     const commandInputs = transactions.map((transaction) => {
       const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
       const createLedgerName = selectedLedger?.createLedgerName || "";
@@ -680,9 +670,7 @@ export async function POST(request: Request) {
         transaction,
         counterpartyLedgerName,
         createLedgerName,
-        createLedgerParentName:
-          selectedLedger?.createLedgerParentName ||
-          (isIncomingReceipt(transaction) ? "Sundry Debtors" : "Sundry Creditors"),
+        createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
       };
     });
 
@@ -771,16 +759,6 @@ export async function POST(request: Request) {
           skipped.ledgerNotSynced += 1;
           skippedRows.push({ transactionId: transaction.id, description: transaction.description, reason: "counterpartyLedgerNotSynced" });
           return [];
-        }
-        const counterpartyKind = shouldCreateCounterpartyLedger
-          ? masterParentDescendsFromGroup(createLedgerParentName, groupIdentities, "Sundry Debtors")
-            ? "customer"
-            : masterParentDescendsFromGroup(createLedgerParentName, groupIdentities, "Sundry Creditors")
-              ? "supplier"
-              : "other"
-          : partyLedgerKind(counterpartyLedgerName);
-        if (incomingReceipt && counterpartyKind === "supplier") {
-          return skipTransaction(transaction, "invalidDirection");
         }
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
           ? isPartyParent(createLedgerParentName)

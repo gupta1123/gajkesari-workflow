@@ -854,18 +854,6 @@ function findLedgerByCandidates(ledgerMasters: TallyMaster[], candidates: string
   return null;
 }
 
-function isCustomerReceivableLedger(ledger?: TallyMaster | null) {
-  return ledger?.ledgerType === "customer";
-}
-
-function isSupplierPayableLedger(ledger?: TallyMaster | null) {
-  return ledger?.ledgerType === "supplier";
-}
-
-function needsReceivableLedger(transaction: Pick<ReviewTransaction, "suggestionReason">) {
-  return transaction.suggestionReason.startsWith("Incoming receipts require a Receivables customer ledger.");
-}
-
 function getTallyConnectionRank(connection: TallyConnection) {
   if (connection.status === "company_loaded") return 5;
   if (connection.status === "tally_reachable") return 4;
@@ -931,25 +919,11 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     : [];
   const isAiCloseMatch = recommendation?.matchType === "close_match" || aiCandidateLedgerNames.length > 0;
   const recommendedLedgerName = recommendation?.ledgerName || suggestedLedgerName || fallbackReviewLedgerName(transaction);
-  const incomingReceipt =
-    (parseNumber(transaction.creditAmount) ?? 0) > 0 &&
-    (parseNumber(transaction.debitAmount) ?? 0) <= 0;
   const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
   const suspenseName = suspenseLedger?.name || "Suspense";
   const confirmedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.confirmedLedgerName);
   const confirmedSuspenseLedger = confirmedLedger && isSuspenseLedgerName(confirmedLedger.name) ? confirmedLedger : null;
-  const recommendedExistingLedger = findLedgerByNormalizedName(ledgerMasters, recommendedLedgerName);
-  const receivableDirectionConflict = incomingReceipt && (
-    isSupplierPayableLedger(confirmedLedger) || isSupplierPayableLedger(recommendedExistingLedger)
-  );
-  const directionEligibleLedgers = receivableDirectionConflict
-    ? ledgerMasters.filter(isCustomerReceivableLedger)
-    : ledgerMasters;
-  const confirmedMappedLedger = confirmedLedger &&
-    !isSuspenseLedgerName(confirmedLedger.name) &&
-    (!receivableDirectionConflict || isCustomerReceivableLedger(confirmedLedger))
-      ? confirmedLedger
-      : null;
+  const confirmedMappedLedger = confirmedLedger && !isSuspenseLedgerName(confirmedLedger.name) ? confirmedLedger : null;
   const ledgerCandidates = ledgerNameCandidateVariants(
     recommendedLedgerName,
     transaction.counterpartyName,
@@ -957,19 +931,13 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   );
   const standardLedger = aiVetoesDerivedAutoMatch
     ? null
-    : findLedgerByNormalizedName(directionEligibleLedgers, standardLedgerNameForTransaction(transaction));
+    : findLedgerByNormalizedName(ledgerMasters, standardLedgerNameForTransaction(transaction));
   const matchedLedger = aiVetoesDerivedAutoMatch
     ? null
-    : findLedgerByCandidates(directionEligibleLedgers, ledgerCandidates);
-  const candidateLedgerNames = isAiCloseMatch
-    ? aiCandidateLedgerNames.filter((ledgerName) => {
-        const ledger = findLedgerByNormalizedName(ledgerMasters, ledgerName);
-        return !receivableDirectionConflict || isCustomerReceivableLedger(ledger);
-      })
-    : [];
-  const unresolvedReceivableConflict = receivableDirectionConflict && !confirmedMappedLedger && !matchedLedger;
+    : findLedgerByCandidates(ledgerMasters, ledgerCandidates);
+  const candidateLedgerNames = isAiCloseMatch ? aiCandidateLedgerNames : [];
   const hasCloseMatchCandidates = candidateLedgerNames.length >= 1;
-  const reviewSuggestedLedgerName = hasCloseMatchCandidates || unresolvedReceivableConflict ? "" : recommendedLedgerName;
+  const reviewSuggestedLedgerName = hasCloseMatchCandidates ? "" : recommendedLedgerName;
   const selectedLedgerName = confirmedMappedLedger?.name ||
     standardLedger?.name ||
     matchedLedger?.name ||
@@ -983,9 +951,7 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     ? action === "use_standard_ledger"
       ? "use_standard_ledger"
       : "use_existing_ledger"
-    : unresolvedReceivableConflict
-      ? "needs_review"
-      : "use_suspense";
+    : "use_suspense";
 
   return {
     id: transaction.id || crypto.randomUUID(),
@@ -1010,9 +976,7 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     counterpartyName: transaction.counterpartyName || "",
     suggestedLedgerName: reviewSuggestedLedgerName,
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
-    suggestionReason: unresolvedReceivableConflict
-      ? "Incoming receipts require a Receivables customer ledger. The exact-name Tally match belongs to Payables and was rejected."
-      : hasCloseMatchCandidates
+    suggestionReason: hasCloseMatchCandidates
         ? `Close Tally ledger matches found: ${candidateLedgerNames.join(", ")}.`
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
@@ -1020,8 +984,8 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     candidateLedgerNames,
     selectedLedgerName,
     ledgerAction,
-    ledgerGroup: unresolvedReceivableConflict ? "" : recommendation?.ledgerGroup || "",
-    requiresUserConfirmation: unresolvedReceivableConflict || hasCloseMatchCandidates,
+    ledgerGroup: recommendation?.ledgerGroup || "",
+    requiresUserConfirmation: hasCloseMatchCandidates,
     ledgerSelectionTouched: false,
   };
 }
@@ -1260,17 +1224,14 @@ function uniqueLedgerOptions(options: LedgerPickerOption[]) {
 }
 
 function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]): LedgerPickerGroup[] {
-  const directionEligibleLedgers = needsReceivableLedger(transaction)
-    ? ledgerMasters.filter(isCustomerReceivableLedger)
-    : ledgerMasters;
   const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
   const suspenseName = suspenseLedger?.name || "Suspense";
-  const currentLedger = findLedgerByNormalizedName(directionEligibleLedgers, transaction.selectedLedgerName);
-  const suggestedLedger = findLedgerByNormalizedName(directionEligibleLedgers, transaction.suggestedLedgerName);
+  const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+  const suggestedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.suggestedLedgerName);
   const candidateLedgers = (transaction.candidateLedgerNames ?? [])
-    .map((ledgerName) => findLedgerByNormalizedName(directionEligibleLedgers, ledgerName))
+    .map((ledgerName) => findLedgerByNormalizedName(ledgerMasters, ledgerName))
     .filter((ledger): ledger is TallyMaster => Boolean(ledger));
-  const commonLedgers = getCommonLedgerOptions(directionEligibleLedgers);
+  const commonLedgers = getCommonLedgerOptions(ledgerMasters);
   const groups: LedgerPickerGroup[] = [];
   const usedKeys = new Set<string>();
 
@@ -1374,13 +1335,13 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
         : "use_existing_ledger",
       label: name,
       helper: "Commonly used Tally ledger.",
-      ...ledgerBalanceFields(findLedgerByNormalizedName(directionEligibleLedgers, name)),
+      ...ledgerBalanceFields(findLedgerByNormalizedName(ledgerMasters, name)),
     }))
   );
 
   addGroup(
     "Search Tally ledgers",
-    directionEligibleLedgers.map((ledger) => ({
+    ledgerMasters.map((ledger) => ({
       name: ledger.name,
       action: "use_existing_ledger",
       label: ledger.name,
@@ -1886,7 +1847,6 @@ function getReviewStatusLabel(transaction: ReviewTransaction) {
   const status = getReviewStatus(transaction);
   if (status === "matched") return "Ledger matched";
   if (status === "suspense") return "In Suspense";
-  if (needsReceivableLedger(transaction)) return "Needs Receivable Ledger";
   return "Close match";
 }
 
@@ -2171,7 +2131,6 @@ function getBillAllocationBadgeText(
   draft?: BillAllocationDraft | null
 ) {
   if (draft) return getBillAllocationLabel(draft);
-  if (needsReceivableLedger(transaction)) return "Needs Receivable Ledger";
   const context = getPartyBillMatchContext(transaction, ledgerMasters);
   if (context.eligible) return "Not Matched";
   if (isOutgoingPaymentRow(transaction)) return "Check Entry";
