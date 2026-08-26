@@ -47,6 +47,15 @@ const SESSION_MAX_AGE_MS = 2 * 60_000;
 let cachedGatewayUrl: Promise<string> | null = null;
 let cachedSession: BrowserLiveSession | null = null;
 
+function readableLiveError(value: unknown) {
+  const message = String(value || "").trim();
+  if (!message) return "The live Tally request failed.";
+  if (/<(?:!doctype|html|head|body|iframe)\b/i.test(message)) {
+    return "The server could not complete the live Tally request in time. Please try again.";
+  }
+  return message;
+}
+
 async function gatewayUrl() {
   const configured = String(process.env.NEXT_PUBLIC_CASH_DISCOUNT_GATEWAY_URL || "").trim();
   if (configured) return configured;
@@ -161,9 +170,9 @@ function createSession(params: {
         window.clearTimeout(pending.timeout);
         session.pending.delete(requestId);
         if (message.success === true) pending.resolve(message.data);
-        else pending.reject(new Error(message.error || "The live Tally request failed."));
+        else pending.reject(new Error(readableLiveError(message.error)));
       } else if (message.type === "error") {
-        endSession(session, new Error(message.error || "The live Cash Discount channel failed."));
+        endSession(session, new Error(readableLiveError(message.error || "The live Cash Discount channel failed.")));
       }
     } catch {
       endSession(session, new Error("The live Cash Discount channel returned an invalid response."));

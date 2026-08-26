@@ -23,7 +23,8 @@ const MASTER_INPUT_KEYS: Record<string, TallyMasterType> = {
   taxLedgers: "tax_ledger",
 };
 
-const MASTER_UPSERT_BATCH_SIZE = 300;
+const MASTER_UPSERT_BATCH_SIZE = 500;
+const MASTER_UPSERT_CONCURRENCY = 4;
 
 function errorMessage(error: unknown) {
   if (error instanceof Error) return error.message;
@@ -184,16 +185,32 @@ export async function POST(request: Request) {
     }
 
     if (rowsWithRun.length > 0) {
-      for (let start = 0; start < rowsWithRun.length; start += MASTER_UPSERT_BATCH_SIZE) {
-        const batch = rowsWithRun.slice(start, start + MASTER_UPSERT_BATCH_SIZE);
-        const { error: upsertError } = await supabase
-          .from("tally_masters")
-          .upsert(batch, {
-            onConflict: "connection_id,company_name,master_type,master_key",
-          });
-        if (upsertError) {
-          const batchNumber = Math.floor(start / MASTER_UPSERT_BATCH_SIZE) + 1;
-          throw new Error(`Could not save Tally masters batch ${batchNumber}: ${errorMessage(upsertError)}`);
+      const batches = Array.from(
+        { length: Math.ceil(rowsWithRun.length / MASTER_UPSERT_BATCH_SIZE) },
+        (_, batchIndex) => rowsWithRun.slice(
+          batchIndex * MASTER_UPSERT_BATCH_SIZE,
+          (batchIndex + 1) * MASTER_UPSERT_BATCH_SIZE
+        )
+      );
+
+      // Large Tally companies can contain thousands of ledgers. Sequential
+      // PostgREST upserts cross Heroku's request deadline, so keep a small,
+      // bounded number in flight without overwhelming Supabase.
+      for (let start = 0; start < batches.length; start += MASTER_UPSERT_CONCURRENCY) {
+        const window = batches.slice(start, start + MASTER_UPSERT_CONCURRENCY);
+        const results = await Promise.all(window.map((batch) =>
+          supabase
+            .from("tally_masters")
+            .upsert(batch, {
+              onConflict: "connection_id,company_name,master_type,master_key",
+            })
+        ));
+        const failedIndex = results.findIndex((result) => result.error);
+        if (failedIndex >= 0) {
+          const batchNumber = start + failedIndex + 1;
+          throw new Error(
+            `Could not save Tally masters batch ${batchNumber}: ${errorMessage(results[failedIndex].error)}`
+          );
         }
       }
     }
