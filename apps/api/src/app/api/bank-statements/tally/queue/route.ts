@@ -36,6 +36,7 @@ type QueuePayload = {
       amount?: number | string;
     }>;
     billMatchingVerified?: boolean;
+    duplicateCheckVerified?: boolean;
     saveMapping?: boolean;
   }>;
 };
@@ -128,6 +129,7 @@ type TransactionLedgerSelection = {
     amount: number;
   }>;
   billMatchingVerified: boolean;
+  duplicateCheckVerified: boolean;
 };
 
 type TallyCommandInsert = {
@@ -308,6 +310,7 @@ export async function POST(request: Request) {
               createLedgerParentName,
               billAllocations,
               billMatchingVerified: transaction?.billMatchingVerified === true,
+              duplicateCheckVerified: transaction?.duplicateCheckVerified === true,
             },
           ] as const,
         ];
@@ -564,6 +567,7 @@ export async function POST(request: Request) {
       invalidDirection: 0,
       invalidBillAllocation: 0,
       billMatchingNotVerified: 0,
+      duplicateCheckNotVerified: 0,
     };
     type SkippedReason = keyof typeof skipped;
     const skippedRows: Array<{
@@ -729,6 +733,7 @@ export async function POST(request: Request) {
         }
         const billAllocations = ledgerSelectionByTransactionId.get(transaction.id)?.billAllocations ?? [];
         const billMatchingVerified = ledgerSelectionByTransactionId.get(transaction.id)?.billMatchingVerified === true;
+        const duplicateCheckVerified = ledgerSelectionByTransactionId.get(transaction.id)?.duplicateCheckVerified === true;
         const originalVoucherType = getVoucherType(transaction);
         const statementImport = transaction.statement_import_id
           ? importsById.get(transaction.statement_import_id)
@@ -767,6 +772,10 @@ export async function POST(request: Request) {
             },
           });
           return nextCommands;
+        }
+
+        if (!duplicateCheckVerified) {
+          return skipTransaction(transaction, "duplicateCheckNotVerified");
         }
 
         if (!counterpartyLedgerName) {

@@ -2172,6 +2172,52 @@ function isAllocationTotalValid(receiptAmount: number, totalAllocatedAmount: num
   return Math.abs(receiptAmount - totalAllocatedAmount) < 0.005;
 }
 
+function billStateSignature(
+  openBills: OpenBillReference[],
+  existingAdvances: ExistingAdvanceReference[]
+) {
+  const bills = openBills
+    .map((bill) => `${normalizeReferenceToken(bill.referenceName)}:${Number(bill.pendingAmount ?? 0).toFixed(2)}`)
+    .sort();
+  const advances = existingAdvances
+    .map((advance) => `${normalizeReferenceToken(advance.referenceName)}:${Number(advance.pendingAdvanceAmount ?? 0).toFixed(2)}`)
+    .sort();
+  return `${bills.join("|")}::${advances.join("|")}`;
+}
+
+function validateAllocationAgainstFreshBillState(
+  draft: BillAllocationDraft,
+  openBills: OpenBillReference[],
+  existingAdvances: ExistingAdvanceReference[]
+) {
+  const freshBillsByReference = new Map(
+    openBills.map((bill) => [normalizeReferenceToken(bill.referenceName), bill])
+  );
+  for (const allocation of draft.allocations) {
+    if (allocation.referenceType !== "Agst Ref") continue;
+    const freshBill = freshBillsByReference.get(normalizeReferenceToken(allocation.referenceName));
+    if (!freshBill) {
+      return `Bill ${allocation.referenceName} is no longer open in Tally.`;
+    }
+    if (Number(freshBill.pendingAmount ?? 0) + 0.005 < allocation.allocatedAmount) {
+      return `Bill ${allocation.referenceName} now has only ${formatCurrencyAmount(Number(freshBill.pendingAmount ?? 0))} pending.`;
+    }
+  }
+
+  const previousSignature = billStateSignature(draft.candidateBills, draft.existingAdvances);
+  const freshSignature = billStateSignature(openBills, existingAdvances);
+  if (draft.caseType !== "manual_review" && previousSignature !== freshSignature) {
+    return "Open bills or advances changed in Tally after the statement was checked.";
+  }
+  if (
+    draft.caseType === "manual_review" &&
+    billStateSignature([], draft.existingAdvances) !== billStateSignature([], existingAdvances)
+  ) {
+    return "Existing advances changed in Tally after the manual allocation was reviewed.";
+  }
+  return null;
+}
+
 function getAllocationCaseLabel(allocations: BillAllocationLine[], newAdvanceAmount: number, manual = false) {
   if (manual) return "Manual Review";
   const billLines = allocations.filter((line) => line.referenceType === "Agst Ref");
@@ -4214,16 +4260,13 @@ export function BankStatementsPage() {
           : transaction
       )
     );
-    setBillAllocationsByTransactionId((current) => {
-      const next = { ...current };
-      delete next[id];
-      return next;
-    });
-    setOutgoingVerificationsByTransactionId((current) => {
-      const next = { ...current };
-      delete next[id];
-      return next;
-    });
+    // Ledger identity is part of both duplicate detection and bill matching.
+    // Any ledger change invalidates the complete statement-level proof.
+    setBillAllocationsByTransactionId({});
+    setOutgoingVerificationsByTransactionId({});
+    setTallyPresenceByTransactionId({});
+    setTallyBalanceProof(null);
+    setTallyCheckAttempted(false);
     setBillAllocationReviewTransactionId((current) => (current === id ? null : current));
     setOutgoingReviewTransactionId((current) => (current === id ? null : current));
   }
@@ -5558,6 +5601,80 @@ export function BankStatementsPage() {
       showToast("error", "Match or review open bills before posting bank transactions to Tally.");
       return;
     }
+    const connection = commandConnection;
+    if (!connection) {
+      showToast("error", "The selected Tally connection is not live. Refresh it and try again.");
+      return;
+    }
+    const billEligibleTransactions = selectedTallyWorkTransactions.filter((transaction) =>
+      isBillMatchEligibleTransaction(transaction, ledgerMasters)
+    );
+    if (billEligibleTransactions.length > 0) {
+      try {
+        const ledgerNames = Array.from(new Set(
+          billEligibleTransactions.map((transaction) => transaction.selectedLedgerName)
+        ));
+        const asOfDate = billEligibleTransactions
+          .map(getEffectiveTransactionDate)
+          .filter(Boolean)
+          .sort()
+          .at(-1);
+        const freshBillData = await fetchOpenBillsForLedgers(connection, ledgerNames, asOfDate);
+        const staleAllocations = billEligibleTransactions.flatMap((transaction) => {
+          const draft = billAllocationsByTransactionId[transaction.id];
+          const fresh = freshBillData.get(transaction.selectedLedgerName);
+          if (!draft || draft.status !== "ready_to_post") {
+            return [{ transaction, reason: "Bill allocation is no longer ready to post." }];
+          }
+          if (!fresh) {
+            return [{ transaction, reason: "Could not refresh the selected party ledger's open bills." }];
+          }
+          const reason = validateAllocationAgainstFreshBillState(
+            draft,
+            fresh.openBills,
+            fresh.existingAdvances
+          );
+          return reason ? [{ transaction, reason }] : [];
+        });
+        if (staleAllocations.length > 0) {
+          setBillAllocationsByTransactionId((current) => {
+            const next = { ...current };
+            for (const { transaction, reason } of staleAllocations) {
+              const draft = next[transaction.id];
+              if (!draft) continue;
+              next[transaction.id] = {
+                ...draft,
+                status: "stale_data",
+                caseLabel: "Tally Data Changed",
+                reason,
+                requiresUserReview: true,
+                isEligibleForPosting: false,
+              };
+            }
+            return next;
+          });
+          setOutgoingVerificationsByTransactionId({});
+          setTallyPresenceByTransactionId({});
+          setTallyBalanceProof(null);
+          setTallyCheckAttempted(false);
+          setBanner({
+            tone: "error",
+            text: `Tally bill data changed for ${staleAllocations.length} row(s). Check Tally matches again before posting.`,
+          });
+          showToast("error", staleAllocations[0].reason);
+          return;
+        }
+      } catch (error) {
+        setTallyCheckAttempted(false);
+        setBanner({
+          tone: "error",
+          text: error instanceof Error
+            ? `Could not revalidate live Tally bills: ${error.message}`
+            : "Could not revalidate live Tally bills. Check Tally matches again.",
+        });
+        return;
+      }
+    }
     try {
       setSendingMode(mode);
       setTallyPostingStatus(null);
@@ -5670,6 +5787,9 @@ export function BankStatementsPage() {
                 createLedgerName: "",
                 createLedgerParentName: "",
                 billMatchingVerified: billAllocation?.status === "ready_to_post",
+                duplicateCheckVerified:
+                  reviewedTransaction != null &&
+                  tallyPresenceByTransactionId[reviewedTransaction.id]?.status === "missing",
                 billAllocations: billAllocation?.status === "ready_to_post"
                     ? billAllocation.allocations.map((allocation) => ({
                         referenceType: allocation.referenceType,
