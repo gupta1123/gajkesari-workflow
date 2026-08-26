@@ -34,10 +34,76 @@ let lastStatus = {
   state: "idle",
 };
 
+function electronRequestFetch(input, init = {}) {
+  const url = input instanceof URL ? input.toString() : String(input);
+  return new Promise((resolve, reject) => {
+    const request = net.request({
+      method: String(init.method || "GET").toUpperCase(),
+      url,
+      redirect: "follow",
+    });
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      init.signal?.removeEventListener?.("abort", abort);
+      callback(value);
+    };
+    const abort = () => {
+      request.abort();
+      finish(reject, init.signal?.reason || new DOMException("The operation was aborted.", "AbortError"));
+    };
+
+    for (const [name, value] of new Headers(init.headers || {}).entries()) {
+      request.setHeader(name, value);
+    }
+    request.on("response", (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on("error", (error) => finish(reject, error));
+      response.on("end", () => {
+        const headers = new Headers();
+        for (const [name, values] of Object.entries(response.headers || {})) {
+          for (const value of Array.isArray(values) ? values : [values]) {
+            if (value != null) headers.append(name, String(value));
+          }
+        }
+        finish(
+          resolve,
+          new Response(Buffer.concat(chunks), {
+            status: response.statusCode,
+            statusText: response.statusMessage,
+            headers,
+          })
+        );
+      });
+    });
+    request.on("error", (error) => finish(reject, error));
+    if (init.signal?.aborted) return abort();
+    init.signal?.addEventListener?.("abort", abort, { once: true });
+
+    if (init.body == null) {
+      request.end();
+    } else if (typeof init.body === "string" || Buffer.isBuffer(init.body) || init.body instanceof Uint8Array) {
+      request.end(init.body);
+    } else {
+      request.abort();
+      finish(reject, new TypeError("Unsupported connector request body."));
+    }
+  });
+}
+
 function installSystemNetworkFetch() {
   // Use Windows' proxy and certificate store, matching the user's browser.
   // This avoids TLS failures on machines with corporate/antivirus inspection.
   globalThis.fetch = async (input, init) => {
+    const requestUrl = new URL(input instanceof URL ? input.toString() : String(input));
+    if (["localhost", "127.0.0.1", "::1"].includes(requestUrl.hostname)) {
+      // Tally's local HTTP server can keep the response connection open in a
+      // way Electron ClientRequest interprets as an unfinished stream. Node's
+      // fetch handles that protocol correctly and needs no Windows TLS store.
+      return nodeFetch(input, init);
+    }
     if (Date.now() < preferNodeFetchUntil) {
       try {
         return await nodeFetch(input, init);
@@ -48,7 +114,7 @@ function installSystemNetworkFetch() {
       }
     }
     try {
-      return await net.fetch(input instanceof URL ? input.toString() : input, init);
+      return await electronRequestFetch(input, init);
     } catch (error) {
       // Chromium networking can return the opaque net::ERR_FAILED before a
       // request reaches Heroku. Node's fetch uses a separate HTTPS stack and

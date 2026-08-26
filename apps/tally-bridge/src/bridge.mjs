@@ -9,11 +9,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.49";
+const BRIDGE_VERSION = "0.1.52";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
+const BACKEND_REQUEST_TIMEOUT_MS = 10_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
@@ -4280,6 +4281,10 @@ async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
     headers: {
       Authorization: `Bearer ${config.bridgeToken}`,
     },
+    // A sleeping/restarting cloud API must not hold the entire connector
+    // cycle indefinitely. The live channel can keep serving Tally work while
+    // the next heartbeat retries this lightweight command poll.
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
 
@@ -4876,6 +4881,7 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
       companyName: testResult.companyName ?? null,
       companies: availableCompanies,
     }),
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
 
@@ -4907,7 +4913,7 @@ async function runOnce(config, options = {}) {
       }
     }
   } catch (commandError) {
-    console.error(commandError instanceof Error ? commandError.message : commandError);
+    emitLog(options, "error", commandError instanceof Error ? commandError.message : String(commandError));
   }
 
   const result = await testTally(config.tallyUrl);
