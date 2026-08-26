@@ -2103,21 +2103,10 @@ function getPartyBillMatchContext(transaction: ReviewTransaction, ledgerMasters:
   if (ledger?.billWiseEnabled === false) {
     return { eligible: false, amount, direction, partyKind, reason: "Selected party ledger is not bill-wise enabled." };
   }
-  if (partyKind === "customer" && direction !== "receipt") {
-    return { eligible: false, amount, direction, partyKind, reason: "Customer refunds need manual review." };
-  }
-  if (partyKind === "supplier" && direction !== "payment") {
-    return { eligible: false, amount, direction, partyKind, reason: "Supplier receipts need manual review." };
-  }
-  if (
-    !(
-      (partyKind === "customer" && direction === "receipt") ||
-      (partyKind === "supplier" && direction === "payment")
-    )
-  ) {
-    return { eligible: false, amount, direction, partyKind, reason: "This party and bank direction do not support automatic bill matching." };
-  }
-
+  // Bill matching depends on whether the selected Tally ledger is bill-wise,
+  // not whether its Debtor/Creditor classification matches the bank direction.
+  // Suppliers can send refunds and customers can receive refunds, so both
+  // receipt and payment rows must be allowed to inspect the ledger's open bills.
   return { eligible: true, amount, direction, partyKind, reason: "" };
 }
 
