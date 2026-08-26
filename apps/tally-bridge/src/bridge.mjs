@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.48";
+const BRIDGE_VERSION = "0.1.49";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -4911,9 +4911,21 @@ async function runOnce(config, options = {}) {
   }
 
   const result = await testTally(config.tallyUrl);
+  const companyCache = options.companyHeartbeatCache || null;
+  const cacheIsFresh =
+    companyCache &&
+    companyCache.activeCompanyName === (result.companyName || null) &&
+    Date.now() - Number(companyCache.fetchedAt || 0) < 60_000;
   const availableCompanies = result.tallyReachable
-    ? await fetchAvailableCompanies(config.tallyUrl, result.companyName)
+    ? cacheIsFresh
+      ? companyCache.companies
+      : await fetchAvailableCompanies(config.tallyUrl, result.companyName)
     : [];
+  if (companyCache && result.tallyReachable && !cacheIsFresh) {
+    companyCache.activeCompanyName = result.companyName || null;
+    companyCache.companies = availableCompanies;
+    companyCache.fetchedAt = Date.now();
+  }
   const heartbeat = await sendHeartbeat(config, result, availableCompanies);
   const company = result.companyName ? ` Company: ${result.companyName}.` : "";
   const companyList =
@@ -5188,6 +5200,7 @@ async function startBridge(args) {
       running = false;
     }
   };
+  const runnerOptions = { companyHeartbeatCache: {} };
   const runSerially = async () => {
     if (running || pendingExclusive > 0) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
@@ -5196,13 +5209,13 @@ async function startBridge(args) {
 
     running = true;
     try {
-      await runOnce(config);
+      await runOnce(config, runnerOptions);
     } finally {
       running = false;
     }
   };
 
-  await runOnce(config);
+  await runOnce(config, runnerOptions);
   startTallyLiveChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
@@ -5249,6 +5262,7 @@ function createBridgeRunner(options = {}) {
   let pendingExclusive = 0;
   let stopped = false;
   let stopTallyLiveChannel = null;
+  const companyHeartbeatCache = {};
 
   const executeExclusive = async (task) => {
     pendingExclusive += 1;
@@ -5286,7 +5300,7 @@ function createBridgeRunner(options = {}) {
 
     running = true;
     try {
-      const cycle = await runOnce(config, options);
+      const cycle = await runOnce(config, { ...options, companyHeartbeatCache });
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }

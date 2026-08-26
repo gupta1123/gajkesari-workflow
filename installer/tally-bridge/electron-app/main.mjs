@@ -21,6 +21,8 @@ const installDir = path.resolve(__dirname, "..", "..");
 const logPath = path.join(installDir, "bridge.log");
 const errPath = path.join(installDir, "bridge.err.log");
 const nodeFetch = globalThis.fetch.bind(globalThis);
+const ELECTRON_NETWORK_RETRY_MS = 5 * 60 * 1000;
+let preferNodeFetchUntil = 0;
 
 let mainWindow = null;
 let runner = null;
@@ -36,17 +38,28 @@ function installSystemNetworkFetch() {
   // Use Windows' proxy and certificate store, matching the user's browser.
   // This avoids TLS failures on machines with corporate/antivirus inspection.
   globalThis.fetch = async (input, init) => {
+    if (Date.now() < preferNodeFetchUntil) {
+      try {
+        return await nodeFetch(input, init);
+      } catch {
+        // Re-probe Chromium immediately if the previously-working Node path
+        // becomes unavailable.
+        preferNodeFetchUntil = 0;
+      }
+    }
     try {
       return await net.fetch(input instanceof URL ? input.toString() : input, init);
     } catch (error) {
       // Chromium networking can return the opaque net::ERR_FAILED before a
       // request reaches Heroku. Node's fetch uses a separate HTTPS stack and
       // is a safe fallback for the same standards-based RequestInit payload.
+      const response = await nodeFetch(input, init);
+      preferNodeFetchUntil = Date.now() + ELECTRON_NETWORK_RETRY_MS;
       appendLog(
         errPath,
-        `Electron network request failed (${formatConnectorError(error)}); retrying with Node HTTPS.`
+        `Electron networking failed (${formatConnectorError(error)}); Node HTTPS succeeded and will be preferred for five minutes.`
       );
-      return nodeFetch(input, init);
+      return response;
     }
   };
 }
@@ -233,7 +246,7 @@ function createWindow() {
     title: CONNECTOR_NAME,
     width: 460,
     height: 260,
-    show: true,
+    show: false,
     resizable: false,
     backgroundColor: "#f8f5ef",
     webPreferences: {
@@ -242,7 +255,7 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
+  const connectorPage = `data:text/html;charset=utf-8,${encodeURIComponent(`
     <html>
       <body style="font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f8f5ef;color:#24140c">
         <div style="padding:24px">
@@ -272,7 +285,22 @@ function createWindow() {
         </script>
       </body>
     </html>
-  `)}`);
+  `)}`;
+
+  mainWindow.once("ready-to-show", () => {
+    showWindow();
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, code, description) => {
+    appendLog(errPath, `Connector status page failed to load (${code}: ${description}).`);
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    appendLog(errPath, `Connector renderer stopped (${details.reason || "unknown"}). Reloading status page.`);
+    if (!mainWindow?.isDestroyed()) void mainWindow.loadURL(connectorPage);
+  });
+  void mainWindow.loadURL(connectorPage).catch((error) => {
+    appendLog(errPath, `Connector status page could not be opened: ${formatConnectorError(error)}`);
+    showWindow();
+  });
 
   mainWindow.webContents.once("did-finish-load", () => sendStatus(lastStatus));
   mainWindow.on("close", (event) => {
