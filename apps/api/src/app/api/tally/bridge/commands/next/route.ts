@@ -27,6 +27,8 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const connectionId = url.searchParams.get("connectionId") ?? "";
     const bridgeVersion = url.searchParams.get("bridgeVersion") ?? null;
+    const requestedLimit = Number(url.searchParams.get("limit") || 1);
+    const limit = Math.max(1, Math.min(50, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 1));
     const token = getBridgeToken(request);
 
     if (!connectionId || !token) {
@@ -34,18 +36,24 @@ export async function GET(request: Request) {
     }
 
     if (isLocalDbMode()) {
-      const result = await claimNextLocalTallyCommand({
-        connectionId,
-        token,
-        bridgeVersion,
-      });
+      const commands = [];
+      for (let index = 0; index < limit; index += 1) {
+        const result = await claimNextLocalTallyCommand({
+          connectionId,
+          token,
+          bridgeVersion,
+        });
 
-      if (result.unauthorized) {
-        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+        if (result.unauthorized) {
+          return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+        }
+        if (!result.command) break;
+        commands.push(serializeTallyBridgeCommand(result.command));
       }
 
       return jsonWithCors(request, {
-        command: result.command ? serializeTallyBridgeCommand(result.command) : null,
+        command: commands[0] ?? null,
+        commands,
       });
     }
 
@@ -109,35 +117,39 @@ export async function GET(request: Request) {
       .lt("attempts", 3)
       .order("priority", { ascending: false })
       .order("created_at", { ascending: true })
-      .limit(1)
-      .maybeSingle();
+      .limit(limit);
 
     if (commandError) throw commandError;
-    if (!commandData) {
-      return jsonWithCors(request, { command: null });
+    if (!commandData?.length) {
+      return jsonWithCors(request, { command: null, commands: [] });
     }
 
-    const command = commandData as unknown as TallyBridgeCommandRow;
-    const { data: claimedData, error: claimError } = await supabase
-      .from("tally_bridge_commands")
-      .update({
-        status: "claimed",
-        claimed_at: now,
-        attempts: command.attempts + 1,
-        bridge_version: bridgeVersion,
+    const claimedRows = await Promise.all(
+      (commandData as unknown as TallyBridgeCommandRow[]).map(async (command) => {
+        const { data: claimedData, error: claimError } = await supabase
+          .from("tally_bridge_commands")
+          .update({
+            status: "claimed",
+            claimed_at: now,
+            attempts: command.attempts + 1,
+            bridge_version: bridgeVersion,
+          })
+          .eq("id", command.id)
+          .eq("status", "queued")
+          .select("*")
+          .maybeSingle();
+
+        if (claimError) throw claimError;
+        return claimedData as unknown as TallyBridgeCommandRow | null;
       })
-      .eq("id", command.id)
-      .eq("status", "queued")
-      .select("*")
-      .maybeSingle();
-
-    if (claimError) throw claimError;
-    if (!claimedData) {
-      return jsonWithCors(request, { command: null });
-    }
+    );
+    const commands = claimedRows
+      .filter((command): command is TallyBridgeCommandRow => Boolean(command))
+      .map(serializeTallyBridgeCommand);
 
     return jsonWithCors(request, {
-      command: serializeTallyBridgeCommand(claimedData as unknown as TallyBridgeCommandRow),
+      command: commands[0] ?? null,
+      commands,
     });
   } catch (error) {
     console.error("Error in GET /api/tally/bridge/commands/next:", error);

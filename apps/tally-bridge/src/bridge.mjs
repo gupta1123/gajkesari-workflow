@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.46";
+const BRIDGE_VERSION = "0.1.47";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -1003,6 +1003,7 @@ export function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) 
     companyName,
     voucherDate,
     legacyHeader: options.legacyHeader === true,
+    legacyEnvelope: options.legacyEnvelope === true,
     messages: [
       buildVoucherMessageXml({
         voucherDate,
@@ -1013,6 +1014,33 @@ export function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) 
         partyLedgerName: voucherType === "Journal" ? null : partyLedgerName,
       }),
     ],
+  });
+}
+
+export function buildBankVoucherBatchXml(payloads, fallbackCompanyName) {
+  if (!Array.isArray(payloads) || payloads.length === 0) {
+    throw new Error("Bank voucher batch requires at least one voucher.");
+  }
+
+  const companyName = payloads[0]?.companyName || fallbackCompanyName;
+  const voucherDate = toIsoLikeDate(payloads[0]?.voucherDate);
+  const messages = payloads.map((payload) => {
+    const voucherXml = buildBankVoucherXml(payload, companyName);
+    const message = voucherXml.match(/<TALLYMESSAGE\b[\s\S]*?<\/TALLYMESSAGE>/i)?.[0];
+    if (!message) {
+      throw new Error("Could not build a Tally message for a bank voucher batch.");
+    }
+    return message;
+  });
+
+  // This is Tally's documented Data import protocol. It is intentionally
+  // different from the Import Data / IMPORTDATA protocol used by other
+  // request shapes; mixing the two makes Tally return `DESC not found`.
+  return wrapVoucherMessagesXml({
+    companyName,
+    voucherDate,
+    messages,
+    legacyEnvelope: true,
   });
 }
 
@@ -1867,11 +1895,7 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
     }
   }
 
-  // Tally's documented voucher-import envelope includes VERSION, TYPE and ID.
-  // The shorter header is accepted by some releases, but recent TallyPrime
-  // builds can route it through Import Exceptions and misleadingly report that
-  // DATE is missing even though DATE and EFFECTIVEDATE are present.
-  const primaryXml = buildBankVoucherXml(payload, companyName, { legacyHeader: true });
+  const primaryXml = buildBankVoucherXml(payload, companyName, { legacyEnvelope: true });
   const primaryOutcome = explainBankVoucherTallyError(
     requireCreatedVoucher(await invokeTallyXml(tallyUrl, primaryXml)),
     payload
@@ -1918,6 +1942,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       );
     }
 
+    const pendingCommands = [];
     for (const command of group) {
       try {
         const transactionId = String(command.payload?.transactionId || "");
@@ -1953,22 +1978,132 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
           continue;
         }
 
+        pendingCommands.push(command);
+      } catch (error) {
+        console.error(
+          `Command ${command.id} failed without blocking the remaining vouchers: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    if (pendingCommands.length === 0) continue;
+
+    const firstPayload = pendingCommands[0].payload || {};
+    const companyName = firstPayload.companyName || config.companyName || null;
+    let batchXml = null;
+    let batchOutcome = null;
+    const batchStartedAt = Date.now();
+    try {
+      batchXml = buildBankVoucherBatchXml(
+        pendingCommands.map((command) => command.payload),
+        companyName
+      );
+      batchOutcome = await invokeTallyXml(config.tallyUrl, batchXml);
+    } catch (error) {
+      batchOutcome = {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        result: {},
+      };
+    }
+
+    const batchElapsedMs = Date.now() - batchStartedAt;
+    const importedCount =
+      Number(batchOutcome.result?.created || 0) + Number(batchOutcome.result?.altered || 0);
+    if (batchOutcome.success && importedCount >= pendingCommands.length) {
+      await sendCommandResults(
+        config,
+        pendingCommands.map((command) => ({
+          command,
+          outcome: {
+            success: true,
+            result: {
+              created: 1,
+              altered: 0,
+              transactionId: command.payload?.transactionId,
+              sourceBankTransactionId: command.payload?.transactionId,
+              voucherId: command.payload?.referenceNumber || command.id,
+              voucherNumber: command.payload?.referenceNumber || null,
+              requestXml: previewXml(batchXml),
+              batchImport: true,
+              batchSize: pendingCommands.length,
+              batchElapsedMs,
+            },
+          },
+        }))
+      );
+      console.log(
+        `Posted ${pendingCommands.length} bank vouchers in one Tally request (${batchElapsedMs} ms).`
+      );
+      continue;
+    }
+
+    // A Tally batch may create its valid messages and report only the invalid
+    // ones as exceptions. Reconcile once after a mixed result so already-created
+    // rows are never retried as duplicates, then retry only confirmed-missing
+    // rows independently. One bad voucher therefore cannot block the others.
+    let postflightByTransactionId = null;
+    try {
+      const postflight = await reconcileBankTransactionsInTally(config, {
+        companyName,
+        bankLedgerName: firstPayload.bankLedgerName,
+        transactions: pendingCommands.map((command) => ({
+          ...command.payload,
+          expectedDirection:
+            command.payload?.expectedDirection ||
+            (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
+        })),
+      });
+      postflightByTransactionId = new Map(
+        (postflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+    } catch (error) {
+      console.warn(
+        `Batch postflight verification was unavailable: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+
+    for (const command of pendingCommands) {
+      const transactionId = String(command.payload?.transactionId || "");
+      const postflight = postflightByTransactionId?.get(transactionId) || null;
+      if (postflight?.verificationStatus === "found") {
+        await sendCommandResult(config, command, {
+          success: true,
+          result: {
+            created: 1,
+            transactionId,
+            sourceBankTransactionId: transactionId,
+            voucherId: postflight.voucherId || command.payload?.referenceNumber || command.id,
+            voucherNumber: postflight.voucherNumber || command.payload?.referenceNumber || null,
+            duplicateCheck: postflight,
+            requestXml: batchXml ? previewXml(batchXml) : null,
+            batchImport: true,
+            batchSize: pendingCommands.length,
+            batchElapsedMs,
+          },
+        });
+        continue;
+      }
+
+      try {
         await runCommand(
           config,
           {
             ...command,
             payload: {
               ...command.payload,
-              // One targeted Tally export above checked every voucher in this
-              // company/bank group. Do not repeat the same export per row.
-              preflightVerifyExisting: preflightByTransactionId === null,
+              preflightVerifyExisting: postflightByTransactionId === null,
             },
           },
           options
         );
       } catch (error) {
         console.error(
-          `Command ${command.id} failed without blocking the remaining vouchers: ${
+          `Command ${command.id} failed after batch isolation: ${
             error instanceof Error ? error.message : String(error)
           }`
         );
@@ -4019,10 +4154,11 @@ async function testTally(tallyUrl) {
   }
 }
 
-async function receiveNextCommand(config) {
+async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
   const url = new URL(`${config.apiBase}/api/tally/bridge/commands/next`);
   url.searchParams.set("connectionId", config.connectionId);
   url.searchParams.set("bridgeVersion", BRIDGE_VERSION);
+  url.searchParams.set("limit", String(Math.max(1, Math.min(MAX_COMMANDS_PER_CYCLE, limit))));
 
   const response = await fetch(url, {
     method: "GET",
@@ -4036,7 +4172,18 @@ async function receiveNextCommand(config) {
     throw new Error(payload.error || `Command poll failed with HTTP ${response.status}.`);
   }
 
-  return payload.command ?? null;
+  if (Array.isArray(payload.commands)) return payload.commands;
+  return payload.command ? [payload.command] : [];
+}
+
+async function sendCommandResults(config, entries, concurrency = 10) {
+  for (let index = 0; index < entries.length; index += concurrency) {
+    await Promise.all(
+      entries
+        .slice(index, index + concurrency)
+        .map(({ command, outcome }) => sendCommandResult(config, command, outcome))
+    );
+  }
 }
 
 async function sendCommandResult(config, command, outcome) {
@@ -4633,9 +4780,8 @@ async function runOnce(config, options = {}) {
   // flow hostage for a minute.
   const deferredCommands = [];
   try {
-    for (let index = 0; index < MAX_COMMANDS_PER_CYCLE; index += 1) {
-      const command = await receiveNextCommand(config);
-      if (!command) break;
+    const claimedCommands = await receiveNextCommands(config);
+    for (const command of claimedCommands) {
       const isVerifiedDebitNotePdf =
         command.commandType === "export_debit_note_pdf" ||
         (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf");

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildCollectionExportXml,
+  buildBankVoucherBatchXml,
   buildBankVoucherXml,
   buildPurchaseVoucherXml,
   buildRequestedLedgerFormula,
@@ -86,7 +87,7 @@ test("direct party posting creates an Advance without settling an existing bill"
   assert.doesNotMatch(xml, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
 });
 
-test("bank voucher supports Tally's documented complete import header", () => {
+test("bank voucher supports Tally's documented Data import envelope", () => {
   const xml = buildBankVoucherXml(
     {
       companyName: "Solution Nyx",
@@ -99,12 +100,43 @@ test("bank voucher supports Tally's documented complete import header", () => {
       referenceNumber: "SBIN1108260001",
     },
     null,
-    { legacyHeader: true }
+    { legacyEnvelope: true }
   );
 
-  assert.match(xml, /<HEADER><VERSION>1<\/VERSION><TALLYREQUEST>Import Data<\/TALLYREQUEST><TYPE>Data<\/TYPE><ID>Vouchers<\/ID><\/HEADER>/);
+  assert.match(xml, /<HEADER><VERSION>1<\/VERSION><TALLYREQUEST>Import<\/TALLYREQUEST><TYPE>Data<\/TYPE><ID>Vouchers<\/ID><\/HEADER>/);
+  assert.match(xml, /<BODY><DESC><STATICVARIABLES>/);
+  assert.match(xml, /<\/DESC><DATA><TALLYMESSAGE/);
+  assert.doesNotMatch(xml, /<IMPORTDATA>|<REQUESTDESC>|<REQUESTDATA>/);
   assert.match(xml, /<DATE>20260811<\/DATE>/);
   assert.match(xml, /<EFFECTIVEDATE>20260811<\/EFFECTIVEDATE>/);
+});
+
+test("bank voucher batch puts every voucher in one documented Tally request", () => {
+  const payload = {
+    companyName: "Solution Nyx",
+    voucherType: "Receipt",
+    voucherDate: "2026-08-11",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Indus Metal Recovery",
+    counterpartyIsPartyLedger: true,
+    bankLedgerEntryIsDebit: true,
+    amount: 140000,
+  };
+  const xml = buildBankVoucherBatchXml(
+    Array.from({ length: 50 }, (_, index) => ({
+      ...payload,
+      referenceNumber: `BATCH-REF-${index + 1}`,
+    })),
+    null
+  );
+
+  assert.equal((xml.match(/<TALLYMESSAGE\b/g) || []).length, 50);
+  assert.equal((xml.match(/<VOUCHER\b/g) || []).length, 50);
+  assert.match(xml, /<TALLYREQUEST>Import<\/TALLYREQUEST>/);
+  assert.match(xml, /<DESC><STATICVARIABLES>/);
+  assert.doesNotMatch(xml, /<IMPORTDATA>|<REQUESTDESC>|<REQUESTDATA>/);
+  assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-1<\/VOUCHERNUMBER>/);
+  assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-50<\/VOUCHERNUMBER>/);
 });
 
 
