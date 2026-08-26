@@ -1149,6 +1149,11 @@ function getTransactionPartyTitle(transaction: ReviewTransaction) {
   if (mode === "ATM") return "ATM cash withdrawal";
   if (mode === "Bank charge") return "Bank charges";
   if (mode === "Interest") return "Interest credit";
+  const matchedLedgerName = [transaction.selectedLedgerName, transaction.suggestedLedgerName]
+    .map((value) => value.trim())
+    .find((value) => value && !isSuspenseLedgerName(value));
+  if (matchedLedgerName) return matchedLedgerName;
+  if (transaction.description.trim()) return transaction.description.trim();
   if (transaction.category && transaction.category !== "unknown") {
     return formatDataLabel(transaction.category);
   }
@@ -2066,6 +2071,36 @@ function getLedgerGroupLabel(transaction: ReviewTransaction, ledgerMasters: Tall
 
 function getSelectedLedger(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
   return findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+}
+
+type ProposedBankVoucherType = "Receipt" | "Payment" | "Contra";
+
+function getProposedBankVoucherType(
+  transaction: ReviewTransaction,
+  ledgerMasters: TallyMaster[]
+): ProposedBankVoucherType | null {
+  const selectedLedger = getSelectedLedger(transaction, ledgerMasters);
+  const parentName = selectedLedger?.parent || transaction.ledgerGroup;
+  const counterpartyIsBankOrCash = Boolean(
+    selectedLedger &&
+      (["Bank Accounts", "Bank OD A/c", "Cash-in-Hand"].some(
+        (rootGroupName) =>
+          normalizeName(parentName) === normalizeName(rootGroupName) ||
+          masterParentDescendsFromGroup(parentName, ledgerMasters, rootGroupName)
+      ) ||
+        isBankLedgerMaster(selectedLedger))
+  );
+
+  if (counterpartyIsBankOrCash) return "Contra";
+  if (isIncomingReceiptRow(transaction)) return "Receipt";
+  if (isOutgoingPaymentRow(transaction)) return "Payment";
+  return null;
+}
+
+function getVoucherTypeTagClass(voucherType: ProposedBankVoucherType) {
+  if (voucherType === "Receipt") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (voucherType === "Payment") return "border-rose-200 bg-rose-50 text-rose-700";
+  return "border-sky-200 bg-sky-50 text-sky-700";
 }
 
 type PartyBillMatchContext = {
@@ -3706,12 +3741,8 @@ export function BankStatementsPage() {
       : outgoingReviewTransaction.debitAmount
     : 0;
   const tallyResultReviewPostingVoucherType = (() => {
-    if (!outgoingReviewTransaction || tallyResultReviewIsIncoming) return "Receipt";
-    const ledger = getSelectedLedger(outgoingReviewTransaction, ledgerMasters);
-    const parent = normalizeName(ledger?.parent || outgoingReviewTransaction.ledgerGroup);
-    return (ledger ? isBankLedgerMaster(ledger) : false) || /bank od|cash in hand/.test(parent)
-      ? "Contra"
-      : "Payment";
+    if (!outgoingReviewTransaction) return "Receipt";
+    return getProposedBankVoucherType(outgoingReviewTransaction, ledgerMasters) || "Receipt";
   })();
   const tallyResultReviewReason = (() => {
     if (!outgoingReviewTransaction || !tallyResultReviewDraft) {
@@ -7318,6 +7349,7 @@ export function BankStatementsPage() {
                           const debit = formatAmount(transaction.debitAmount);
                           const credit = formatAmount(transaction.creditAmount);
                           const partyTitle = getTransactionPartyTitle(transaction);
+                          const proposedVoucherType = getProposedBankVoucherType(transaction, ledgerMasters);
                           const mode = getTransactionMode(transaction);
                           const reference = getTransactionReference(transaction);
                           const isEditingLedger = editingLedgerIds.has(transaction.id);
@@ -7357,8 +7389,19 @@ export function BankStatementsPage() {
                                 {formatShortDate(getEffectiveTransactionDate(transaction))}
                               </td>
                               <td className="px-3 py-4 align-top">
-                                <div className="whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={partyTitle}>
-                                  {partyTitle}
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <div className="whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={partyTitle}>
+                                    {partyTitle}
+                                  </div>
+                                  {proposedVoucherType ? (
+                                    <span
+                                      aria-label={`Tally voucher type: ${proposedVoucherType}`}
+                                      className={`inline-flex h-4 shrink-0 items-center rounded-full border px-1.5 text-[8px] font-extrabold uppercase tracking-[0.08em] ${getVoucherTypeTagClass(proposedVoucherType)}`}
+                                      title={`Will post as ${proposedVoucherType} voucher`}
+                                    >
+                                      {proposedVoucherType}
+                                    </span>
+                                  ) : null}
                                 </div>
                                 <div className="mt-0.5 line-clamp-2 whitespace-normal break-words text-xs font-semibold leading-4 text-slate-500" title={transaction.description}>
                                   {transaction.description || "Narration not found"}

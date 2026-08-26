@@ -568,6 +568,7 @@ export async function POST(request: Request) {
       invalidBillAllocation: 0,
       billMatchingNotVerified: 0,
       duplicateCheckNotVerified: 0,
+      sameContraLedger: 0,
     };
     type SkippedReason = keyof typeof skipped;
     const skippedRows: Array<{
@@ -667,6 +668,15 @@ export async function POST(request: Request) {
         },
         groupIdentities
       ) !== "other";
+    }
+
+    function isBankOrCashLedger(ledgerName: string) {
+      const parentName = ledgerParentByName.get(normalizeName(ledgerName)) || "";
+      return ["Bank Accounts", "Bank OD A/c", "Cash-in-Hand"].some(
+        (rootGroupName) =>
+          normalizeName(parentName) === normalizeName(rootGroupName) ||
+          masterParentDescendsFromGroup(parentName, groupIdentities, rootGroupName)
+      );
     }
 
     const commandInputs = transactions.map((transaction) => {
@@ -804,14 +814,19 @@ export async function POST(request: Request) {
         ) {
           return skipTransaction(transaction, "invalidBillAllocation");
         }
-        const counterpartyParentName = shouldCreateCounterpartyLedger
-          ? createLedgerParentName
-          : ledgerParentByName.get(normalizeName(counterpartyLedgerName)) || "";
-        const counterpartyIsBankOrCashLedger = ["Bank Accounts", "Bank OD A/c", "Cash-in-Hand"].some(
-          (rootGroupName) =>
-            normalizeName(counterpartyParentName) === normalizeName(rootGroupName) ||
-            masterParentDescendsFromGroup(counterpartyParentName, groupIdentities, rootGroupName)
-        );
+        const counterpartyIsBankOrCashLedger = shouldCreateCounterpartyLedger
+          ? ["Bank Accounts", "Bank OD A/c", "Cash-in-Hand"].some(
+              (rootGroupName) =>
+                normalizeName(createLedgerParentName) === normalizeName(rootGroupName) ||
+                masterParentDescendsFromGroup(createLedgerParentName, groupIdentities, rootGroupName)
+            )
+          : isBankOrCashLedger(counterpartyLedgerName);
+        if (
+          counterpartyIsBankOrCashLedger &&
+          normalizeName(counterpartyLedgerName) === normalizeName(bankLedgerName)
+        ) {
+          return skipTransaction(transaction, "sameContraLedger");
+        }
         const nextCommands: TallyCommandInsert[] = [];
         const createLedgerKey = normalizeName(createLedgerName);
         if (shouldCreateCounterpartyLedger && createLedgerKey && !queuedCreateLedgerKeys.has(createLedgerKey)) {
@@ -842,7 +857,7 @@ export async function POST(request: Request) {
             bankAccountId: account.id,
             fingerprint: transaction.fingerprint,
             companyName: expectedCompanyName,
-            voucherType: outgoingPayment && counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
+            voucherType: counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
             voucherDate,
             bankLedgerName,
             counterpartyLedgerName,

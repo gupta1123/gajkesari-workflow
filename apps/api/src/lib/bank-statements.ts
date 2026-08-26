@@ -181,6 +181,7 @@ const COUNTERPARTY_PREFIXES = new Set([
 function cleanCounterpartyCandidate(value?: string | null) {
   let cleaned = String(value ?? "")
     .replace(/\b(?:utr|ref|reference|invoice|bill|chq|cheque|txn|transaction)\b[\s:#/-]*[a-z0-9-]+.*$/i, "")
+    .replace(/\s*[-–—]\s*[a-z]{2,12}\s*\/\s*\d{2}\s*-\s*\d{2}\s*\/.*$/i, "")
     .replace(/[^a-zA-Z0-9 .&'/-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -201,16 +202,16 @@ function cleanCounterpartyCandidate(value?: string | null) {
 }
 
 export function extractCounterpartyName(description?: string | null) {
-  const raw = String(description ?? "").replace(/\s+/g, " ").trim();
+  const raw = String(description ?? "").replace(/[\u2013\u2014]/g, "-").replace(/\s+/g, " ").trim();
   if (!raw) return null;
 
   const patterns = [
-    /\b(?:neft|rtgs|imps)\s+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
-    /\b(?:neft|rtgs|imps)\s+(?:payment\s+)?to\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
-    /\b(?:neft|rtgs|imps)\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
-    /\bupi\s+(?:payment\s+)?to\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
-    /\bupi\s+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
-    /\bupi\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
+    /\b(?:neft|rtgs|imps)[\s:/._-]+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
+    /\b(?:neft|rtgs|imps)[\s:/._-]+(?:payment\s+)?to\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
+    /\b(?:neft|rtgs|imps)[\s:/._-]+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
+    /\bupi[\s:/._-]+(?:payment\s+)?to\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
+    /\bupi[\s:/._-]+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
+    /\bupi[\s:/._-]+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
     /\bby\s+transfer\s+from\s+(.+?)(?:\s+(?:ref|reference|on)\b|$)/i,
     /\bto\s+transfer\s+to\s+(.+?)(?:\s+(?:ref|reference|on)\b|$)/i,
   ];

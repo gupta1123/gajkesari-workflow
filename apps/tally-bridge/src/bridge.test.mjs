@@ -158,6 +158,24 @@ test("outgoing Contra vouchers debit the destination and credit the statement ba
   assert.ok(xml.indexOf("<LEDGERNAME>HDFC Bank</LEDGERNAME>") < xml.indexOf("<LEDGERNAME>State Bank of India</LEDGERNAME>"));
 });
 
+test("incoming Contra vouchers debit the statement bank and credit the source account", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Contra",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Cash",
+    bankLedgerEntryIsDebit: true,
+    amount: 25000,
+    referenceNumber: "CASH-DEPOSIT-1",
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Contra<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>/);
+  assert.match(xml, /<LEDGERNAME>Cash<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE>/);
+  assert.ok(xml.indexOf("<LEDGERNAME>State Bank of India</LEDGERNAME>") < xml.indexOf("<LEDGERNAME>Cash</LEDGERNAME>"));
+});
+
 test("collection exports apply Tally-side formula filters", () => {
   const xml = buildCollectionExportXml({ collectionName: "Filtered Bills", tallyType: "Bill", fetchFields: "Name,LedgerName,ClosingBalance", companyName: "Solution Nyx", dateTo: "2026-08-17", formulae: [{ name: "RequestedLedger", formula: '$$IsEqual:$LedgerName:"Customer A"' }], filterNames: ["RequestedLedger"] });
   assert.match(xml, /<FILTER>RequestedLedger<\/FILTER>/);
