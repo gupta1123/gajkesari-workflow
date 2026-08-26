@@ -864,8 +864,6 @@ export async function POST(request: Request) {
     const outgoingTransactionCount = transactions.filter(isOutgoingPayment).length;
     const expectedPaymentCheckCount = outgoingAction === "verify" ? outgoingTransactionCount : 0;
     const expectedPaymentPostCount = outgoingAction === "post" ? outgoingTransactionCount : 0;
-    const expectedVoucherCount = expectedReceiptCount + expectedPaymentPostCount;
-
     if (voucherCommands.length === 0 && verificationCommands.length === 0) {
       return jsonWithCors(
         request,
