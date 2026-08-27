@@ -743,7 +743,6 @@ export async function POST(request: Request) {
         }
         const billAllocations = ledgerSelectionByTransactionId.get(transaction.id)?.billAllocations ?? [];
         const billMatchingVerified = ledgerSelectionByTransactionId.get(transaction.id)?.billMatchingVerified === true;
-        const duplicateCheckVerified = ledgerSelectionByTransactionId.get(transaction.id)?.duplicateCheckVerified === true;
         const originalVoucherType = getVoucherType(transaction);
         const statementImport = transaction.statement_import_id
           ? importsById.get(transaction.statement_import_id)
@@ -784,10 +783,9 @@ export async function POST(request: Request) {
           return nextCommands;
         }
 
-        if (!duplicateCheckVerified) {
-          return skipTransaction(transaction, "duplicateCheckNotVerified");
-        }
-
+        // The connector performs an authoritative live duplicate preflight immediately
+        // before import. The browser-side statement check is useful review context, but
+        // it is not required in order to queue a safely guarded voucher.
         if (!counterpartyLedgerName) {
           return skipTransaction(transaction, "missingCounterpartyLedger");
         }
