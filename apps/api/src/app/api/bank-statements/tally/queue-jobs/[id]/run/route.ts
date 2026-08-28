@@ -19,6 +19,7 @@ type QueueJobResult = {
   verificationCount?: number;
   commandCount?: number;
   commands?: unknown[];
+  diagnostics?: unknown;
 };
 
 function readRecord(value: unknown): Record<string, unknown> {
@@ -82,6 +83,7 @@ function mergeQueueResults(current: QueueJobResult, next: QueueJobResult) {
     verificationCount: Number(current.verificationCount ?? 0) + Number(next.verificationCount ?? 0),
     commandCount: Number(current.commandCount ?? 0) + Number(next.commandCount ?? nextCommands.length),
     commands: [...currentCommands, ...nextCommands],
+    diagnostics: next.diagnostics ?? current.diagnostics,
   };
 }
 
@@ -214,6 +216,10 @@ export async function POST(
         .update({
           status: "failed",
           error,
+          result: {
+            ...readResult(job.result),
+            diagnostics: queueBody?.diagnostics ?? null,
+          },
           updated_at: failedAt,
           completed_at: failedAt,
         })
@@ -226,7 +232,8 @@ export async function POST(
       return jsonWithCors(request, {
         error,
         job: serializeQueueJob(failedJob as Record<string, unknown>),
-      }, { status: 400 });
+        diagnostics: queueBody?.diagnostics ?? null,
+      }, { status: queueResponse.status });
     }
 
     const nextResult = mergeQueueResults(readResult(job.result), readResult(queueBody));

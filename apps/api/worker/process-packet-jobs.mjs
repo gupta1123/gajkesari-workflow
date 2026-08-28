@@ -2613,7 +2613,9 @@ async function runTallyQueueJob(job) {
     );
     const payload = await response.json().catch(async () => ({ error: await response.text().catch(() => "") }));
     if (!response.ok) {
-      throw new Error(payload?.error || `Tally queue batch failed (${response.status})`);
+      const error = new Error(payload?.error || `Tally queue batch failed (${response.status})`);
+      error.nonRetryable = response.status >= 400 && response.status < 500 && ![408, 425, 429].includes(response.status);
+      throw error;
     }
     const status = payload?.job?.status;
     const processed = Number(payload?.job?.processedCount ?? 0);
@@ -2627,10 +2629,10 @@ async function runTallyQueueJob(job) {
   throw new Error("Tally queue job exceeded the 500-batch safety limit.");
 }
 
-async function requeueTallyQueueJob(job, error) {
+async function requeueTallyQueueJob(job, error, forceTerminal = false) {
   const attempts = Number(job?.attempt_count ?? 1);
   const maxAttempts = Number(job?.max_attempts ?? 5);
-  const terminal = attempts >= maxAttempts;
+  const terminal = forceTerminal || attempts >= maxAttempts;
   const delaySeconds = Math.min(120, Math.max(5, 5 * 2 ** Math.max(0, attempts - 1)));
   const now = new Date();
   const { error: updateError } = await supabase
@@ -2681,7 +2683,7 @@ async function main() {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
           console.error(`[worker] Tally queue failed for ${tallyQueueJob.id}: ${message}`);
-          await requeueTallyQueueJob(tallyQueueJob, message);
+          await requeueTallyQueueJob(tallyQueueJob, message, error?.nonRetryable === true);
         }
         continue;
       }

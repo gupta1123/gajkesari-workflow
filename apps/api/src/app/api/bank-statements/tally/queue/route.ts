@@ -25,6 +25,12 @@ type QueuePayload = {
   accountId?: string;
   bankLedgerName?: string;
   counterpartyLedgerName?: string;
+  liveLedgerContext?: Array<{
+    name?: string;
+    parent?: string | null;
+    billWiseEnabled?: boolean | null;
+    ledgerType?: string | null;
+  }>;
   outgoingAction?: "verify" | "post";
   transactions?: Array<{
     transactionId?: string;
@@ -94,6 +100,7 @@ type TallyLedgerRow = {
   tally_name: string;
   parent_name: string | null;
   raw_payload: Record<string, unknown> | null;
+  ledger_type?: string | null;
 };
 
 const MASTER_LOOKUP_CHUNK_SIZE = 100;
@@ -265,6 +272,23 @@ function buildVoucherReference(transaction: BankTransactionRow, bankCode: string
   return `${getVoucherReferencePrefix(transaction)}-${bankCode}-${suffix}`;
 }
 
+function readLiveLedgerContext(value: unknown): TallyLedgerRow[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 100).flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const row = entry as Record<string, unknown>;
+    const name = toText(row.name, 500);
+    if (!name) return [];
+    const billWiseEnabled = typeof row.billWiseEnabled === "boolean" ? row.billWiseEnabled : null;
+    return [{
+      tally_name: name,
+      parent_name: toText(row.parent, 240) || null,
+      ledger_type: toText(row.ledgerType, 80) || null,
+      raw_payload: { billWiseEnabled },
+    }];
+  });
+}
+
 function buildVoucherNarration(description: string, referenceNumber: string) {
   const narration = toText(description, 1600);
   const reference = toText(referenceNumber, 200);
@@ -334,6 +358,7 @@ export async function POST(request: Request) {
       })
     );
     const accountId = toText(body.accountId, 80);
+    const liveLedgerContext = readLiveLedgerContext(body.liveLedgerContext);
 
     if (!submittedConnectionId) {
       return jsonWithCors(request, { error: "Tally connection is required." }, { status: 400 });
@@ -650,6 +675,10 @@ export async function POST(request: Request) {
         [
           ...ledgerQueryResults.flatMap((result) => (result.data ?? []) as unknown as TallyLedgerRow[]),
           ...((suspenseResult.data ?? []) as unknown as TallyLedgerRow[]),
+          // The browser obtained these few ledgers directly from the currently open
+          // Tally company during analysis. Prefer that fresh snapshot when the
+          // connector has not persisted a full tally_masters catalogue.
+          ...liveLedgerContext,
         ].map((ledger) => [normalizeName(ledger.tally_name), ledger] as const)
       ).values()
     );
@@ -715,6 +744,9 @@ export async function POST(request: Request) {
         return [normalizeName(ledger.tally_name), typeof value === "boolean" ? value : null] as const;
       })
     );
+    const ledgerTypeByName = new Map(
+      activeLedgers.map((ledger) => [normalizeName(ledger.tally_name), normalizeName(ledger.ledger_type || "")])
+    );
 
     function ledgerExists(ledgerName: string) {
       return syncedLedgerNames.has(normalizeName(ledgerName));
@@ -728,6 +760,8 @@ export async function POST(request: Request) {
     }
 
     function isPartyLedger(ledgerName: string) {
+      const liveLedgerType = ledgerTypeByName.get(normalizeName(ledgerName));
+      if (liveLedgerType === "customer" || liveLedgerType === "supplier") return true;
       return classifyPartyLedgerFromGroups(
         {
           name: ledgerName,

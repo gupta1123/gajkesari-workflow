@@ -455,6 +455,26 @@ type TallyPostingStatus = {
   paymentCheckFailed: number;
 };
 
+type QueueLedgerContext = {
+  name: string;
+  parent: string | null;
+  billWiseEnabled: boolean | null;
+  ledgerType: string | null;
+};
+
+function buildQueueLedgerContext(ledgerMasters: TallyMaster[], names: Array<string | null | undefined>) {
+  const requestedNames = new Set(names.map(normalizeName).filter(Boolean));
+  return ledgerMasters
+    .filter((ledger) => requestedNames.has(normalizeName(ledger.name)))
+    .slice(0, 100)
+    .map((ledger): QueueLedgerContext => ({
+      name: ledger.name,
+      parent: ledger.parent ?? null,
+      billWiseEnabled: typeof ledger.billWiseEnabled === "boolean" ? ledger.billWiseEnabled : null,
+      ledgerType: ledger.ledgerType ?? null,
+    }));
+}
+
 type LedgerSelection = {
   name: string;
   action: LedgerRecommendationAction;
@@ -6111,6 +6131,17 @@ export function BankStatementsPage() {
           accountId: confirmPayload.account.id,
           transactionIds: queueRows.map((transaction) => transaction.id),
           bankLedgerName,
+          liveLedgerContext: buildQueueLedgerContext(ledgerMasters, [
+            bankLedgerName,
+            ...queueRows.flatMap((transaction) => {
+              const reviewedTransaction = reviewedTransactionsByKey.get(transactionQueueKey(transaction));
+              return [
+                reviewedTransaction?.selectedLedgerName,
+                transaction.confirmedLedgerName,
+                transaction.suggestedLedgerName,
+              ];
+            }),
+          ]),
           outgoingAction: "post",
           transactions: queueRows.map((transaction) => ({
             transactionId: transaction.id,
