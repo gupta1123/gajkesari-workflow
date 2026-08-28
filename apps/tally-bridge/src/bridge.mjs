@@ -1909,9 +1909,12 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
   const groups = new Map();
   for (const command of commands) {
     const payload = command?.payload || {};
+    const hasBillAllocations = Array.isArray(payload.billAllocations) && payload.billAllocations.length > 0;
     const key = [
       normalizeLooseName(payload.companyName || config.companyName),
       normalizeLooseName(payload.bankLedgerName),
+      normalizeLooseName(payload.voucherType),
+      hasBillAllocations ? "billwise" : "plain",
     ].join("::");
     const group = groups.get(key) || [];
     group.push(command);
@@ -1925,6 +1928,10 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       const batchPreflight = await reconcileBankTransactionsInTally(config, {
         companyName: firstPayload.companyName || config.companyName || null,
         bankLedgerName: firstPayload.bankLedgerName,
+        // Duplicate detection only needs the voucher collection. Fetching the
+        // bank closing balance here added another unrelated Tally request to
+        // every post and could consume the full export timeout.
+        includeBalanceProof: false,
         transactions: group.map((command) => ({
           ...command.payload,
           expectedDirection:
@@ -2050,6 +2057,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       const postflight = await reconcileBankTransactionsInTally(config, {
         companyName,
         bankLedgerName: firstPayload.bankLedgerName,
+        includeBalanceProof: false,
         transactions: pendingCommands.map((command) => ({
           ...command.payload,
           expectedDirection:
@@ -3044,22 +3052,25 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(bankLedgerName)
   ));
   const tallyMovement = periodBankEntries.reduce((sum, entry) => sum - Number(entry.amount || 0), 0);
+  const includeBalanceProof = commandPayload.includeBalanceProof !== false;
   let tallyClosingBalance = null;
-  let balanceError = null;
-  try {
-    const rawTallyClosingBalance = await fetchLedgerClosingBalance(tallyUrl, {
-      companyName,
-      ledgerName: bankLedgerName,
-      dateFrom,
-      dateTo,
-    });
-    // Tally's internal amount sign is opposite to the bank statement view for
-    // asset bank ledgers: debit balances are negative internally.
-    tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
-      ? -Number(rawTallyClosingBalance)
-      : null;
-  } catch (error) {
-    balanceError = error instanceof Error ? error.message : String(error);
+  let balanceError = includeBalanceProof ? null : "Balance proof skipped for posting duplicate preflight.";
+  if (includeBalanceProof) {
+    try {
+      const rawTallyClosingBalance = await fetchLedgerClosingBalance(tallyUrl, {
+        companyName,
+        ledgerName: bankLedgerName,
+        dateFrom,
+        dateTo,
+      });
+      // Tally's internal amount sign is opposite to the bank statement view for
+      // asset bank ledgers: debit balances are negative internally.
+      tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
+        ? -Number(rawTallyClosingBalance)
+        : null;
+    } catch (error) {
+      balanceError = error instanceof Error ? error.message : String(error);
+    }
   }
   const derivedTallyOpeningBalance = Number.isFinite(tallyClosingBalance)
     ? Number(tallyClosingBalance) - tallyMovement
@@ -5178,6 +5189,180 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   };
 }
 
+async function fetchCommandRealtimeConfig(config) {
+  const url = new URL(`${config.apiBase}/api/tally/bridge/realtime-config`);
+  url.searchParams.set("connectionId", config.connectionId);
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${config.bridgeToken}` },
+  });
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    const error = new Error(payload.error || `Realtime configuration failed with HTTP ${response.status}.`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload.realtime ?? null;
+}
+
+async function processClaimedCommands(config, commands, options = {}) {
+  const bankVoucherCommands = commands.filter((command) => command.commandType === "post_bank_voucher");
+  for (const command of commands) {
+    if (command.commandType === "post_bank_voucher") continue;
+    try {
+      await runCommand(config, command, options);
+    } catch (error) {
+      console.error(
+        `Command ${command.id} failed without blocking the remaining queue: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+  if (bankVoucherCommands.length > 0) {
+    await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
+  }
+}
+
+async function drainPendingCommands(config, options = {}) {
+  let processed = 0;
+  while (processed < MAX_COMMANDS_PER_CYCLE) {
+    const commands = await receiveNextCommands(
+      config,
+      Math.min(MAX_COMMANDS_PER_CYCLE - processed, MAX_COMMANDS_PER_CYCLE)
+    );
+    if (commands.length === 0) break;
+    // Preserve the bank-voucher batch path even when Realtime wakes the bridge.
+    // Processing each notification independently would re-run duplicate
+    // preflight once per voucher and be slower than the polling path.
+    await processClaimedCommands(config, commands, options);
+    processed += commands.length;
+  }
+  return processed;
+}
+
+function decodeRealtimeFrame(data) {
+  if (typeof data === "string") return JSON.parse(data);
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  if (bytes.length >= 5 && bytes[0] === 4) {
+    const topicSize = bytes[1];
+    const eventSize = bytes[2];
+    const metadataSize = bytes[3];
+    const payloadEncoding = bytes[4];
+    let offset = 5;
+    const frameTopic = bytes.subarray(offset, offset + topicSize).toString("utf8");
+    offset += topicSize;
+    const userEvent = bytes.subarray(offset, offset + eventSize).toString("utf8");
+    offset += eventSize + metadataSize;
+    const rawPayload = bytes.subarray(offset);
+    const broadcastPayload = payloadEncoding === 1
+      ? JSON.parse(rawPayload.toString("utf8"))
+      : rawPayload;
+    return [null, null, frameTopic, "broadcast", { event: userEvent, payload: broadcastPayload }];
+  }
+  return JSON.parse(bytes.toString("utf8"));
+}
+
+function startCommandWakeChannel(config, executeExclusive, options = {}) {
+  let socket = null;
+  let reconnectTimer = null;
+  let heartbeatTimer = null;
+  let stopped = false;
+  let messageRef = 1;
+  let realtimeConfig = null;
+
+  const log = (level, message) => emitLog(options, level, message);
+  const clearSocketTimers = () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  };
+  const sendFrame = (topic, event, payload, joinRef = null) => {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const ref = String(messageRef++);
+    socket.send(JSON.stringify([joinRef, ref, topic, event, payload]));
+    return ref;
+  };
+  const runWake = async (reason) => {
+    try {
+      const processed = await executeExclusive(() => drainPendingCommands(config, options));
+      if (processed > 0) {
+        log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
+      }
+    } catch (error) {
+      log("error", error instanceof Error ? error.message : "Immediate Tally command check failed.");
+    }
+  };
+  const scheduleReconnect = () => {
+    clearSocketTimers();
+    if (stopped || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connect();
+    }, 3000);
+    reconnectTimer.unref?.();
+  };
+
+  const connect = async () => {
+    if (stopped) return;
+    try {
+      realtimeConfig = await fetchCommandRealtimeConfig(config);
+      if (!realtimeConfig?.websocketUrl || !realtimeConfig?.publishableKey || !realtimeConfig?.topic) {
+        throw new Error("Realtime command notifications are not configured.");
+      }
+      const url = new URL(realtimeConfig.websocketUrl);
+      url.searchParams.set("apikey", realtimeConfig.publishableKey);
+      url.searchParams.set("vsn", "2.0.0");
+      const topic = `realtime:${realtimeConfig.topic}`;
+      socket = new WebSocket(url.toString(), { ca: windowsTlsCertificates() });
+      socket.addEventListener("open", () => {
+        sendFrame(topic, "phx_join", {
+          config: {
+            broadcast: { ack: false, self: false },
+            presence: { enabled: false },
+            postgres_changes: [],
+          },
+        }, "1");
+        heartbeatTimer = setInterval(() => sendFrame("phoenix", "heartbeat", {}), 25_000);
+        heartbeatTimer.unref?.();
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const frame = decodeRealtimeFrame(event.data);
+          if (!Array.isArray(frame) || frame.length < 5) return;
+          const [, , frameTopic, eventName, payload] = frame;
+          if (frameTopic !== topic) return;
+          if (eventName === "phx_reply" && payload?.status === "ok") {
+            log("info", "Immediate Tally command notifications connected; polling remains as fallback.");
+            void runWake("notification-channel startup");
+            return;
+          }
+          if (eventName === "broadcast" && payload?.event === (realtimeConfig.event || "command_queued")) {
+            void runWake("realtime notification");
+          }
+        } catch (error) {
+          log("error", error instanceof Error ? error.message : "Invalid realtime command notification.");
+        }
+      });
+      socket.addEventListener("error", (event) => {
+        const detail = event?.error?.message || event?.message || "WebSocket connection failed";
+        log("error", `Immediate command notifications are unavailable (${detail}); polling fallback remains active.`);
+      });
+      socket.addEventListener("close", scheduleReconnect);
+    } catch (error) {
+      log("error", `${error instanceof Error ? error.message : "Could not connect command notifications"} Polling fallback remains active.`);
+      scheduleReconnect();
+    }
+  };
+
+  void connect();
+  return () => {
+    stopped = true;
+    clearSocketTimers();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    socket?.close();
+  };
+}
+
 async function startBridge(args) {
   const config = readConfig();
   if (!config) {
@@ -5222,6 +5407,7 @@ async function startBridge(args) {
   };
 
   await runOnce(config, runnerOptions);
+  startCommandWakeChannel(config, executeExclusive, runnerOptions);
   startTallyLiveChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
@@ -5268,6 +5454,7 @@ function createBridgeRunner(options = {}) {
   let pendingExclusive = 0;
   let stopped = false;
   let stopTallyLiveChannel = null;
+  let stopCommandWakeChannel = null;
   const companyHeartbeatCache = {};
 
   const executeExclusive = async (task) => {
@@ -5292,6 +5479,8 @@ function createBridgeRunner(options = {}) {
     }
     stopTallyLiveChannel?.();
     stopTallyLiveChannel = null;
+    stopCommandWakeChannel?.();
+    stopCommandWakeChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -5337,6 +5526,7 @@ function createBridgeRunner(options = {}) {
     async start() {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
+      stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, options);
       stopTallyLiveChannel = startTallyLiveChannel(config, executeExclusive, options);
       await runSerially();
       if (!stopped) {

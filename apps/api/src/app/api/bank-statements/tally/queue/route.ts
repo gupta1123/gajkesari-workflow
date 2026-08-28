@@ -13,6 +13,7 @@ import {
   resolveCompanySuspenseLedgerName,
 } from "@/lib/bank-statement-ledger-safety";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { wakeTallyConnector } from "@/lib/tally/command-wake";
 
 export const runtime = "nodejs";
 
@@ -94,6 +95,16 @@ type TallyLedgerRow = {
   parent_name: string | null;
   raw_payload: Record<string, unknown> | null;
 };
+
+const MASTER_LOOKUP_CHUNK_SIZE = 100;
+
+function chunkValues<T>(values: T[], size = MASTER_LOOKUP_CHUNK_SIZE) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
 
 type MappingRow = {
   connection_id: string;
@@ -586,47 +597,103 @@ export async function POST(request: Request) {
       return [] as TallyCommandInsert[];
     }
 
-    const activeLedgers: TallyLedgerRow[] = [];
-    const ledgerPageSize = 1000;
-    for (let from = 0; from < 20000; from += ledgerPageSize) {
-      const { data: ledgerRows, error: ledgerError } = await supabase
+    // Posting only needs the ledgers referenced by these rows. Loading every
+    // synced ledger (including raw_payload) made a four-row post download the
+    // entire 12k+ master catalogue before it could create any commands.
+    const requestedLedgerNames = new Set<string>();
+    for (const transaction of transactions) {
+      const account = accountsById.get(transaction.bank_account_id);
+      const selection = ledgerSelectionByTransactionId.get(transaction.id);
+      const bankLedger = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
+      const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
+      [
+        bankLedger,
+        selection?.counterpartyLedgerName,
+        selection?.createLedgerName,
+        transaction.confirmed_ledger_name,
+        Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? transaction.suggested_ledger_name : "",
+        legacyFallback,
+      ].forEach((name) => {
+        const value = toText(name, 500);
+        if (value) requestedLedgerNames.add(value);
+      });
+    }
+
+    const ledgerQueries = chunkValues(Array.from(requestedLedgerNames)).map((names) =>
+      supabase
         .from("tally_masters")
         .select("tally_name, parent_name, raw_payload")
         .eq("owner_user_id", user.id)
         .eq("connection_id", connectionId)
         .eq("master_type", "ledger")
         .eq("is_active", true)
-        .order("tally_name", { ascending: true })
-        .range(from, from + ledgerPageSize - 1);
-      if (ledgerError) throw ledgerError;
-      const page = (ledgerRows ?? []) as unknown as TallyLedgerRow[];
-      activeLedgers.push(...page);
-      if (page.length < ledgerPageSize) break;
-      if (from + ledgerPageSize >= 20000) {
-        throw new Error("Tally ledger sync exceeds the supported 20,000-ledger safety limit.");
-      }
+        .in("tally_name", names)
+    );
+    const [ledgerQueryResults, suspenseResult] = await Promise.all([
+      Promise.all(ledgerQueries),
+      supabase
+        .from("tally_masters")
+        .select("tally_name, parent_name, raw_payload")
+        .eq("owner_user_id", user.id)
+        .eq("connection_id", connectionId)
+        .eq("master_type", "ledger")
+        .eq("is_active", true)
+        .or("tally_name.ilike.%suspense%,parent_name.ilike.%suspense%")
+        .limit(100),
+    ]);
+    for (const result of ledgerQueryResults) {
+      if (result.error) throw result.error;
     }
+    if (suspenseResult.error) throw suspenseResult.error;
+    const activeLedgers = Array.from(
+      new Map(
+        [
+          ...ledgerQueryResults.flatMap((result) => (result.data ?? []) as unknown as TallyLedgerRow[]),
+          ...((suspenseResult.data ?? []) as unknown as TallyLedgerRow[]),
+        ].map((ledger) => [normalizeName(ledger.tally_name), ledger] as const)
+      ).values()
+    );
     const companySuspenseLedgerName = resolveCompanySuspenseLedgerName(
       activeLedgers.map((ledger) => ({ name: ledger.tally_name, parent: ledger.parent_name }))
     ) || "";
+
+    // Resolve only the ancestor chains needed to classify selected ledgers.
+    // Tally group trees are shallow, so this is normally one or two compact
+    // requests instead of another paginated full-master scan.
     const activeGroups: TallyLedgerRow[] = [];
-    for (let from = 0; from < 20000; from += ledgerPageSize) {
-      const { data: groupRows, error: groupError } = await supabase
-        .from("tally_masters")
-        .select("tally_name, parent_name")
-        .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
-        .eq("master_type", "group")
-        .eq("is_active", true)
-        .order("tally_name", { ascending: true })
-        .range(from, from + ledgerPageSize - 1);
-      if (groupError) throw groupError;
-      const page = (groupRows ?? []) as unknown as TallyLedgerRow[];
-      activeGroups.push(...page);
-      if (page.length < ledgerPageSize) break;
-      if (from + ledgerPageSize >= 20000) {
-        throw new Error("Tally group sync exceeds the supported 20,000-group safety limit.");
+    const loadedGroupNames = new Set<string>();
+    let pendingGroupNames = Array.from(
+      new Set(
+        [
+          ...activeLedgers.map((ledger) => ledger.parent_name || ""),
+          ...Array.from(ledgerSelectionByTransactionId.values()).map((selection) => selection.createLedgerParentName),
+        ].filter(Boolean)
+      )
+    );
+    for (let depth = 0; pendingGroupNames.length > 0 && depth < 20; depth += 1) {
+      const names = pendingGroupNames.filter((name) => !loadedGroupNames.has(normalizeName(name)));
+      if (names.length === 0) break;
+      const results = await Promise.all(
+        chunkValues(names).map((nameChunk) =>
+          supabase
+            .from("tally_masters")
+            .select("tally_name, parent_name")
+            .eq("owner_user_id", user.id)
+            .eq("connection_id", connectionId)
+            .eq("master_type", "group")
+            .eq("is_active", true)
+            .in("tally_name", nameChunk)
+        )
+      );
+      for (const result of results) {
+        if (result.error) throw result.error;
       }
+      const rows = results.flatMap((result) => (result.data ?? []) as unknown as TallyLedgerRow[]);
+      for (const row of rows) {
+        loadedGroupNames.add(normalizeName(row.tally_name));
+        activeGroups.push(row);
+      }
+      pendingGroupNames = rows.map((row) => row.parent_name || "").filter(Boolean);
     }
     const groupIdentities = activeGroups.map((group) => ({
       name: group.tally_name,
@@ -1118,6 +1185,11 @@ export async function POST(request: Request) {
         savedMappingCount: uniqueMappingRows.length,
       },
     });
+
+    // Wake only after the posting logs and transaction checkpoints are ready;
+    // otherwise a very fast connector could finish before this route records
+    // the queued state and have its success overwritten.
+    await wakeTallyConnector(connectionId);
 
     return jsonWithCors(request, {
       queuedCount: voucherCommands.length,

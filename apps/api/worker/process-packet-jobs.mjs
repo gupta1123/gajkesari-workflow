@@ -11,6 +11,12 @@ import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
 import {
+  bankStatementAccountDiagnostics,
+  combinedLedgerCatalogueDecision,
+  extractAccountFromBankStatementMarkdown,
+  mergeBankStatementAccount,
+} from "./bank-statement-account.mjs";
+import {
   correctRowsFromRunningBalance,
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
@@ -1148,6 +1154,7 @@ async function extractAndMatchBankStatementFromMarkdown(
       role: "system",
       content:
         "Read the supplied bank-statement Markdown and perform both tasks in one response: (1) extract normalized account details and transaction rows, and (2) recommend an existing Tally ledger for every transaction. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+        "The account object is mandatory and must contain bankName, accountNumber, accountHolderName, and ifscCode. Copy each visible account value from the statement header exactly; use null only when that specific value is not visible. Never infer the statement account from a transaction narration or the Tally ledger catalogue. " +
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, suggestedLedgerName, suggestionConfidence, and suggestionReason. Dates must be ISO YYYY-MM-DD. Use positive numbers for debit and credit in their own columns. Do not invent rows or amounts. Preserve complete narration text. " +
         "For suggestedLedgerName, choose only an exact name from the supplied tallyLedgers list. If no ledger is uniquely supported, return null, suggestionConfidence 0, and explain briefly in suggestionReason. Never invent a ledger. " +
         "If the Markdown contains only summary information and no ledger rows, return an empty transactions array." +
@@ -1626,23 +1633,50 @@ async function extractBankStatementAdaptive({
         anydocResult.markdownText.trim() &&
         hasUsableBankStatementText(markdownPages)
       ) {
-        await onExtractionSource?.("anydoc_markdown_combined_ai");
-        await updateBankJob(jobId, { progress: 45, stage: "Running quick Markdown + ledger AI" });
+        const combinedDecision = combinedLedgerCatalogueDecision(ledgerNames);
+        diagnostics.anydoc.combinedLedgerCatalogue = combinedDecision;
+        const nextExtractionSource = combinedDecision.useCombined
+          ? "anydoc_markdown_combined_ai"
+          : "anydoc_markdown_ai";
+        await onExtractionSource?.(nextExtractionSource);
+        await updateBankJob(jobId, {
+          progress: 45,
+          stage: combinedDecision.useCombined
+            ? "Running quick Markdown + ledger AI"
+            : "Extracting statement from Markdown",
+        });
         const markdownAiStartedAt = Date.now();
-        parsed = await extractAndMatchBankStatementFromMarkdown(fileName, anydocResult.markdownText, bankAccountCandidates, ledgerNames, {
+        const markdownAiOptions = {
           model: OPENROUTER_ANYDOC_MODEL,
           reasoningTokens: OPENROUTER_ANYDOC_REASONING_TOKENS,
           maxOutputTokens: OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS,
-        });
+        };
+        parsed = combinedDecision.useCombined
+          ? await extractAndMatchBankStatementFromMarkdown(
+              fileName,
+              anydocResult.markdownText,
+              bankAccountCandidates,
+              ledgerNames,
+              markdownAiOptions
+            )
+          : await extractBankStatementFromText(
+              fileName,
+              markdownPages,
+              bankAccountCandidates,
+              markdownAiOptions
+            );
         diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
+        const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
+        parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+        diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
         if (parsed.transactions.length > 0) {
           parsed.transactions = addBankStatementPageProvenance(parsed.transactions, {
             startPage: 1,
             endPage: Math.max(1, anydocResult.tableCount),
             method: "anydoc_markdown_v1",
           });
-          extractionSource = "anydoc_markdown_combined_ai";
-          diagnostics.pipeline = "anydoc_markdown_combined_ai";
+          extractionSource = nextExtractionSource;
+          diagnostics.pipeline = nextExtractionSource;
           diagnostics.coverageComplete = true;
           return { parsed, extractionSource, extractionError: null, diagnostics };
         }
@@ -2214,6 +2248,11 @@ async function runBankStatementJob(job) {
     accountHolderName: importRow.extracted_account_holder_name || parsed.account.accountHolderName || null,
     ifscCode: importRow.extracted_ifsc_code || parsed.account.ifscCode || null,
   };
+  extractionDiagnostics.account = bankStatementAccountDiagnostics(account);
+  if (!extractionDiagnostics.account.hasIdentity) {
+    extractionDiagnostics.account.warning =
+      "No statement bank name or account number was extracted; account selection requires review.";
+  }
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
   const { data: candidateRows, error: candidateError } = normalizedAccountNumber
     ? await supabase
@@ -2229,7 +2268,7 @@ async function runBankStatementJob(job) {
   const extractionIncomplete =
     Boolean(extractionError) || extractionDiagnostics?.coverageComplete === false;
   const finalStatus =
-    parsed.transactions.length === 0 || extractionIncomplete
+    parsed.transactions.length === 0 || extractionIncomplete || !extractionDiagnostics.account.hasIdentity
       ? "manual_review_required"
       : candidateCount > 1
         ? "needs_account_selection"
@@ -2562,7 +2601,11 @@ async function runTallyQueueJob(job) {
       {
         method: "POST",
         headers: { "x-worker-secret": WORKER_SECRET },
-        signal: AbortSignal.timeout(25_000),
+        // Local Next.js can spend more than 25 seconds cold-compiling this
+        // route. A longer guard prevents a still-running request from being
+        // retried concurrently; the route itself remains responsible for work
+        // completion and production normally finishes far sooner.
+        signal: AbortSignal.timeout(90_000),
       }
     );
     const payload = await response.json().catch(async () => ({ error: await response.text().catch(() => "") }));

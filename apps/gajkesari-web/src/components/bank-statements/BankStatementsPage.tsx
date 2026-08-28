@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import {
@@ -586,6 +586,13 @@ function normalizeName(value?: string | null) {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function withoutRecordKey<T>(record: Record<string, T>, key: string) {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return record;
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
 function masterParentDescendsFromGroupMap(
   parentName: string | null | undefined,
   parentByName: Map<string, string | null>,
@@ -1083,13 +1090,26 @@ function transactionIsValid(transaction: ReviewTransaction) {
   );
 }
 
+const bankAmountFormatter = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 0,
+});
+
+const bankCurrencyInputFormatter = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 2,
+});
+
+const bankShortDateFormatter = new Intl.DateTimeFormat("en-IN", {
+  day: "2-digit",
+  month: "short",
+  year: "numeric",
+});
+
 function formatAmount(value: string | number | null | undefined) {
   const parsed = parseNumber(value) ?? 0;
   if (!Number.isFinite(parsed) || parsed === 0) return "";
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 0,
-  }).format(parsed);
+  return bankAmountFormatter.format(parsed);
 }
 
 function formatCurrencyAmount(value: string | number | null | undefined) {
@@ -1100,10 +1120,7 @@ function formatCurrencyAmount(value: string | number | null | undefined) {
 function formatCurrencyInputAmount(value: string | number | null | undefined) {
   const parsed = parseNumber(value) ?? 0;
   if (!Number.isFinite(parsed) || parsed === 0) return "";
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 2,
-  }).format(parsed);
+  return bankCurrencyInputFormatter.format(parsed);
 }
 
 function formatDataLabel(value?: string | null) {
@@ -1380,19 +1397,25 @@ type LedgerSearchGroup = {
   }>;
 };
 
+const MAX_BANK_LEDGER_MENU_OPTIONS = 60;
+
 function LedgerSearchSelect({
   value,
   groups,
   placeholder,
   onChange,
+  onCommit,
 }: {
   value: string;
   groups: LedgerSearchGroup[];
   placeholder: string;
   onChange: (value: string) => void;
+  onCommit?: (value: string) => void;
 }) {
+  const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [hasSearchStarted, setHasSearchStarted] = useState(false);
   const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const uniqueGroups = useMemo(() => {
     const seen = new Set<string>();
@@ -1408,53 +1431,107 @@ function LedgerSearchSelect({
       }))
       .filter((group) => group.options.length > 0);
   }, [groups]);
+  const optionMetadataByName = useMemo(() => {
+    const metadata = new Map<string, { balance: string | null; searchText: string }>();
+    uniqueGroups.forEach((group) => {
+      group.options.forEach((option) => {
+        const balance = formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType);
+        metadata.set(normalizeName(option.name), {
+          balance,
+          searchText: normalizeName(`${option.name} ${option.helper ?? ""} ${balance ?? ""} ${group.label}`),
+        });
+      });
+    });
+    return metadata;
+  }, [uniqueGroups]);
   const filteredGroups = useMemo(() => {
-    const normalizedQuery = normalizeName(query);
+    const normalizedQuery = hasSearchStarted ? normalizeName(query) : "";
     if (!normalizedQuery) return uniqueGroups;
     return uniqueGroups
       .map((group) => ({
         ...group,
         options: group.options.filter((option) =>
-          normalizeName(`${option.name} ${option.helper ?? ""} ${formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ?? ""} ${group.label}`).includes(normalizedQuery)
+          optionMetadataByName.get(normalizeName(option.name))?.searchText.includes(normalizedQuery)
         ),
       }))
       .filter((group) => group.options.length > 0);
-  }, [query, uniqueGroups]);
+  }, [hasSearchStarted, optionMetadataByName, query, uniqueGroups]);
   const visibleOptions = useMemo(
     () => filteredGroups.flatMap((group) => group.options),
     [filteredGroups]
   );
+  const renderedGroups = useMemo(() => {
+    let remaining = MAX_BANK_LEDGER_MENU_OPTIONS;
+    return filteredGroups
+      .map((group) => {
+        if (remaining <= 0) return { ...group, options: [] };
+        const options = group.options.slice(0, remaining);
+        remaining -= options.length;
+        return { ...group, options };
+      })
+      .filter((group) => group.options.length > 0);
+  }, [filteredGroups]);
+  const menuOptions = useMemo(
+    () => renderedGroups.flatMap((group) => group.options),
+    [renderedGroups]
+  );
+  const menuOptionIndexByName = useMemo(
+    () => new Map(menuOptions.map((option, index) => [normalizeName(option.name), index])),
+    [menuOptions]
+  );
 
-  function chooseLedger(name: string) {
-    onChange(name);
+  function chooseLedger(name: string, commit = false) {
+    if (commit && onCommit) onCommit(name);
+    else onChange(name);
     setQuery("");
+    setHasSearchStarted(false);
     setOpen(false);
     setActiveOptionIndex(0);
   }
 
+  useLayoutEffect(() => {
+    if (!open) return;
+    const activeOption = menuRef.current?.querySelector<HTMLElement>(
+      `[data-ledger-option-index="${activeOptionIndex}"]`
+    );
+    activeOption?.scrollIntoView({ block: "nearest" });
+  }, [activeOptionIndex, open]);
+
   return (
     <div className="relative">
       <div className="relative">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
         <input
+          aria-activedescendant={open && menuOptions[activeOptionIndex] ? `bank-ledger-option-${activeOptionIndex}` : undefined}
+          aria-autocomplete="list"
+          aria-expanded={open}
+          aria-haspopup="listbox"
           autoFocus
-          className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 pl-9 text-sm font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
-          onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+          className="h-8 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
+          onBlur={() =>
+            window.setTimeout(() => {
+              setOpen(false);
+              setQuery("");
+              setHasSearchStarted(false);
+            }, 120)
+          }
           onChange={(event) => {
             setQuery(event.target.value);
+            setHasSearchStarted(true);
             setOpen(true);
             setActiveOptionIndex(0);
           }}
           onFocus={(event) => {
-            const input = event.currentTarget;
             setOpen(true);
-            setActiveOptionIndex(0);
-            window.requestAnimationFrame(() => input.select());
+            setActiveOptionIndex(menuOptionIndexByName.get(normalizeName(value)) ?? 0);
+            event.currentTarget.select();
           }}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
               event.preventDefault();
               setOpen(false);
+              setQuery("");
+              setHasSearchStarted(false);
               return;
             }
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -1462,70 +1539,84 @@ function LedgerSearchSelect({
               setOpen(true);
               const direction = event.key === "ArrowDown" ? 1 : -1;
               setActiveOptionIndex((current) => {
-                if (visibleOptions.length === 0) return 0;
-                return (current + direction + visibleOptions.length) % visibleOptions.length;
+                if (menuOptions.length === 0) return 0;
+                return (current + direction + menuOptions.length) % menuOptions.length;
               });
               return;
             }
-            if (event.key === "Enter" && open && visibleOptions[activeOptionIndex]) {
+            if (event.key === "Enter" && open && menuOptions[activeOptionIndex]) {
               event.preventDefault();
-              chooseLedger(visibleOptions[activeOptionIndex].name);
+              chooseLedger(menuOptions[activeOptionIndex].name, true);
             }
           }}
           placeholder={placeholder}
-          value={open ? query : value}
+          value={hasSearchStarted ? query : value}
         />
       </div>
 
       {open ? (
-        <div className="absolute z-30 mt-2 max-h-72 w-full overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-xl">
+        <div
+          className="absolute z-30 mt-1 max-h-64 w-full overflow-auto rounded-lg border border-[#d8cbbb] bg-white p-1 shadow-xl"
+          ref={menuRef}
+          role="listbox"
+        >
           {filteredGroups.length > 0 ? (
-            filteredGroups.map((group) => (
+            renderedGroups.map((group) => (
               <div className="mb-1 last:mb-0" key={group.label}>
-                <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                <div className="px-2.5 pb-0.5 pt-1.5 text-[9px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
                   {group.label}
                 </div>
                 {group.options.map((option) => {
-                  const optionIndex = visibleOptions.findIndex((candidate) => candidate.name === option.name);
+                  const optionIndex = menuOptionIndexByName.get(normalizeName(option.name)) ?? -1;
                   const keyboardActive = optionIndex === activeOptionIndex;
+                  const closingBalance = optionMetadataByName.get(normalizeName(option.name))?.balance;
                   return (
                     <button
-                      className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
+                      aria-selected={option.name === value}
+                      className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[11px] font-bold leading-[14px] transition hover:bg-[#fbf4ea] ${
                         option.name === value || keyboardActive
                           ? "bg-[#f6efe6] text-[#4b3828]"
                           : "text-[#2b241d]"
                       }`}
+                      data-ledger-option-index={optionIndex}
+                      id={`bank-ledger-option-${optionIndex}`}
                       key={option.name}
                       onMouseDown={(event) => {
                         event.preventDefault();
                         chooseLedger(option.name);
                       }}
+                      role="option"
                       type="button"
                     >
                       <span className="min-w-0">
                         <span className="block truncate">{option.name}</span>
-                        <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-medium text-[#8a7f72]">
+                        <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-semibold leading-[12px] text-[#8a7f72]">
                           {option.helper ? <span className="truncate">{option.helper}</span> : null}
-                          {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ? (
+                          {closingBalance ? (
                             <span className="whitespace-nowrap font-bold text-[#6f4e2f]">
-                              {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType)}
+                              {closingBalance}
                             </span>
                           ) : (
                             <span className="whitespace-nowrap text-slate-400">Closing balance unavailable</span>
                           )}
                         </span>
                       </span>
-                      {option.name === value ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /> : null}
+                      {option.name === value ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" /> : null}
                     </button>
                   );
                 })}
               </div>
             ))
           ) : (
-            <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+            <div className="px-2.5 py-3 text-[10px] font-semibold text-[#8a7f72]">
               No matching ledger found.
             </div>
           )}
+          {visibleOptions.length > menuOptions.length ? (
+            <div className="sticky bottom-0 border-t border-[#eee7dc] bg-[#fffdf9] px-2.5 py-1.5 text-[9px] font-bold text-[#7a6c5f]">
+              Type to search {visibleOptions.length - menuOptions.length} more ledgers
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -1547,6 +1638,8 @@ function isSuspenseLedgerName(value: string) {
   return normalizeName(value).includes("suspense");
 }
 
+const MAX_INITIAL_LEDGER_MENU_OPTIONS = 60;
+
 function LedgerReviewSelect({
   transaction,
   ledgerMasters,
@@ -1561,7 +1654,7 @@ function LedgerReviewSelect({
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const [popoverPosition, setPopoverPosition] = useState<{
     bottom?: number;
     left: number;
@@ -1570,6 +1663,7 @@ function LedgerReviewSelect({
     width: number;
   } | null>(null);
   const [query, setQuery] = useState("");
+  const [hasSearchStarted, setHasSearchStarted] = useState(false);
   const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const groups = useMemo(
     () => buildLedgerPickerGroups(transaction, ledgerMasters),
@@ -1592,15 +1686,37 @@ function LedgerReviewSelect({
       }))
       .filter((group) => group.options.length > 0);
   }, [groups, normalizedQuery, query]);
-  const displayValue = open ? query : getLedgerPickerDisplayValue(transaction);
   const visibleOptions = useMemo(
     () => filteredGroups.flatMap((group) => group.options),
     [filteredGroups]
   );
+  const renderedGroups = useMemo(() => {
+    let remaining = MAX_INITIAL_LEDGER_MENU_OPTIONS;
+    return filteredGroups
+      .map((group) => {
+        if (remaining <= 0) return { ...group, options: [] };
+        const options = group.options.slice(0, remaining);
+        remaining -= options.length;
+        return { ...group, options };
+      })
+      .filter((group) => group.options.length > 0);
+  }, [filteredGroups]);
+  const menuOptions = useMemo(
+    () => renderedGroups.flatMap((group) => group.options),
+    [renderedGroups]
+  );
+  const menuOptionIndexByKey = useMemo(
+    () => new Map(menuOptions.map((option, index) => [option.key, index])),
+    [menuOptions]
+  );
+  const displayValue = hasSearchStarted
+    ? query
+    : transaction.selectedLedgerName || getLedgerPickerDisplayValue(transaction);
 
   function selectOption(option: LedgerSelection) {
     onChange(option);
     setQuery("");
+    setHasSearchStarted(false);
     setOpen(false);
   }
 
@@ -1629,14 +1745,30 @@ function LedgerReviewSelect({
     setOpen(true);
   }
 
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      inputRef.current?.focus();
-      openMenu();
-    });
-    return () => window.cancelAnimationFrame(frame);
-    // This editor is mounted only when a row enters edit mode. Opening once
-    // after layout guarantees that the first cell click can be measured.
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (rect) {
+      const gutter = 16;
+      const width = Math.min(440, window.innerWidth - gutter * 2);
+      const left = Math.min(
+        Math.max(gutter, rect.right - width),
+        Math.max(gutter, window.innerWidth - width - gutter)
+      );
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      const shouldOpenAbove = spaceBelow < 330 && spaceAbove > spaceBelow;
+      const availableHeight = Math.max(220, shouldOpenAbove ? spaceAbove - gutter * 2 : spaceBelow - gutter * 2);
+      setPopoverPosition({
+        bottom: shouldOpenAbove ? window.innerHeight - rect.top + 8 : undefined,
+        left,
+        maxHeight: Math.min(390, availableHeight),
+        top: shouldOpenAbove ? undefined : rect.bottom + 8,
+        width,
+      });
+    }
+    input?.focus();
+    input?.select();
   }, []);
 
   useEffect(() => {
@@ -1669,7 +1801,7 @@ function LedgerReviewSelect({
       }}
     >
       {filteredGroups.length > 0 ? (
-        filteredGroups.map((group) => (
+        renderedGroups.map((group) => (
           <div className="mb-0.5 last:mb-0" key={group.label}>
             <div className="px-2.5 pb-0.5 pt-1.5 text-[9px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
               {group.label}
@@ -1678,7 +1810,7 @@ function LedgerReviewSelect({
               const selected =
                 normalizeName(option.name) === normalizeName(transaction.selectedLedgerName) &&
                 option.action === transaction.ledgerAction;
-              const optionIndex = visibleOptions.findIndex((candidate) => candidate.key === option.key);
+              const optionIndex = menuOptionIndexByKey.get(option.key) ?? -1;
               const keyboardActive = optionIndex === activeOptionIndex;
               return (
                 <button
@@ -1717,7 +1849,7 @@ function LedgerReviewSelect({
               );
             })}
           </div>
-        ))
+          ))
       ) : ledgerMasters.length === 0 ? (
         <div className="px-2.5 py-3 text-[10px] font-semibold text-[#8a7f72]">
           Tally ledgers are not loaded. Use Sync above, then search again.
@@ -1727,6 +1859,11 @@ function LedgerReviewSelect({
           No matching ledger found.
         </div>
       )}
+      {visibleOptions.length > menuOptions.length ? (
+        <div className="sticky bottom-0 border-t border-[#eee7dc] bg-[#fffdf9] px-2.5 py-1.5 text-[9px] font-bold text-[#7a6c5f]">
+          Type to search {visibleOptions.length - menuOptions.length} more ledgers
+        </div>
+      ) : null}
     </div>
   ) : null;
 
@@ -1735,7 +1872,6 @@ function LedgerReviewSelect({
       <div className="relative">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
         <input
-          autoFocus
           className="h-8 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-8 text-[11px] font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
           onBlur={() => {
             window.setTimeout(() => {
@@ -1752,13 +1888,13 @@ function LedgerReviewSelect({
           }}
           onChange={(event) => {
             setQuery(event.target.value);
+            setHasSearchStarted(true);
             setActiveOptionIndex(0);
             openMenu();
           }}
           onFocus={(event) => {
-            const input = event.currentTarget;
-            openMenu();
-            window.requestAnimationFrame(() => input.select());
+            setOpen(true);
+            event.currentTarget.select();
           }}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
@@ -1772,14 +1908,14 @@ function LedgerReviewSelect({
               if (!open) openMenu();
               const direction = event.key === "ArrowDown" ? 1 : -1;
               setActiveOptionIndex((current) => {
-                if (visibleOptions.length === 0) return 0;
-                return (current + direction + visibleOptions.length) % visibleOptions.length;
+                if (menuOptions.length === 0) return 0;
+                return (current + direction + menuOptions.length) % menuOptions.length;
               });
               return;
             }
-            if (event.key === "Enter" && open && visibleOptions[activeOptionIndex]) {
+            if (event.key === "Enter" && open && menuOptions[activeOptionIndex]) {
               event.preventDefault();
-              selectOption(visibleOptions[activeOptionIndex]);
+              selectOption(menuOptions[activeOptionIndex]);
             }
           }}
           placeholder="Search or choose action"
@@ -1865,13 +2001,6 @@ function getReviewStatusLabel(transaction: ReviewTransaction) {
   if (status === "matched") return "Ledger matched";
   if (status === "suspense") return "In Suspense";
   return "Close match";
-}
-
-function getReviewStatusClass(transaction: ReviewTransaction) {
-  const status = getReviewStatus(transaction);
-  if (status === "matched") return "border-emerald-200 bg-emerald-50 text-emerald-800";
-  if (status === "suspense") return "border-slate-300 bg-slate-100 text-slate-700";
-  return "border-amber-200 bg-amber-50 text-amber-800";
 }
 
 function getLedgerReviewFilterValue(transaction: ReviewTransaction): Exclude<ReviewLedgerFilter, "all"> {
@@ -2102,7 +2231,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
 function formatShortDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
   if (Number.isNaN(date.getTime())) return value || "-";
-  return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  return bankShortDateFormatter.format(date);
 }
 
 function formatDateTime(value?: string | null) {
@@ -2117,8 +2246,12 @@ function formatDateTime(value?: string | null) {
   });
 }
 
-function getLedgerGroupLabel(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
-  const ledger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+function getLedgerGroupLabel(
+  transaction: ReviewTransaction,
+  ledgerMasters: TallyMaster[],
+  selectedLedger?: TallyMaster | null
+) {
+  const ledger = selectedLedger ?? findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
   return ledger?.parent || transaction.ledgerGroup || "-";
 }
 
@@ -2130,9 +2263,10 @@ type ProposedBankVoucherType = "Receipt" | "Payment" | "Contra";
 
 function getProposedBankVoucherType(
   transaction: ReviewTransaction,
-  ledgerMasters: TallyMaster[]
+  ledgerMasters: TallyMaster[],
+  selectedLedgerOverride?: TallyMaster | null
 ): ProposedBankVoucherType | null {
-  const selectedLedger = getSelectedLedger(transaction, ledgerMasters);
+  const selectedLedger = selectedLedgerOverride ?? getSelectedLedger(transaction, ledgerMasters);
   const parentName = selectedLedger?.parent || transaction.ledgerGroup;
   const counterpartyIsBankOrCash = Boolean(
     selectedLedger &&
@@ -2148,12 +2282,6 @@ function getProposedBankVoucherType(
   if (isIncomingReceiptRow(transaction)) return "Receipt";
   if (isOutgoingPaymentRow(transaction)) return "Payment";
   return null;
-}
-
-function getVoucherTypeTagClass(voucherType: ProposedBankVoucherType) {
-  if (voucherType === "Receipt") return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  if (voucherType === "Payment") return "border-rose-200 bg-rose-50 text-rose-700";
-  return "border-sky-200 bg-sky-50 text-sky-700";
 }
 
 type PartyBillMatchContext = {
@@ -2200,6 +2328,27 @@ function getPartyBillMatchContext(transaction: ReviewTransaction, ledgerMasters:
 
 function isBillMatchEligibleTransaction(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
   return getPartyBillMatchContext(transaction, ledgerMasters).eligible;
+}
+
+type ReviewPostingAction = "outgoing" | "allocation";
+
+function getReviewPostingAction(
+  transaction: ReviewTransaction,
+  ledgerMasters: TallyMaster[],
+  tallyPresence?: OutgoingVerificationDraft | null
+): ReviewPostingAction {
+  if (tallyPresence?.status === "found") return "outgoing";
+
+  const outgoingPayment = isOutgoingPaymentRow(transaction);
+  const billMatchEligible = isBillMatchEligibleTransaction(transaction, ledgerMasters);
+  if (isIncomingReceiptRow(transaction) && !billMatchEligible) return "outgoing";
+  const outgoingNeedsBillAllocation = Boolean(
+    outgoingPayment &&
+      tallyPresence?.status === "missing" &&
+      billMatchEligible
+  );
+  if (outgoingPayment && !outgoingNeedsBillAllocation) return "outgoing";
+  return "allocation";
 }
 
 function getBillAllocationBadgeText(
@@ -3022,7 +3171,6 @@ export function BankStatementsPage() {
   const [statementDoneSummary, setStatementDoneSummary] = useState<StatementDoneSummary | null>(null);
   const [reviewFiltersOpen, setReviewFiltersOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  const [activeReviewTransactionId, setActiveReviewTransactionId] = useState<string | null>(null);
   const [reviewSearch, setReviewSearch] = useState("");
   const [reviewWorkStatusFilter, setReviewWorkStatusFilter] = useState<ReviewWorkStatusFilter>("all");
   const [reviewTallyResultFilter, setReviewTallyResultFilter] = useState<ReviewTallyResultFilter>("all");
@@ -3042,7 +3190,11 @@ export function BankStatementsPage() {
   const [billAllocationSearch, setBillAllocationSearch] = useState("");
   const [confirmFullAdvance, setConfirmFullAdvance] = useState(false);
   const [outgoingReviewTransactionId, setOutgoingReviewTransactionId] = useState<string | null>(null);
+  const [reviewActionStage, setReviewActionStage] = useState<"ledger" | "posting">("ledger");
+  const [expandedNarrationTransactionId, setExpandedNarrationTransactionId] = useState<string | null>(null);
   const reviewRowRefs = useRef<Map<string, HTMLTableRowElement>>(new Map());
+  const reviewTableScrollRef = useRef<HTMLDivElement | null>(null);
+  const activeReviewTransactionIdRef = useRef<string | null>(null);
   const reviewSearchInputRef = useRef<HTMLInputElement>(null);
   const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
@@ -3050,11 +3202,70 @@ export function BankStatementsPage() {
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
   const lastNonEmptyCompaniesRef = useRef<CompanyOption[]>([]);
+  const lastLiveTallyCheckAtRef = useRef(0);
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
+
+  useEffect(() => {
+    if (!expandedNarrationTransactionId) return;
+
+    function collapseNarrationOnOutsideClick(event: PointerEvent) {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("[data-narration-cell]")) return;
+      setExpandedNarrationTransactionId(null);
+    }
+
+    document.addEventListener("pointerdown", collapseNarrationOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", collapseNarrationOnOutsideClick);
+  }, [expandedNarrationTransactionId]);
+
+  const selectReviewTransaction = useCallback((transactionId: string | null) => {
+    const previousId = activeReviewTransactionIdRef.current;
+    if (previousId !== transactionId) setReviewActionStage("ledger");
+    if (previousId && previousId !== transactionId) {
+      const previousRow = reviewRowRefs.current.get(previousId);
+      previousRow?.setAttribute("data-active", "false");
+      previousRow?.setAttribute("aria-selected", "false");
+    }
+
+    activeReviewTransactionIdRef.current = transactionId;
+    if (transactionId) {
+      const nextRow = reviewRowRefs.current.get(transactionId);
+      nextRow?.setAttribute("data-active", "true");
+      nextRow?.setAttribute("aria-selected", "true");
+    }
+  }, []);
+
+  const scrollReviewTransactionIntoView = useCallback((transactionId: string) => {
+    const scrollIfNeeded = () => {
+      const row = reviewRowRefs.current.get(transactionId);
+      const container = reviewTableScrollRef.current;
+      if (!row || !container) return false;
+
+      const rowRect = row.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const visibleTop = containerRect.top + 34;
+      if (rowRect.top < visibleTop) {
+        container.scrollTop -= visibleTop - rowRect.top;
+      } else if (rowRect.bottom > containerRect.bottom) {
+        container.scrollTop += rowRect.bottom - containerRect.bottom;
+      }
+      return true;
+    };
+
+    if (!scrollIfNeeded()) {
+      window.requestAnimationFrame(() => {
+        if (!scrollIfNeeded()) window.requestAnimationFrame(scrollIfNeeded);
+      });
+    }
+  }, []);
 
   const validTransactions = useMemo(
     () => transactions.filter(transactionIsValid),
     [transactions]
+  );
+  const ledgerMastersByNormalizedName = useMemo(
+    () => new Map(ledgerMasters.map((ledger) => [normalizeName(ledger.name), ledger])),
+    [ledgerMasters]
   );
   const ignoredStatementRowCount = Math.max(0, transactions.length - validTransactions.length);
 
@@ -3517,6 +3728,10 @@ export function BankStatementsPage() {
     tallyPresenceByTransactionId,
     validTransactions,
   ]);
+  const filteredTransactionIndexById = useMemo(
+    () => new Map(filteredTransactions.map((transaction, index) => [transaction.id, index])),
+    [filteredTransactions]
+  );
   const visibleReviewTransactions = useMemo(
     () => {
       const start = (reviewPage - 1) * rowsPerPage;
@@ -3560,6 +3775,24 @@ export function BankStatementsPage() {
       : `Post to Tally (${selectedPostingTransactions.length})`;
   const statementReviewLocked = Boolean(statementDoneSummary) || tallyPostingInProgress;
   const statementReviewDrawerLocked = tallyPostingInProgress;
+  const openPostingReviewAction = useCallback(
+    (transaction: ReviewTransaction) => {
+      const postingAction = getReviewPostingAction(
+        transaction,
+        ledgerMasters,
+        tallyPresenceByTransactionId[transaction.id]
+      );
+      if (statementReviewDrawerLocked) return;
+
+      setEditingLedgerIds(new Set());
+      if (postingAction === "outgoing") {
+        setOutgoingReviewTransactionId(transaction.id);
+      } else {
+        setBillAllocationReviewTransactionId(transaction.id);
+      }
+    },
+    [ledgerMasters, statementReviewDrawerLocked, tallyPresenceByTransactionId]
+  );
   const activeReviewFilterCount = [
     reviewSearch.trim(),
     reviewWorkStatusFilter !== "all" ? reviewWorkStatusFilter : "",
@@ -3590,15 +3823,16 @@ export function BankStatementsPage() {
 
   useEffect(() => {
     if (visibleReviewTransactions.length === 0) {
-      setActiveReviewTransactionId(null);
+      selectReviewTransaction(null);
       return;
     }
-    setActiveReviewTransactionId((current) =>
+    const current = activeReviewTransactionIdRef.current;
+    selectReviewTransaction(
       current && visibleReviewTransactions.some((transaction) => transaction.id === current)
         ? current
         : visibleReviewTransactions[0].id
     );
-  }, [visibleReviewTransactions]);
+  }, [selectReviewTransaction, visibleReviewTransactions]);
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
@@ -3692,9 +3926,9 @@ export function BankStatementsPage() {
       if (["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp"].includes(event.key)) {
         if (filteredTransactions.length === 0) return;
         event.preventDefault();
-        const currentIndex = filteredTransactions.findIndex(
-          (transaction) => transaction.id === activeReviewTransactionId
-        );
+        const currentIndex = activeReviewTransactionIdRef.current
+          ? filteredTransactionIndexById.get(activeReviewTransactionIdRef.current) ?? -1
+          : -1;
         let nextIndex = currentIndex < 0 ? 0 : currentIndex;
         if (event.key === "Home") nextIndex = 0;
         else if (event.key === "End") nextIndex = filteredTransactions.length - 1;
@@ -3704,35 +3938,52 @@ export function BankStatementsPage() {
         else if (event.key === "PageUp") nextIndex -= rowsPerPage;
         nextIndex = Math.min(Math.max(nextIndex, 0), filteredTransactions.length - 1);
         const nextTransaction = filteredTransactions[nextIndex];
-        setActiveReviewTransactionId(nextTransaction.id);
-        setReviewPage(Math.floor(nextIndex / rowsPerPage) + 1);
-        window.requestAnimationFrame(() => {
-          window.requestAnimationFrame(() => {
-            reviewRowRefs.current.get(nextTransaction.id)?.scrollIntoView({ block: "nearest" });
-          });
-        });
+        selectReviewTransaction(nextTransaction.id);
+        const nextPage = Math.floor(nextIndex / rowsPerPage) + 1;
+        setReviewPage((current) => (current === nextPage ? current : nextPage));
+        scrollReviewTransactionIntoView(nextTransaction.id);
         return;
       }
 
-      if ((event.key === "Enter" || event.key === "F2") && activeReviewTransactionId && !statementReviewLocked) {
+      const activeTransactionId = activeReviewTransactionIdRef.current;
+      if (event.key === "Enter" && activeTransactionId) {
+        const activeIndex = filteredTransactionIndexById.get(activeTransactionId);
+        const activeTransaction = activeIndex === undefined ? null : filteredTransactions[activeIndex];
+        if (!activeTransaction) return;
         event.preventDefault();
-        setEditingLedgerIds(new Set([activeReviewTransactionId]));
+        setExpandedNarrationTransactionId(null);
+        if (event.ctrlKey || event.metaKey) {
+          if (!statementReviewLocked) {
+            setReviewActionStage("ledger");
+            setEditingLedgerIds(new Set([activeTransactionId]));
+          }
+          return;
+        }
+        if (reviewActionStage === "ledger") {
+          if (!statementReviewLocked) setEditingLedgerIds(new Set([activeTransactionId]));
+          return;
+        }
+        openPostingReviewAction(activeTransaction);
       }
     }
 
     window.addEventListener("keydown", handleReviewShortcut);
     return () => window.removeEventListener("keydown", handleReviewShortcut);
   }, [
-    activeReviewTransactionId,
     bankLedgerChangeMode,
     billAllocationsByTransactionId,
     billAllocationReviewTransactionId,
     editingLedgerIds,
+    filteredTransactionIndexById,
     filteredTransactions,
+    openPostingReviewAction,
     outgoingReviewTransactionId,
     preview,
     reviewFiltersOpen,
     rowsPerPage,
+    reviewActionStage,
+    scrollReviewTransactionIntoView,
+    selectReviewTransaction,
     shortcutsOpen,
     statementReviewLocked,
   ]);
@@ -3782,6 +4033,11 @@ export function BankStatementsPage() {
   const tallyResultReviewIsIncoming = outgoingReviewTransaction
     ? isIncomingReceiptRow(outgoingReviewTransaction)
     : false;
+  const tallyResultReviewIsDirectReceipt = Boolean(
+    outgoingReviewTransaction &&
+      tallyResultReviewIsIncoming &&
+      !isBillMatchEligibleTransaction(outgoingReviewTransaction, ledgerMasters)
+  );
   const tallyResultReviewDirection = tallyResultReviewIsIncoming ? "receipt" : "payment";
   const tallyResultReviewAmount = outgoingReviewTransaction
     ? tallyResultReviewIsIncoming
@@ -3793,6 +4049,9 @@ export function BankStatementsPage() {
     return getProposedBankVoucherType(outgoingReviewTransaction, ledgerMasters) || "Receipt";
   })();
   const tallyResultReviewReason = (() => {
+    if (outgoingReviewTransaction && tallyResultReviewIsDirectReceipt) {
+      return "Bill matching is not applicable for this ledger. This receipt is ready to post directly as a Receipt voucher.";
+    }
     if (!outgoingReviewTransaction || !tallyResultReviewDraft) {
       return `Run Check Tally Matches to verify this ${tallyResultReviewDirection} against Tally.`;
     }
@@ -4075,9 +4334,10 @@ export function BankStatementsPage() {
     setPostedTransactionIds(new Set());
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
+    selectReviewTransaction(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
-  }, []);
+  }, [selectReviewTransaction]);
   const pollTallyPostingStatus = useCallback(async (connectionId: string, commandIds: string[]) => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       await wait(2000);
@@ -4326,6 +4586,11 @@ export function BankStatementsPage() {
   }, [ledgerMasters]);
 
   function updateLedgerSelection(id: string, selection: LedgerSelection) {
+    const previousTransaction = transactions.find((transaction) => transaction.id === id);
+    const ledgerIdentityChanged =
+      !previousTransaction ||
+      normalizeName(previousTransaction.selectedLedgerName) !== normalizeName(selection.name);
+
     setTransactions((current) =>
       current.map((transaction) =>
         transaction.id === id
@@ -4340,14 +4605,21 @@ export function BankStatementsPage() {
           : transaction
       )
     );
-    // Ledger identity is part of both duplicate detection and bill matching.
-    // Any ledger change invalidates the complete statement-level proof.
-    setBillAllocationsByTransactionId({});
-    setOutgoingVerificationsByTransactionId({});
-    setTallyPresenceByTransactionId({});
-    setPostedTransactionIds(new Set());
+
+    // Reconfirming the same ledger is part of the keyboard review flow and must
+    // preserve live Tally evidence. A genuine identity change invalidates only
+    // this row; other checked rows remain trustworthy and visible.
+    if (!ledgerIdentityChanged) return;
+    setBillAllocationsByTransactionId((current) => withoutRecordKey(current, id));
+    setOutgoingVerificationsByTransactionId((current) => withoutRecordKey(current, id));
+    setTallyPresenceByTransactionId((current) => withoutRecordKey(current, id));
+    setPostedTransactionIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
     setTallyBalanceProof(null);
-    setTallyCheckAttempted(false);
     setBillAllocationReviewTransactionId((current) => (current === id ? null : current));
     setOutgoingReviewTransactionId((current) => (current === id ? null : current));
   }
@@ -4502,15 +4774,21 @@ export function BankStatementsPage() {
     if (next) setBillAllocationReviewTransactionId(next.id);
   }
 
-  function closeAndOpenNextBillIssue() {
-    const nextIssue = [...blockingReceiptBillAllocationTransactions, ...blockingPaymentBillAllocationTransactions].find(
-      (transaction) => transaction.id !== billAllocationReviewTransactionId
-    );
-    if (nextIssue) {
-      setBillAllocationReviewTransactionId(nextIssue.id);
-      return;
-    }
+  function completePostingReview(transactionId: string) {
     setBillAllocationReviewTransactionId(null);
+    setOutgoingReviewTransactionId(null);
+    setEditingLedgerIds(new Set());
+    setReviewActionStage("ledger");
+
+    const currentIndex = filteredTransactionIndexById.get(transactionId);
+    if (currentIndex === undefined) return;
+    const nextTransaction = filteredTransactions[currentIndex + 1];
+    if (!nextTransaction) return;
+
+    selectReviewTransaction(nextTransaction.id);
+    const nextPage = Math.floor((currentIndex + 1) / rowsPerPage) + 1;
+    setReviewPage((current) => (current === nextPage ? current : nextPage));
+    scrollReviewTransactionIntoView(nextTransaction.id);
   }
 
   function dismissToast(id: string) {
@@ -4615,14 +4893,18 @@ export function BankStatementsPage() {
     setBankLedgerChangeMode(false);
   }
 
-  function confirmBankLedgerChange() {
-    if (!pendingBankLedgerName.trim()) {
+  function commitBankLedgerChange(ledgerName: string) {
+    if (!ledgerName.trim()) {
       showToast("error", "Choose a Tally bank ledger first.");
       return;
     }
 
-    applyTallyBankLedgerSelection(pendingBankLedgerName);
+    applyTallyBankLedgerSelection(ledgerName);
     showToast("success", "Bank ledger updated for this statement.");
+  }
+
+  function confirmBankLedgerChange() {
+    commitBankLedgerChange(pendingBankLedgerName);
   }
 
   function applyPreviewPayload(
@@ -4689,7 +4971,7 @@ export function BankStatementsPage() {
     setReviewAllocationFilter("all");
     setReviewDateFrom("");
     setReviewDateTo("");
-    setActiveReviewTransactionId(null);
+    selectReviewTransaction(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }
@@ -5545,6 +5827,7 @@ export function BankStatementsPage() {
       if (receiptTransactionsToMatch.length > 0) {
         setBillAllocationsByTransactionId(nextDrafts);
       }
+      lastLiveTallyCheckAtRef.current = Date.now();
       const foundCount = Object.values(presenceDrafts).filter((draft) => draft.status === "found").length;
       const ambiguousCount = Object.values(presenceDrafts).filter((draft) => draft.status === "ambiguous").length;
       const duplicateCount = Object.values(presenceDrafts).filter((draft) => draft.duplicateInTally).length;
@@ -5662,7 +5945,12 @@ export function BankStatementsPage() {
         draft.allocations.some((allocation) => allocation.referenceType === "Agst Ref")
       );
     });
-    if (billEligibleTransactions.length > 0) {
+    // The match action has just fetched these exact live bills. Reuse that
+    // result briefly so an immediate Post click does not make the user wait for
+    // the same Tally export twice. Older reviews still get the full revalidation.
+    const liveBillCheckIsFresh =
+      tallyCheckAttempted && Date.now() - lastLiveTallyCheckAtRef.current < 120_000;
+    if (billEligibleTransactions.length > 0 && !liveBillCheckIsFresh) {
       try {
         const ledgerNames = Array.from(new Set(
           billEligibleTransactions.map((transaction) => transaction.selectedLedgerName)
@@ -6063,8 +6351,8 @@ export function BankStatementsPage() {
                 ["Up / Down", "Move through the filtered transaction list"],
                 ["Home / End", "Move to the first or last filtered transaction"],
                 ["PgUp / PgDn", "Move one page through filtered transactions"],
-                ["Enter", "Open ledger selection for the highlighted row"],
-                ["F2", "Alter the highlighted row's Tally ledger"],
+                ["Enter", "Confirm the outlined step, then continue through ledger, posting, and the next row"],
+                ["Ctrl + Enter", "Change the highlighted row's Tally ledger"],
                 ["Alt + F", "Open Filters and focus transaction search"],
                 ["Ctrl + B", "Open or close Filters, including while using them"],
                 ["Alt + F2", "Open Filters and focus the statement period"],
@@ -6087,8 +6375,8 @@ export function BankStatementsPage() {
         </div>
       ) : null}
       <div className="bank-statements-workflow flex min-h-full flex-col bg-[#f7f7f5] text-[#1a1a1a]">
-        <div className="flex-1 px-4 py-3 sm:px-8 sm:py-4">
-          <div className="mx-auto flex w-full max-w-7xl flex-col gap-2.5">
+        <div className="min-w-0 flex-1 px-0 py-3 sm:py-4">
+          <div className="flex w-full max-w-none flex-col gap-2.5">
           <header className={`flex flex-col gap-2 md:flex-row md:items-center md:justify-between ${preview ? "border-b border-[#e5ddd0] pb-2" : ""}`}>
             <div>
               <h1 className="flex shrink-0 items-center gap-2 text-xl font-black tracking-tight text-[#1a1a1a] sm:text-2xl">
@@ -6749,29 +7037,29 @@ export function BankStatementsPage() {
               </section>
             </section>
           ) : (
-            <section className="space-y-2.5">
-              <div className="rounded-xl border border-[#e5ddd0] bg-white px-3.5 py-2.5 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-                <div className="flex flex-col gap-2.5 lg:flex-row lg:items-center lg:justify-between">
+            <section className="space-y-0">
+              <div className="border-y border-[#e5ddd0] bg-transparent px-1 py-2 sm:px-2">
+                <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
                   {/* Left: Statement Account -> Tally Ledger */}
-                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2.5 sm:gap-3.5">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:gap-3">
                     {/* Statement Account Box */}
-                    <div className="flex min-w-0 items-center gap-2">
-                      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#f5f0e8] text-[#6f6255] border border-[#e5ddd0]">
-                        <Landmark className="h-3.5 w-3.5" />
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-[#e5ddd0] bg-[#f5f0e8] text-[#6f6255]">
+                        <Landmark className="h-3 w-3" />
                       </div>
                       <div className="min-w-0">
-                        <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Statement Account</div>
-                        <div className="flex flex-wrap items-baseline gap-1 text-xs">
+                        <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Statement Account</div>
+                        <div className="flex flex-wrap items-baseline gap-1 text-[11px] leading-[13px]">
                           <span className="font-extrabold text-[#1a1a1a]">
                             {account.bankName || "Detected Account"}
                           </span>
                           {account.accountNumber ? (
-                            <span className="font-mono font-bold text-[#5a5046]">
+                            <span className="font-mono text-[9px] font-bold text-[#5a5046]">
                               · {account.accountNumber}
                             </span>
                           ) : null}
                           {account.accountHolderName && account.accountHolderName !== "Holder not found" ? (
-                            <span className="text-[10px] font-semibold text-slate-400">
+                            <span className="text-[8px] font-semibold text-slate-400">
                               ({account.accountHolderName})
                             </span>
                           ) : null}
@@ -6781,23 +7069,23 @@ export function BankStatementsPage() {
 
                     {/* Mapping Arrow */}
                     <div className="hidden sm:flex items-center text-slate-300">
-                      <ArrowRight className="h-3.5 w-3.5 text-emerald-600" />
+                      <ArrowRight className="h-3 w-3 text-emerald-600" />
                     </div>
 
                     {/* Tally Ledger Box */}
                     {!bankLedgerChangeMode && bankLedgerName ? (
-                      <div className="flex min-w-0 items-center gap-2">
-                        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700">
-                          <CheckCircle2 className="h-3.5 w-3.5" />
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700">
+                          <CheckCircle2 className="h-3 w-3" />
                         </div>
                         <div className="min-w-0">
                           <div className="flex items-center gap-1.5">
-                            <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Tally Ledger</span>
-                            <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[8.5px] font-bold uppercase tracking-wider text-emerald-800">
+                            <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Tally Ledger</span>
+                            <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[7px] font-extrabold uppercase tracking-wider text-emerald-800">
                               Matched
                             </span>
                           </div>
-                          <div className="truncate text-xs font-extrabold text-[#1a1a1a]" title={bankLedgerName}>
+                          <div className="truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={bankLedgerName}>
                             {bankLedgerName}
                           </div>
                         </div>
@@ -6806,7 +7094,7 @@ export function BankStatementsPage() {
                   </div>
 
                   {/* Right Actions */}
-                  <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t border-[#eee7dc] pt-2 lg:border-t-0 lg:pt-0">
+                  <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t border-[#eee7dc] pt-1.5 lg:border-t-0 lg:pt-0">
                     {preview.candidates.length > 1 ? (
                       <select
                         value={selectedAccountId || "new"}
@@ -6829,7 +7117,7 @@ export function BankStatementsPage() {
                             }
                           }
                         }}
-                        className="h-7 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[10px] font-bold text-[#5a5046] outline-none"
+                        className="h-7 rounded-md border border-[#e5ddd0] bg-white px-2 text-[9px] font-bold text-[#5a5046] outline-none"
                       >
                         <option value="new">Extracted account</option>
                         {preview.candidates.map((candidate) => (
@@ -6843,7 +7131,7 @@ export function BankStatementsPage() {
                       <button
                         type="button"
                         onClick={beginBankLedgerChange}
-                        className="inline-flex h-7 items-center rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                        className="inline-flex h-7 items-center rounded-md border border-[#e5ddd0] bg-white px-2.5 text-[9px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
                       >
                         Change ledger
                       </button>
@@ -6852,7 +7140,7 @@ export function BankStatementsPage() {
                       type="button"
                       onClick={handleSyncLedgerMasters}
                       disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
-                      className="inline-flex h-7 items-center justify-center gap-1 rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex h-7 items-center justify-center gap-1 rounded-md border border-[#e5ddd0] bg-white px-2.5 text-[9px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {syncingMasters || loadingBankLedgers ? (
                         <Loader2 className="h-3 w-3 animate-spin" />
@@ -6866,27 +7154,28 @@ export function BankStatementsPage() {
 
                 {/* Ledger Selection Mode */}
                 {bankLedgerChangeMode || !bankLedgerName ? (
-                  <div className="mt-2.5 border-t border-[#eee7dc] pt-2.5">
-                    <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-[#5a5046]">
+                  <div className="mt-2 border-t border-[#eee7dc] pt-2">
+                    <div className="mb-1 text-[9px] font-extrabold uppercase tracking-[0.12em] text-[#5a5046]">
                       {bankLedgerChangeMode ? "Select replacement Tally bank ledger" : "Choose matching Tally bank ledger"}
                     </div>
                     <LedgerSearchSelect
                       groups={bankLedgerPickerGroups}
                       onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
+                      onCommit={bankLedgerChangeMode ? commitBankLedgerChange : undefined}
                       placeholder="Search bank accounts or all Tally ledgers"
                       value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
                     />
                     {bankLedgerChangeMode ? (
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                         <button
-                          className="inline-flex h-7 items-center rounded-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white transition hover:bg-[#1a1a1a]"
+                          className="inline-flex h-7 items-center rounded-md bg-[#2d2d2d] px-3 text-[9px] font-bold text-white transition hover:bg-[#1a1a1a]"
                           onClick={confirmBankLedgerChange}
                           type="button"
                         >
                           Use selected ledger
                         </button>
                         <button
-                          className="inline-flex h-7 items-center rounded-lg px-2 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
+                          className="inline-flex h-7 items-center rounded-md px-2 text-[9px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
                           onClick={cancelBankLedgerChange}
                           type="button"
                         >
@@ -6894,15 +7183,15 @@ export function BankStatementsPage() {
                         </button>
                       </div>
                     ) : (
-                      <div className="mt-1.5 flex items-start gap-1.5 text-[10px] font-semibold text-amber-700">
-                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <div className="mt-1.5 flex items-start gap-1.5 text-[9px] font-semibold text-amber-700">
+                        <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
                         <span>Choose the intended ledger - no exact account match was found in Tally.</span>
                       </div>
                     )}
                   </div>
                 ) : null}
               </div>
-              <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              <div className="overflow-hidden border-b border-[#e5ddd0] bg-transparent">
                 <div className="border-b border-[#e5ddd0] px-4 py-2.5">
                   <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
                     <div className="flex flex-wrap items-center gap-2.5">
@@ -7124,30 +7413,36 @@ export function BankStatementsPage() {
                     </div>
                   ) : null}
                 </div>
-                <div className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-230px)] [scrollbar-gutter:stable]">
-                  <table className="w-full min-w-[940px] table-fixed border-collapse text-left">
+                <div ref={reviewTableScrollRef} className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-230px)] [scrollbar-gutter:stable]">
+                  <table className="w-full min-w-full table-fixed border-collapse text-left md:min-w-[900px] xl:min-w-[1120px]">
                     <thead className="sticky top-0 z-20">
-                      <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[9px] font-bold uppercase tracking-wider text-slate-400">
-                        <th className="w-20 px-3 py-2.5">Date</th>
-                        <th className="w-[29%] px-3 py-2.5">Transaction</th>
-                        <th className="w-24 px-3 py-2.5 text-right">Payment</th>
-                        <th className="w-24 px-3 py-2.5 text-right">Receipt</th>
-                        <th className="w-[22%] px-3 py-2.5">Tally ledger</th>
-                        <th className="w-32 px-3 py-2.5">Ledger status</th>
-                        <th className="w-44 px-3 py-2.5">Posting plan</th>
-                        <th className="w-12 px-2 py-2.5" aria-label="Row actions"></th>
+                      <tr className="border-b border-[#d8cbbb] bg-[#f7f3ed] text-[9px] font-extrabold uppercase tracking-[0.1em] text-[#776b5f]">
+                        <th className="w-[74px] px-3 py-2">Date</th>
+                        <th className="w-auto px-2 py-2 sm:px-3 md:w-[28%]">Particulars</th>
+                        <th className="hidden w-[84px] px-2 py-2 lg:table-cell">Vch type</th>
+                        <th className="hidden w-[120px] px-2 py-2 xl:table-cell">Reference</th>
+                        <th className="hidden w-[104px] px-3 py-2 text-right md:table-cell">
+                          <span className="block">Payment</span>
+                        </th>
+                        <th className="hidden w-[104px] px-3 py-2 text-right md:table-cell">
+                          <span className="block">Receipt</span>
+                        </th>
+                        <th className="w-[92px] px-2 py-2 text-right md:hidden">Amount</th>
+                        <th className="hidden w-[23%] px-3 py-2 md:table-cell">Tally ledger</th>
+                        <th className="w-[160px] px-2 py-2 sm:w-[200px] sm:px-3">Posting status</th>
+                        <th className="sticky right-0 w-10 border-l border-[#e5ddd0] bg-[#f7f3ed] px-1 py-2" aria-label="Edit ledger"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#e5ddd0] text-[10px] font-semibold text-slate-600">
                       {validTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
+                          <td colSpan={10} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
                             No posting rows were extracted. Upload another file or add rows after extraction support improves.
                           </td>
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
+                          <td colSpan={10} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
                             No rows match the current filters.
                           </td>
                         </tr>
@@ -7156,7 +7451,19 @@ export function BankStatementsPage() {
                           const debit = formatAmount(transaction.debitAmount);
                           const credit = formatAmount(transaction.creditAmount);
                           const partyTitle = getTransactionPartyTitle(transaction);
-                          const proposedVoucherType = getProposedBankVoucherType(transaction, ledgerMasters);
+                          const selectedLedger = ledgerMastersByNormalizedName.get(
+                            normalizeName(transaction.selectedLedgerName)
+                          ) ?? null;
+                          const proposedVoucherType = getProposedBankVoucherType(
+                            transaction,
+                            ledgerMasters,
+                            selectedLedger
+                          );
+                          const ledgerGroupLabel = getLedgerGroupLabel(
+                            transaction,
+                            ledgerMasters,
+                            selectedLedger
+                          );
                           const mode = getTransactionMode(transaction);
                           const reference = getTransactionReference(transaction);
                           const isEditingLedger = editingLedgerIds.has(transaction.id);
@@ -7176,67 +7483,139 @@ export function BankStatementsPage() {
                             isBillMatchEligibleTransaction(transaction, ledgerMasters)
                           );
                           const ledgerMatchStatus = getReviewStatusLabel(transaction);
-                          const ledgerMatchStatusClass = getReviewStatusClass(transaction);
+                          const postingReviewAction = getReviewPostingAction(
+                            transaction,
+                            ledgerMasters,
+                            tallyPresence
+                          );
+                          const highlightedReviewAction = showLedgerSelect || reviewActionStage === "ledger"
+                            ? "ledger"
+                            : postingReviewAction;
+                          const narrationExpanded = expandedNarrationTransactionId === transaction.id;
 
                           return (
                             <tr
-                              aria-selected={activeReviewTransactionId === transaction.id}
-                              className={`align-middle transition-colors ${
-                                activeReviewTransactionId === transaction.id
-                                  ? "bg-amber-50/70 shadow-[inset_3px_0_0_#f59e0b]"
-                                  : "hover:bg-[#fcfbfa]/60"
-                              }`}
+                              aria-selected={activeReviewTransactionIdRef.current === transaction.id}
+                              className="group cursor-pointer bg-white align-top hover:bg-[#fff9e8] data-[active=true]:bg-[#fff4d6] data-[active=true]:shadow-[inset_3px_0_0_#d69a28]"
+                              data-active={activeReviewTransactionIdRef.current === transaction.id ? "true" : "false"}
                               key={transaction.id}
-                              onMouseDown={() => setActiveReviewTransactionId(transaction.id)}
+                              onClick={(event) => {
+                                const target = event.target;
+                                if (
+                                  target instanceof HTMLElement &&
+                                  target.closest("button, input, select, textarea, [role='button']")
+                                ) {
+                                  return;
+                                }
+                                if (reviewActionStage === "ledger") {
+                                  if (!statementReviewLocked) setEditingLedgerIds(new Set([transaction.id]));
+                                } else {
+                                  openPostingReviewAction(transaction);
+                                }
+                              }}
+                              onMouseDown={() => selectReviewTransaction(transaction.id)}
                               ref={(node) => {
                                 if (node) reviewRowRefs.current.set(transaction.id, node);
                                 else reviewRowRefs.current.delete(transaction.id);
                               }}
                             >
-                              <td className="px-3 py-2.5 text-[10px] font-bold leading-[13px] text-slate-500">
+                              <td className="px-3 py-2 align-top text-[10px] font-bold leading-[12px] text-slate-600">
                                 {formatShortDate(getEffectiveTransactionDate(transaction))}
                               </td>
-                              <td className="px-3 py-2.5 align-top">
-                                <div className="whitespace-normal break-words text-[12px] font-bold leading-4 text-[#1a1a1a]" title={partyTitle}>
+                              <td
+                                aria-expanded={narrationExpanded}
+                                className={`px-2 py-2 align-top sm:px-3 ${
+                                  narrationExpanded ? "cursor-zoom-out" : "cursor-zoom-in"
+                                }`}
+                                data-narration-cell
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setExpandedNarrationTransactionId((current) =>
+                                    current === transaction.id ? null : transaction.id
+                                  );
+                                }}
+                                title={narrationExpanded ? "Click to collapse narration" : "Click to view full narration"}
+                              >
+                                <div className="truncate text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]" title={partyTitle}>
                                   {partyTitle}
                                 </div>
-                                <div className="mt-0.5 line-clamp-2 whitespace-normal break-words text-[10px] font-semibold leading-[13px] text-slate-500" title={transaction.description}>
+                                <div
+                                  className={`mt-0.5 text-[9px] font-semibold leading-[13px] text-slate-500 ${
+                                    narrationExpanded
+                                      ? "whitespace-normal break-words"
+                                      : "truncate"
+                                  }`}
+                                  title={narrationExpanded ? undefined : transaction.description}
+                                >
                                   {transaction.description || "Narration not found"}
                                 </div>
-                                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[9px] font-bold">
-                                  <span className="shrink-0 text-[#1a1a1a]">{mode || "-"}</span>
-                                  {proposedVoucherType ? (
-                                    <span
-                                      aria-label={`Tally voucher type: ${proposedVoucherType}`}
-                                      className={`inline-flex h-4 shrink-0 items-center rounded-full border px-1.5 text-[7px] font-extrabold uppercase tracking-[0.08em] ${getVoucherTypeTagClass(proposedVoucherType)}`}
-                                      title={`Will post as ${proposedVoucherType} voucher`}
-                                    >
-                                      {proposedVoucherType}
-                                    </span>
-                                  ) : null}
-                                  <span className="min-w-0 truncate text-slate-500" title={reference}>{reference || "-"}</span>
+                                <div className="mt-0.5 flex min-w-0 items-center gap-1.5 lg:hidden">
+                                  <span className={`text-[8px] font-extrabold uppercase ${
+                                    proposedVoucherType === "Receipt"
+                                      ? "text-emerald-700"
+                                      : proposedVoucherType === "Payment"
+                                        ? "text-red-700"
+                                        : "text-sky-700"
+                                  }`}>
+                                    {proposedVoucherType || "-"}
+                                  </span>
+                                  <span className="truncate text-[8px] font-bold uppercase text-slate-400">{mode || "-"}</span>
+                                </div>
+                                <div className="mt-0.5 truncate text-[8px] font-bold text-[#5a5046] md:hidden" title={ledgerDisplayName}>
+                                  {ledgerDisplayName}
                                 </div>
                               </td>
-                              <td className="px-3 py-2.5 text-right text-[12px] font-extrabold text-red-600">
+                              <td className="hidden px-2 py-2 align-top lg:table-cell">
+                                <span
+                                  aria-label={proposedVoucherType ? `Tally voucher type: ${proposedVoucherType}` : undefined}
+                                  className={`block text-[10px] font-extrabold leading-[13px] ${
+                                    proposedVoucherType === "Receipt"
+                                      ? "text-emerald-700"
+                                      : proposedVoucherType === "Payment"
+                                        ? "text-red-700"
+                                        : "text-sky-700"
+                                  }`}
+                                  title={proposedVoucherType ? `Will post as ${proposedVoucherType} voucher` : undefined}
+                                >
+                                  {proposedVoucherType || "-"}
+                                </span>
+                                <span className="mt-0.5 block truncate text-[8px] font-bold uppercase text-slate-500">
+                                  {mode || "-"}
+                                </span>
+                              </td>
+                              <td className="hidden px-2 py-2 align-top text-[9px] font-bold leading-[12px] text-slate-600 xl:table-cell" title={reference}>
+                                <span className="block truncate">{reference || "-"}</span>
+                              </td>
+                              <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-red-600 md:table-cell">
                                 {debit || "-"}
                               </td>
-                              <td className="px-3 py-2.5 text-right text-[12px] font-extrabold text-emerald-700">
+                              <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-emerald-700 md:table-cell">
                                 {credit || "-"}
                               </td>
+                              <td className={`px-2 py-2 align-top text-right text-[10px] font-extrabold leading-[14px] tabular-nums md:hidden ${debit ? "text-red-600" : "text-emerald-700"}`}>
+                                {debit || credit || "-"}
+                                <span className="ml-0.5 text-[7px] font-bold uppercase text-slate-400">{debit ? "Dr" : credit ? "Cr" : ""}</span>
+                              </td>
                               <td
-                                className={`px-3 py-2.5 align-top ${
+                                className={`hidden px-3 py-2 align-top md:table-cell ${
                                   !showLedgerSelect && !statementReviewLocked
                                     ? "cursor-pointer outline-none transition hover:bg-[#fbf7f1] focus-visible:bg-[#fbf7f1] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-300"
+                                    : ""
+                                } ${
+                                  highlightedReviewAction === "ledger"
+                                    ? "relative group-data-[active=true]:ring-2 group-data-[active=true]:ring-inset group-data-[active=true]:ring-[#ad7617]"
                                     : ""
                                 }`}
                                 onClick={() => {
                                   if (showLedgerSelect || statementReviewLocked) return;
+                                  setReviewActionStage("ledger");
                                   setEditingLedgerIds(new Set([transaction.id]));
                                 }}
                                 onKeyDown={(event) => {
                                   if (showLedgerSelect || statementReviewLocked) return;
                                   if (event.key === "Enter" || event.key === " ") {
                                     event.preventDefault();
+                                    setReviewActionStage("ledger");
                                     setEditingLedgerIds(new Set([transaction.id]));
                                   }
                                 }}
@@ -7256,6 +7635,7 @@ export function BankStatementsPage() {
                                     }}
                                     onChange={(selection) => {
                                       updateLedgerSelection(transaction.id, selection);
+                                      setReviewActionStage("posting");
                                       setEditingLedgerIds((current) => {
                                         const next = new Set(current);
                                         next.delete(transaction.id);
@@ -7266,29 +7646,34 @@ export function BankStatementsPage() {
                                   />
                                 ) : (
                                   <div className="block max-w-full text-left">
-                                    <span className="block line-clamp-2 whitespace-normal break-words text-[12px] font-bold leading-4 text-[#1a1a1a]" title={ledgerDisplayName}>
+                                    <span className="block truncate text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]" title={ledgerDisplayName}>
                                       {ledgerDisplayName}
                                     </span>
-                                    <span className="mt-0.5 block truncate text-[10px] font-semibold leading-[13px] text-slate-500">
-                                      {getLedgerGroupLabel(transaction, ledgerMasters)}
+                                    <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[8px] font-bold leading-[11px] text-slate-500">
+                                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${ledgerMatchStatus === "Ledger matched" ? "bg-emerald-500" : "bg-amber-500"}`} />
+                                      <span className="truncate">{ledgerGroupLabel} · {ledgerMatchStatus}</span>
                                     </span>
                                   </div>
                                 )}
                               </td>
-                              <td className="px-3 py-2.5 align-middle">
-                                <span className={`inline-flex min-h-5 items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${ledgerMatchStatusClass}`}>
-                                  {ledgerMatchStatus}
-                                </span>
-                              </td>
-                              <td className="px-3 py-2.5">
+                              <td
+                                className={`px-2 py-2 align-top sm:px-3 ${
+                                  highlightedReviewAction !== "ledger"
+                                    ? "relative group-data-[active=true]:ring-2 group-data-[active=true]:ring-inset group-data-[active=true]:ring-[#ad7617]"
+                                    : ""
+                                }`}
+                              >
                                 {tallyPresence?.status === "found" ? (
                                   <button
-                                    className="inline-flex min-w-0 max-w-full flex-col items-start gap-1 rounded-xl border border-transparent px-2 py-1 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
-                                    onClick={() => setOutgoingReviewTransactionId(transaction.id)}
+                                    className="flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
+                                    onClick={() => {
+                                      setReviewActionStage("posting");
+                                      setOutgoingReviewTransactionId(transaction.id);
+                                    }}
                                     title="View matching Tally voucher details"
                                     type="button"
                                   >
-                                    <span className={`inline-flex min-h-5 self-start items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${
+                                    <span className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${
                                       tallyPresence.duplicateInTally
                                         ? "border-amber-250 bg-amber-50 text-amber-800"
                                         : "border-emerald-250 bg-emerald-50 text-emerald-800"
@@ -7299,7 +7684,7 @@ export function BankStatementsPage() {
                                           ? "Posted"
                                           : "Already in Tally"}
                                     </span>
-                                    <span className="block max-w-full truncate text-[9px] font-semibold leading-[13px] text-slate-500" title={tallyPresence.reason}>
+                                    <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={tallyPresence.reason}>
                                       {tallyPresence.duplicateInTally
                                         ? `Tally vouchers ${tallyPresence.matches?.map((match) => match.voucherNumber).filter(Boolean).join(", ") || "need review"}`
                                         : tallyPresence.voucherNumber
@@ -7311,22 +7696,25 @@ export function BankStatementsPage() {
                                   </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
                                   <button
-                                    className={`inline-flex min-w-0 max-w-full flex-col items-start gap-1 rounded-xl border border-transparent px-2 py-1 text-left transition ${
+                                    className={`flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition ${
                                       statementReviewDrawerLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
                                     }`}
                                     onClick={() => {
-                                      if (!statementReviewDrawerLocked) setOutgoingReviewTransactionId(transaction.id);
+                                      if (!statementReviewDrawerLocked) {
+                                        setReviewActionStage("posting");
+                                        setOutgoingReviewTransactionId(transaction.id);
+                                      }
                                     }}
                                     title="Review outgoing payment check"
                                     type="button"
                                   >
                                     <span
-                                      className={`inline-flex min-h-5 self-start items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getOutgoingVerificationClass(outgoingVerification)}`}
+                                      className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getOutgoingVerificationClass(outgoingVerification)}`}
                                     >
                                       {getOutgoingVerificationLabel(outgoingVerification)}
                                     </span>
                                     <span
-                                      className="block max-w-full truncate text-[9px] font-semibold leading-[13px] text-slate-500"
+                                      className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500"
                                       title={outgoingVerification?.reason}
                                     >
                                       {getOutgoingVerificationSubtext(outgoingVerification)}
@@ -7334,44 +7722,48 @@ export function BankStatementsPage() {
                                   </button>
                                 ) : (
                                   <button
-                                    className={`inline-flex min-w-0 max-w-full flex-col items-start gap-1 rounded-xl border border-transparent px-2 py-1 text-left transition ${
+                                    className={`flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition ${
                                       statementReviewDrawerLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
                                     }`}
                                     onClick={() => {
-                                      if (!statementReviewDrawerLocked) setBillAllocationReviewTransactionId(transaction.id);
+                                      if (!statementReviewDrawerLocked) {
+                                        setReviewActionStage("posting");
+                                        setBillAllocationReviewTransactionId(transaction.id);
+                                      }
                                     }}
                                     title="Review bill allocation"
                                     type="button"
                                   >
                                     <span
-                                      className={`inline-flex min-h-5 self-start items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getBillAllocationBadgeClass(transaction, ledgerMasters, billAllocation)}`}
+                                      className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getBillAllocationBadgeClass(transaction, ledgerMasters, billAllocation)}`}
                                     >
                                       {getBillAllocationBadgeText(transaction, ledgerMasters, billAllocation)}
                                     </span>
                                     {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters) ? (
-                                      <span className="block max-w-full truncate text-[9px] font-semibold leading-[13px] text-slate-500" title={billAllocation?.reason || "Bill matching is not required for this ledger."}>
+                                      <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={billAllocation?.reason || "Bill matching is not required for this ledger."}>
                                         {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters)}
                                       </span>
                                     ) : null}
                                   </button>
                                 )}
                               </td>
-                              <td className="px-2 py-2.5 text-right align-top">
+                              <td className="sticky right-0 border-l border-[#e5ddd0] bg-white px-1 py-2 text-center align-top group-hover:bg-[#fff9e8] group-data-[active=true]:bg-[#fff4d6]">
                                 <button
                                   data-ledger-editor-toggle
-                                  className={`inline-flex h-7 w-7 items-center justify-center rounded-lg transition ${
+                                  className={`inline-flex h-7 w-7 items-center justify-center rounded-md transition ${
                                     isEditingLedger
                                       ? "bg-[#2d2d2d] text-white hover:bg-[#1a1a1a]"
-                                      : "border border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                                      : "text-[#6f6256] hover:bg-[#efe7dc] hover:text-[#1a1a1a]"
                                   }`}
-                                  onClick={() =>
+                                  onClick={() => {
+                                    setReviewActionStage("ledger");
                                     setEditingLedgerIds((current) => {
                                       const next = new Set(current);
-                                       if (next.has(transaction.id)) next.delete(transaction.id);
-                                       else return new Set([transaction.id]);
-                                       return next;
-                                    })
-                                  }
+                                      if (next.has(transaction.id)) next.delete(transaction.id);
+                                      else return new Set([transaction.id]);
+                                      return next;
+                                    });
+                                  }}
                                   disabled={statementReviewLocked}
                                   title={isEditingLedger ? "Close ledger selection" : "Change ledger"}
                                   type="button"
@@ -7387,7 +7779,7 @@ export function BankStatementsPage() {
                   </table>
                 </div>
 
-                <div className="flex h-11 items-center justify-between border-t border-[#e5ddd0] px-4 text-xs font-semibold text-slate-500">
+                <div className="flex min-h-11 flex-col gap-2 border-t border-[#e5ddd0] px-2 py-2 text-xs font-semibold text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-4">
                   <div className="flex items-center gap-2">
                     <span className="text-slate-400 font-medium">Rows per page</span>
                     <select
@@ -7405,7 +7797,7 @@ export function BankStatementsPage() {
                       ))}
                     </select>
                   </div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex max-w-full flex-wrap items-center justify-end gap-2 sm:gap-3">
                     <span className="text-slate-400">
                       Showing {reviewRangeStart}-{reviewRangeEnd} of {filteredTransactions.length}
                       {ignoredStatementRowCount > 0
@@ -7441,24 +7833,54 @@ export function BankStatementsPage() {
                 <div className="fixed inset-0 z-50 flex justify-end bg-black/20">
                   <button
                     aria-label="Close bill allocation review"
-                    className="absolute inset-0 cursor-default"
-                    onClick={() => closeBillAllocationReview(false, true)}
+                    className="absolute inset-0 z-0 cursor-default"
+                    onClick={() => closeBillAllocationReview(true)}
                     type="button"
                   />
-                  <aside className="relative flex h-full w-full max-w-[720px] flex-col border-l border-[#e5ddd0] bg-[#fcfbfa] shadow-2xl">
-                    <div className="flex items-start justify-between border-b border-[#e5ddd0] bg-white px-5 py-4">
-                      <div>
-                        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                          Bill Allocation
+                  <aside className="relative z-10 flex h-full w-full max-w-[720px] flex-col border-l border-[#aebfca] bg-white shadow-2xl">
+                    <header className="border-b border-[#b8cad5]">
+                      <div className="flex min-h-8 items-center justify-between gap-2 bg-[#d8eaf4] px-4 py-1 text-[#27485d]">
+                        <span className="text-[9px] font-extrabold uppercase tracking-[0.12em]">Bill Allocation</span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            className="h-6 px-2 text-[8px] font-extrabold uppercase tracking-wide transition hover:bg-white/60 disabled:opacity-35"
+                            disabled={billAllocationReviewIndex <= 0}
+                            onClick={() => openAdjacentBillAllocation(-1)}
+                            type="button"
+                          >
+                            Previous
+                          </button>
+                          <button
+                            className="h-6 px-2 text-[8px] font-extrabold uppercase tracking-wide transition hover:bg-white/60 disabled:opacity-35"
+                            disabled={
+                              billAllocationReviewIndex < 0 ||
+                              billAllocationReviewIndex >= partyBillAllocationReviewTransactions.length - 1
+                            }
+                            onClick={() => openAdjacentBillAllocation(1)}
+                            type="button"
+                          >
+                            Next
+                          </button>
+                          <button
+                            aria-label="Close"
+                            className="inline-flex h-6 w-6 items-center justify-center transition hover:bg-white/60"
+                            onClick={() => closeBillAllocationReview()}
+                            title="Close"
+                            type="button"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
                         </div>
-                        <h2 className="mt-1 text-xl font-extrabold text-[#1a1a1a]">
+                      </div>
+                      <div className="bg-white px-4 py-2.5">
+                        <h2 className="text-[15px] font-extrabold leading-5 text-[#171717]">
                           {getTransactionPartyTitle(billAllocationReviewTransaction)}
                         </h2>
-                          <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] font-semibold text-slate-500">
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-bold leading-4 text-[#61788a]">
                           <span>
                             {formatShortDate(billAllocationReviewTransaction.transactionDate)}
                           </span>
-                          <span>-</span>
+                          <span aria-hidden="true">·</span>
                           <span>
                             {formatCurrencyAmount(
                               Math.max(
@@ -7469,46 +7891,15 @@ export function BankStatementsPage() {
                           </span>
                           {getTransactionReference(billAllocationReviewTransaction) ? (
                             <>
-                              <span>-</span>
-                              <span>{getTransactionReference(billAllocationReviewTransaction)}</span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono">{getTransactionReference(billAllocationReviewTransaction)}</span>
                             </>
                           ) : null}
                         </div>
                       </div>
-                      <div className="flex items-center gap-1">
-                        <Button
-                          className="h-9 rounded-xl px-3 text-[11px] font-bold"
-                          disabled={billAllocationReviewIndex <= 0}
-                          onClick={() => openAdjacentBillAllocation(-1)}
-                          type="button"
-                          variant="outline"
-                        >
-                          Previous
-                        </Button>
-                        <Button
-                          className="h-9 rounded-xl px-3 text-[11px] font-bold"
-                          disabled={
-                            billAllocationReviewIndex < 0 ||
-                            billAllocationReviewIndex >= partyBillAllocationReviewTransactions.length - 1
-                          }
-                          onClick={() => openAdjacentBillAllocation(1)}
-                          type="button"
-                          variant="outline"
-                        >
-                          Next
-                        </Button>
-                        <button
-                          className="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-900 transition-colors"
-                          onClick={() => closeBillAllocationReview()}
-                          title="Close"
-                          type="button"
-                        >
-                          <X className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </div>
+                    </header>
 
-                    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+                    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
                       <div className="hidden grid gap-3 sm:grid-cols-2">
                         {[
                           [
@@ -7539,36 +7930,38 @@ export function BankStatementsPage() {
                       </div>
 
                       {!billAllocationReviewDraft ? (
-                        <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] font-semibold text-amber-900">
-                          Match bills first. This row has no allocation draft yet.
+                        <div className="border-y border-[#cfdbe2] bg-[#f4f8fb] px-3 py-2.5 text-[10px] font-bold leading-4 text-[#3f5d70]">
+                          {tallyCheckAttempted
+                            ? "Bill allocation data is unavailable for this row. Recheck Tally or review the selected ledger."
+                            : "Run Check Tally Matches to load this ledger’s open bills before allocating the entry."}
                         </div>
                       ) : (
                         <>
-                          <div className="mt-1 rounded-2xl bg-[#242722] px-4 py-3 text-white shadow-[0_8px_22px_rgba(36,39,34,0.12)]">
+                          <div className="border-y border-[#b8cad5] bg-[#f4f8fb] px-3 py-2.5 text-[#172f3e]">
                             <div className="flex flex-wrap items-end justify-between gap-3">
                               <div>
-                                <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-white/55">
+                                <div className="text-[8px] font-extrabold uppercase tracking-[0.14em] text-[#7890a1]">
                                   {billAllocationReviewIsPayment ? "Payment" : "Receipt"}
                                 </div>
-                                <div className="mt-0.5 text-xl font-extrabold tracking-tight">
+                                <div className="mt-0.5 text-[16px] font-extrabold tracking-tight">
                                   {formatCurrencyAmount(billAllocationReviewDraft.receiptAmount)}
                                 </div>
                               </div>
                               <div className="flex items-center gap-5 text-right">
                                 <div>
-                                  <div className="text-[9px] font-bold uppercase tracking-wider text-white/45">Bills</div>
-                                <div className="mt-0.5 text-xs font-bold">
+                                  <div className="text-[8px] font-extrabold uppercase tracking-wider text-[#7890a1]">Bills</div>
+                                <div className="mt-0.5 text-[10px] font-extrabold">
                                     {formatCurrencyAmount(billAllocationReviewDraft.totalAllocatedAmount - billAllocationReviewDraft.newAdvanceAmount)}
                                   </div>
                                 </div>
                                 <div>
-                                  <div className="text-[9px] font-bold uppercase tracking-wider text-white/45">Advance</div>
-                                <div className="mt-0.5 text-xs font-bold">{formatCurrencyAmount(billAllocationReviewDraft.newAdvanceAmount)}</div>
+                                  <div className="text-[8px] font-extrabold uppercase tracking-wider text-[#7890a1]">Advance</div>
+                                <div className="mt-0.5 text-[10px] font-extrabold">{formatCurrencyAmount(billAllocationReviewDraft.newAdvanceAmount)}</div>
                                 </div>
                                 <span className={`rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-wider ${
                                   Math.abs(billAllocationReviewDraft.unallocatedAmount) < 0.01
-                                    ? "bg-emerald-400/15 text-emerald-200"
-                                    : "bg-amber-300/15 text-amber-200"
+                                    ? "bg-emerald-100 text-emerald-800"
+                                    : "bg-amber-100 text-amber-800"
                                 }`}>
                                   {Math.abs(billAllocationReviewDraft.unallocatedAmount) < 0.01
                                     ? "Balanced"
@@ -7578,9 +7971,9 @@ export function BankStatementsPage() {
                                 </span>
                               </div>
                             </div>
-                            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10">
+                            <div className="mt-2.5 h-1 overflow-hidden bg-[#d6e2e9]">
                               <div
-                                className={`h-full rounded-full transition-[width] duration-300 ${
+                                className={`h-full transition-[width] duration-300 ${
                                   billAllocationReviewDraft.unallocatedAmount < -0.005 ? "bg-amber-300" : "bg-emerald-400"
                                 }`}
                                 style={{
@@ -7593,7 +7986,7 @@ export function BankStatementsPage() {
                           </div>
 
                           {billAllocationReviewDraft.requiresUserReview ? (
-                            <div className="mt-2 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold text-amber-900">
+                            <div className="mt-2 flex items-center gap-2 border-y border-amber-200 bg-amber-50 px-3 py-2 text-[10px] font-bold text-amber-900">
                               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                               <span>
                                 {billAllocationReviewDraft.existingAdvances.length > 0
@@ -7656,7 +8049,7 @@ export function BankStatementsPage() {
 
                           <section className="mt-3">
                             {billAllocationReviewDraft.candidateBills.length === 0 ? (
-                            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#e5ddd0] bg-[#fbf8f3] px-3 py-2.5">
+                            <div className="flex flex-wrap items-center justify-between gap-3 border-y border-[#cfdbe2] bg-[#f8fbfc] px-3 py-2.5">
                                 <div>
                                   <h3 className="text-xs font-extrabold text-[#1a1a1a]">New advance</h3>
                                   <p className="mt-0.5 text-[9px] font-semibold text-slate-400">No open bills in Tally</p>
@@ -7719,7 +8112,7 @@ export function BankStatementsPage() {
                               </div>
                             </div>
                             {confirmFullAdvance ? (
-                            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] font-semibold text-amber-900">
+                            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-y border-amber-200 bg-amber-50 px-3 py-2.5 text-[10px] font-semibold text-amber-900">
                                 <span>Open bills exist. This will intentionally leave them unpaid and record the complete {billAllocationReviewIsPayment ? "payment" : "receipt"} as a new advance.</span>
                                 <div className="flex gap-2">
                                   <Button className="h-8 px-3 text-[11px] font-bold" onClick={() => setConfirmFullAdvance(false)} type="button" variant="outline">
@@ -7736,7 +8129,7 @@ export function BankStatementsPage() {
                                 <label className="relative min-w-[260px] flex-1">
                                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                                 <input
-                                  className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pl-10 pr-3 text-[10px] font-semibold outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                                  className="h-8 w-full rounded-md border border-[#cfdbe2] bg-white pl-9 pr-3 text-[10px] font-semibold outline-none transition focus:border-[#587286] focus:ring-2 focus:ring-[#d8eaf4]"
                                   onChange={(event) => setBillAllocationSearch(event.target.value)}
                                   placeholder="Search bill reference, voucher, date, or amount"
                                   type="search"
@@ -7751,14 +8144,14 @@ export function BankStatementsPage() {
                                 ) : null}
                               </div>
                             </div>
-                            <div className="mt-2 overflow-x-auto rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_8px_22px_rgba(66,53,37,0.05)]">
+                            <div className="mt-2 overflow-x-auto border-y border-[#cfdbe2] bg-white">
                               <table className="w-full min-w-[560px] text-left text-xs">
                                 <thead className="bg-[#fcfbfa] text-[9px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                   <tr>
                                     <th className="px-3 py-2">Bill Reference</th>
                                     <th className="px-3 py-2 text-right">Pending</th>
                                     <th className="px-3 py-2 text-right">Allocate</th>
-                                    <th className="w-[100px] px-3 py-2 text-right"></th>
+                                    <th className="w-[150px] px-3 py-2 text-right"></th>
                                   </tr>
                                 </thead>
                                 <tbody className="divide-y divide-[#eee7dc] text-slate-600 font-semibold">
@@ -7780,6 +8173,9 @@ export function BankStatementsPage() {
                                         billAllocationReviewDraft.allocations.find(
                                           (line) => line.referenceType === "Agst Ref" && line.referenceName === bill.referenceName
                                         )?.allocatedAmount ?? 0;
+                                      const canUseRemaining =
+                                        billAllocationReviewDraft.unallocatedAmount > 0.005 &&
+                                        bill.pendingAmount - currentAmount > 0.005;
 
                                       return (
                                         <tr className={currentAmount > 0 ? "bg-emerald-50/45" : "transition-colors hover:bg-[#fcfaf7]"} key={bill.referenceName}>
@@ -7806,22 +8202,37 @@ export function BankStatementsPage() {
                                             />
                                           </td>
                                           <td className="px-3 py-2.5 text-right">
-                                            <Button
-                                              className={`h-7 rounded-lg px-2 text-[10px] font-bold ${
-                                                currentAmount > 0
-                                                  ? "border-0 bg-transparent text-red-700 shadow-none hover:bg-red-50"
-                                                  : "border-[#e5ddd0] bg-white text-[#5a5046]"
-                                              }`}
-                                              onClick={() =>
-                                                currentAmount > 0
-                                                  ? updateManualBillAmount(billAllocationReviewTransaction, bill.referenceName, "0")
-                                                  : allocateRemainingToBill(billAllocationReviewTransaction, bill.referenceName)
-                                              }
-                                              type="button"
-                                              variant="outline"
-                                            >
-                                              {currentAmount > 0 ? "Remove" : "Use remaining"}
-                                            </Button>
+                                            <div className="flex items-center justify-end gap-1.5">
+                                              {canUseRemaining ? (
+                                                <button
+                                                  className="h-7 whitespace-nowrap rounded-md border border-[#9fb8c7] bg-[#eaf3f8] px-2 text-[9px] font-extrabold text-[#27485d] transition hover:bg-[#d8eaf4]"
+                                                  onClick={() =>
+                                                    allocateRemainingToBill(
+                                                      billAllocationReviewTransaction,
+                                                      bill.referenceName
+                                                    )
+                                                  }
+                                                  type="button"
+                                                >
+                                                  Use remaining
+                                                </button>
+                                              ) : null}
+                                              {currentAmount > 0 ? (
+                                                <button
+                                                  className="h-7 px-1.5 text-[9px] font-extrabold text-red-700 transition hover:bg-red-50"
+                                                  onClick={() =>
+                                                    updateManualBillAmount(
+                                                      billAllocationReviewTransaction,
+                                                      bill.referenceName,
+                                                      "0"
+                                                    )
+                                                  }
+                                                  type="button"
+                                                >
+                                                  Remove
+                                                </button>
+                                              ) : null}
+                                            </div>
                                           </td>
                                         </tr>
                                       );
@@ -7857,7 +8268,7 @@ export function BankStatementsPage() {
                                 </span>
                               </div>
                               {billAllocationReviewDraft.existingAdvances.length === 1 ? (
-                                <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#e5ddd0] bg-white px-3 py-2.5 text-[11px] font-semibold text-slate-600">
+                                <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-y border-[#cfdbe2] bg-white px-3 py-2.5 text-[10px] font-semibold text-slate-600">
                                   <div className="min-w-0">
                                     <div className="truncate font-bold text-[#1a1a1a]">
                                       {billAllocationReviewDraft.existingAdvances[0].referenceName}
@@ -7873,7 +8284,7 @@ export function BankStatementsPage() {
                                   </div>
                                 </div>
                               ) : (
-                                <div className="mt-2 overflow-x-auto rounded-xl border border-[#e5ddd0] bg-white">
+                                <div className="mt-2 overflow-x-auto border-y border-[#cfdbe2] bg-white">
                                   <table className="w-full min-w-[420px] text-left text-xs">
                                     <thead className="bg-[#fcfbfa] text-[9px] font-bold uppercase tracking-wider text-slate-400">
                                       <tr>
@@ -7903,10 +8314,14 @@ export function BankStatementsPage() {
                         </>
                       )}
                     </div>
-                    <div className="flex items-center justify-end gap-2 border-t border-[#e5ddd0] bg-white px-5 py-3">
+                    <div className="flex items-center justify-between gap-2 border-t border-[#b8cad5] bg-[#eaf3f8] px-4 py-2">
+                        <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#61788a]">
+                          Allocate transaction
+                        </span>
+                        <div className="flex items-center gap-1.5">
                         {billAllocationReviewDraft?.requiresUserReview ? (
                           <Button
-                            className="h-9 rounded-xl text-[11px] font-bold"
+                            className="h-8 rounded-md border-[#b8cad5] bg-white px-3 text-[10px] font-bold"
                             onClick={() => closeBillAllocationReview(true)}
                             type="button"
                             variant="outline"
@@ -7915,17 +8330,17 @@ export function BankStatementsPage() {
                           </Button>
                         ) : null}
                         <Button
-                          className="h-9 rounded-xl bg-[#2d2d2d] text-[11px] font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a]"
+                          autoFocus={Boolean(billAllocationReviewDraft && !billAllocationReviewDraft.requiresUserReview)}
+                          className="h-8 rounded-md bg-[#263b47] px-3 text-[10px] font-bold text-white shadow-none transition hover:bg-[#172a35]"
                           disabled={!billAllocationReviewDraft || billAllocationReviewDraft.requiresUserReview}
-                          onClick={() => closeAndOpenNextBillIssue()}
+                          onClick={() => completePostingReview(billAllocationReviewTransaction.id)}
                           type="button"
                         >
-                          {[...blockingReceiptBillAllocationTransactions, ...blockingPaymentBillAllocationTransactions].some(
-                            (transaction) => transaction.id !== billAllocationReviewTransactionId
-                          )
-                            ? "Save & next"
+                          {(filteredTransactionIndexById.get(billAllocationReviewTransaction.id) ?? -1) < filteredTransactions.length - 1
+                            ? "Done & next"
                             : "Done"}
                         </Button>
+                        </div>
                     </div>
                   </aside>
                 </div>
@@ -7935,47 +8350,50 @@ export function BankStatementsPage() {
                 <div className="fixed inset-0 z-50 flex justify-end bg-black/20">
                   <button
                     aria-label="Close Tally match details"
-                    className="absolute inset-0 cursor-default"
+                    className="absolute inset-0 z-0 cursor-default"
                     onClick={() => setOutgoingReviewTransactionId(null)}
                     type="button"
                   />
-                  <aside className="relative flex h-full w-full max-w-[680px] flex-col border-l border-[#e5ddd0] bg-[#fcfbfa] shadow-2xl">
-                    <div className="flex items-start justify-between border-b border-[#e5ddd0] bg-white px-5 py-4">
-                      <div>
-                        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  <aside className="relative z-10 flex h-full w-full max-w-[680px] flex-col border-l border-[#aebfca] bg-white shadow-2xl">
+                    <header className="border-b border-[#b8cad5]">
+                      <div className="flex h-8 items-center justify-between bg-[#d8eaf4] px-4 text-[9px] font-extrabold uppercase tracking-[0.12em] text-[#27485d]">
+                        <span>
                           {tallyResultReviewDraft?.status === "found" || tallyResultReviewDraft?.status === "ambiguous"
                             ? "Tally Match Details"
                             : tallyResultReviewIsIncoming
                               ? "Receipt Check"
                               : "Payment Check"}
-                        </div>
-                        <h2 className="mt-1 text-xl font-extrabold text-[#1a1a1a]">
+                        </span>
+                        <button
+                          aria-label="Close"
+                          className="inline-flex h-6 w-6 items-center justify-center text-[#587286] transition hover:bg-white/60 hover:text-[#172f3e]"
+                          onClick={() => setOutgoingReviewTransactionId(null)}
+                          title="Close"
+                          type="button"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="bg-white px-4 py-2.5">
+                        <h2 className="text-[15px] font-extrabold leading-5 text-[#171717]">
                           {getTransactionPartyTitle(outgoingReviewTransaction)}
                         </h2>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-500">
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-bold leading-4 text-[#61788a]">
                           <span>{formatShortDate(outgoingReviewTransaction.transactionDate)}</span>
-                          <span>-</span>
+                          <span aria-hidden="true">·</span>
                           <span>{formatCurrencyAmount(tallyResultReviewAmount)}</span>
                           {getTransactionReference(outgoingReviewTransaction) ? (
                             <>
-                              <span>-</span>
-                              <span>{getTransactionReference(outgoingReviewTransaction)}</span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono">{getTransactionReference(outgoingReviewTransaction)}</span>
                             </>
                           ) : null}
                         </div>
                       </div>
-                      <button
-                        className="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-900 transition-colors"
-                        onClick={() => setOutgoingReviewTransactionId(null)}
-                        title="Close"
-                        type="button"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </div>
+                    </header>
 
-                    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-                      <div className="mb-4 grid gap-3 rounded-xl border border-[#e5ddd0] bg-white p-4 sm:grid-cols-2">
+                    <div className="min-h-0 flex-1 overflow-y-auto">
+                      <div className="grid border-b border-[#cfdbe2] bg-[#fffefb] sm:grid-cols-2">
                         {[
                           [
                             getEffectiveTransactionDateLabel(outgoingReviewTransaction),
@@ -7988,48 +8406,54 @@ export function BankStatementsPage() {
                           ["Bank Ledger", bankLedgerName || "-"],
                           ["Will Post As", tallyResultReviewPostingVoucherType],
                         ].map(([label, value]) => (
-                          <div key={label} className="border-b border-[#e5ddd0] pb-2">
-                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                          <div key={label} className="min-w-0 border-b border-[#e0e7eb] px-4 py-2 sm:border-r sm:even:border-r-0">
+                            <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#7890a1]">
                               {label}
                             </div>
-                            <div className="mt-1 text-sm font-extrabold text-[#1a1a1a]">{value}</div>
+                            <div className="mt-0.5 break-words text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]">{value}</div>
                           </div>
                         ))}
                       </div>
 
-                      <div className="rounded-xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.01)]">
-                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${getOutgoingVerificationClass(tallyResultReviewDraft)}`}>
-                              {getOutgoingVerificationLabel(tallyResultReviewDraft)}
+                      <section className="border-b border-[#cfdbe2] bg-[#f4f8fb] px-4 py-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#dbe5eb] pb-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider ${
+                              tallyResultReviewIsDirectReceipt
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                                : getOutgoingVerificationClass(tallyResultReviewDraft)
+                            }`}>
+                              {tallyResultReviewIsDirectReceipt
+                                ? "Direct receipt"
+                                : getOutgoingVerificationLabel(tallyResultReviewDraft)}
                             </span>
                             {tallyResultReviewDraft?.status === "found" && !tallyResultReviewDraft.duplicateInTally ? (
-                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider text-emerald-800">
                                 No action required
                               </span>
                             ) : null}
-                            {tallyResultReviewDraft?.status === "missing" ? (
-                              <span className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-800">
+                            {tallyResultReviewDraft?.status === "missing" || tallyResultReviewIsDirectReceipt ? (
+                              <span className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider text-blue-800">
                                 Ready to post as {tallyResultReviewPostingVoucherType}
                               </span>
                             ) : null}
                           </div>
-                          <span className="text-xs font-semibold text-slate-400">
+                          <span className="text-[9px] font-bold text-slate-400">
                             Ledger: {outgoingReviewTransaction.selectedLedgerName || "-"}
                           </span>
                         </div>
-                        <p className="mt-3 text-sm leading-6 text-slate-600">
+                        <p className="mt-2 text-[11px] font-semibold leading-4 text-slate-600">
                           {tallyResultReviewReason}
                         </p>
-                      </div>
+                      </section>
 
-                      <section className={tallyResultReviewEvidence.length ? "mt-5" : "hidden"}>
+                      <section className={tallyResultReviewEvidence.length ? "px-4 py-3" : "hidden"}>
                         <div className="flex flex-wrap items-end justify-between gap-2">
                           <div>
-                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                            <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                               Tally evidence
                             </div>
-                            <h3 className="mt-1 text-sm font-bold text-[#1a1a1a]">
+                            <h3 className="mt-0.5 text-[11px] font-extrabold text-[#1a1a1a]">
                               {tallyResultReviewDraft?.status === "found"
                                 ? tallyResultReviewDraft.duplicateInTally
                                   ? "Matching Tally vouchers"
@@ -8038,7 +8462,7 @@ export function BankStatementsPage() {
                             </h3>
                           </div>
                           {tallyResultReviewDraft?.status === "found" ? (
-                            <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${
+                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider ${
                               tallyResultReviewDraft.duplicateInTally
                                 ? "border-amber-200 bg-amber-50 text-amber-800"
                                 : "border-emerald-200 bg-emerald-50 text-emerald-800"
@@ -8047,45 +8471,45 @@ export function BankStatementsPage() {
                             </span>
                           ) : null}
                         </div>
-                        <div className="mt-2 space-y-3">
+                        <div className="mt-2 border-t border-[#cfdbe2]">
                           {tallyResultReviewEvidence.length ? (
                             tallyResultReviewEvidence.map((match, index) => (
                               <div
                                 key={`${match.masterId || match.voucherNumber || index}`}
-                                className="rounded-xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.01)]"
+                                className="border-b border-[#cfdbe2] bg-white py-3"
                               >
                                 <div className="flex flex-wrap items-start justify-between gap-3">
                                   <div>
-                                    <div className="text-sm font-bold text-[#1a1a1a]">
+                                    <div className="text-[11px] font-extrabold text-[#1a1a1a]">
                                       {match.voucherNumber
                                         ? `Voucher ${match.voucherNumber}`
                                         : match.masterId
                                           ? `Voucher ${match.masterId}`
                                           : `Candidate ${index + 1}`}
                                     </div>
-                                    <div className="mt-1 text-xs font-semibold text-slate-400">
+                                    <div className="mt-0.5 text-[9px] font-semibold text-slate-400">
                                       {[match.voucherType, match.date ? formatShortDate(match.date) : null, match.reference]
                                         .filter(Boolean)
                                         .join(" - ") || "Voucher details from Tally"}
                                     </div>
                                   </div>
                                   {typeof match.score === "number" ? (
-                                    <span className="inline-flex items-center gap-1.5 rounded-full border border-[#e5ddd0] bg-[#faf8f4] px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                                    <span className="inline-flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-[#faf8f4] px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider text-slate-600">
                                       Score: {match.score}
                                     </span>
                                   ) : null}
                                 </div>
-                                <div className="mt-4 grid gap-2 sm:grid-cols-2 border-t border-slate-100 pt-3">
+                                <div className="mt-3 grid gap-2 border-t border-slate-100 pt-2 sm:grid-cols-2">
                                   <div>
-                                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                    <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                       Party / Ledger
                                     </div>
-                                    <div className="mt-1 text-xs font-extrabold text-[#1a1a1a]">
+                                    <div className="mt-0.5 text-[10px] font-extrabold text-[#1a1a1a]">
                                       {match.partyLedgerName || match.ledgerNames[0] || "-"}
                                     </div>
                                   </div>
                                   <div>
-                                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                    <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                       Why it matched
                                     </div>
                                     <div className="mt-1 flex flex-wrap gap-1">
@@ -8093,13 +8517,13 @@ export function BankStatementsPage() {
                                         match.reasons.map((reason) => (
                                           <span
                                             key={reason}
-                                            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800"
+                                            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[8px] font-bold text-amber-800"
                                           >
                                             {reason}
                                           </span>
                                         ))
                                       ) : (
-                                        <span className="text-xs font-semibold text-slate-400">
+                                        <span className="text-[9px] font-semibold text-slate-400">
                                           Unique voucher returned by the live Tally check
                                         </span>
                                       )}
@@ -8109,12 +8533,27 @@ export function BankStatementsPage() {
                               </div>
                             ))
                           ) : (
-                            <div className="rounded-xl border border-[#e5ddd0] bg-white px-4 py-5 text-sm font-semibold text-slate-400 text-center">
+                            <div className="border-b border-[#cfdbe2] bg-white px-3 py-4 text-center text-[10px] font-semibold text-slate-400">
                               No candidate vouchers returned by Tally.
                             </div>
                           )}
                         </div>
                       </section>
+                    </div>
+                    <div className="flex items-center justify-between border-t border-[#b8cad5] bg-[#eaf3f8] px-4 py-2">
+                      <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#61788a]">
+                        Review transaction
+                      </span>
+                      <Button
+                        autoFocus
+                        className="h-8 rounded-md bg-[#263b47] px-3 text-[10px] font-bold text-white shadow-none transition hover:bg-[#172a35]"
+                        onClick={() => completePostingReview(outgoingReviewTransaction.id)}
+                        type="button"
+                      >
+                        {(filteredTransactionIndexById.get(outgoingReviewTransaction.id) ?? -1) < filteredTransactions.length - 1
+                          ? "Done & next"
+                          : "Done"}
+                      </Button>
                     </div>
                   </aside>
                 </div>
@@ -8125,8 +8564,8 @@ export function BankStatementsPage() {
       </div>
 
       {preview ? (
-        <div className="sticky bottom-[calc(4.75rem+env(safe-area-inset-bottom))] md:bottom-0 z-40 w-full border-t border-[#ddd3c5] bg-white/95 px-4 py-2.5 shadow-[0_-4px_20px_rgba(49,39,26,0.08)] backdrop-blur-xl sm:px-8">
-          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2">
+        <div className="sticky bottom-[calc(4.75rem+env(safe-area-inset-bottom))] md:bottom-0 z-40 w-full border-t border-[#ddd3c5] bg-white/95 px-2 py-2.5 shadow-[0_-4px_20px_rgba(49,39,26,0.08)] backdrop-blur-xl">
+          <div className="flex w-full max-w-none flex-wrap items-center justify-between gap-2">
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-1">
               <div className="contents text-[11px] font-bold">
                 <span className={`inline-flex h-6 items-center rounded-full border px-2.5 text-[11px] font-bold ${newReceiptCount > 0 && !statementCompletedCleanly ? "border-blue-200 bg-blue-50 text-blue-800" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
