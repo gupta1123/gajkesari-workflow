@@ -283,7 +283,10 @@ test("zero targeted bills avoids the voucher export", async () => {
   const calls = [];
   const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].tallyType, "Bill");
+  assert.equal(calls[0].filterNames, undefined);
   assert.deepEqual(result.result.openBills, []);
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
   assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
@@ -379,7 +382,7 @@ test("strict bank presence marks same-date amount evidence insufficient for Susp
   assert.equal(result.identityInsufficient, true);
 });
 
-test("statement reconciliation uses one lean export when top-level references match", async () => {
+test("statement reconciliation uses one complete export when top-level references match", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -407,12 +410,12 @@ test("statement reconciliation uses one lean export when top-level references ma
   );
 
   assert.equal(calls.length, 1);
-  assert.doesNotMatch(calls[0].fetchFields, /BankAllocations/);
+  assert.match(calls[0].fetchFields, /BankAllocations/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
 });
 
-test("statement reconciliation fetches bank allocations only for unresolved candidate vouchers", async () => {
+test("statement reconciliation reads bank allocations from the primary export", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -434,19 +437,16 @@ test("statement reconciliation fetches bank allocations only for unresolved cand
     {
       exportCollection: async (_url, options) => {
         calls.push(options);
-        if (calls.length === 1) {
-          return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
-        }
-        return '<ENVELOPE><VOUCHER><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>UTR-123456</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+        return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>UTR-123456</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
       },
     }
   );
 
-  assert.equal(calls.length, 2);
-  assert.match(calls[1].fetchFields, /BankAllocations/);
-  assert.match(calls[1].formulae[0].formula, /\$MasterID = 101/);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].fetchFields, /BankAllocations/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
-  assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 1);
+  assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 0);
+  assert.equal(outcome.result.queryDiagnostics.primaryIncludesBankReferences, true);
 });
 
 test("live statement matching verifies vouchers and fetches bills in one connector operation", async () => {

@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.55";
+const BRIDGE_VERSION = "0.1.56";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -19,7 +19,6 @@ const BACKEND_REQUEST_TIMEOUT_MS = 10_000;
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
-const BANK_REFERENCE_VOUCHER_BATCH_SIZE = 25;
 const CONFIG_DIR = path.join(os.homedir(), ".gajkesari-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
@@ -3579,8 +3578,12 @@ function earliestBillDate(blocks) {
   return dates[0] || null;
 }
 
-async function exportTargetedOpenBillXml(tallyUrl, { companyName, ledgerNames, asOfDate, forceTargeted = false }, exportCollection = exportTallyCollection) {
-  if (!forceTargeted && ledgerNames.length > OPEN_BILL_LEDGER_BATCH_SIZE) {
+async function exportTargetedOpenBillXml(
+  tallyUrl,
+  { companyName, ledgerNames, asOfDate, forceTargeted = false, forceFull = false },
+  exportCollection = exportTallyCollection
+) {
+  if (forceFull || (!forceTargeted && ledgerNames.length > OPEN_BILL_LEDGER_BATCH_SIZE)) {
     const xml = await exportCollection(tallyUrl, {
       collectionName: "Gajkesari Customer Open Bills", tallyType: "Bill",
       fetchFields: "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
@@ -3634,21 +3637,29 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
   const requestedDateFrom = normalizeDateForCompare(commandPayload.dateFrom) || null;
-  const forceTargeted =
-    commandPayload.queryPurpose === "bank_statement_match" && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
+  // A full Bill collection is materially faster in large real-world companies
+  // than Tally formula-filtering a small set of party ledgers. Keep the large
+  // XML local to the connector and return only the requested ledger buckets.
+  const forceFull =
+    commandPayload.queryPurpose === "bank_statement_match" ||
+    commandPayload.queryStrategy === "full_snapshot";
+  const forceTargeted = !forceFull && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   // Tally's local HTTP listener processes reports serially. Concurrent large
   // collection exports can leave one request waiting indefinitely, which
   // previously locked the whole connector cycle and surfaced as a dashboard
   // refresh timeout.
+  const billExportStartedAt = Date.now();
   const billExport = dependencies.billExport || await exportTargetedOpenBillXml(
     tallyUrl,
-    { companyName, ledgerNames, dateFrom: requestedDateFrom, asOfDate, forceTargeted },
+    { companyName, ledgerNames, dateFrom: requestedDateFrom, asOfDate, forceTargeted, forceFull },
     exportCollection
   );
+  const billExportCompletedAt = Date.now();
   const billBlocks = extractBlocks(billExport.xml, "BILL").filter((block) =>
     requestedLedgerByKey.has(normalizeLooseName(billLedgerName(block)))
   );
+  const billFilterCompletedAt = Date.now();
   const fallbackBlocks = billBlocks.filter(openBillBlockRequiresVoucherFallback);
   const fallbackLedgerNames = Array.from(new Set(fallbackBlocks.flatMap((block) => {
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(billLedgerName(block)));
@@ -3769,6 +3780,9 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
         voucherQueryMode: voucherExport.queryMode || "targeted_chunks",
         voucherDateChunkCount: voucherExport.dateChunkCount ?? 0,
         voucherRetrySplitCount: voucherExport.retrySplitCount ?? 0,
+        billExportMs: billExportCompletedAt - billExportStartedAt,
+        billFilterMs: billFilterCompletedAt - billExportCompletedAt,
+        totalMs: Date.now() - billExportStartedAt,
         asOfDate,
       },
     },
@@ -3848,14 +3862,6 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
   };
 }
 
-function buildVoucherMasterIdFormula(masterIds) {
-  return masterIds
-    .map((value) => String(value || "").trim())
-    .filter((value) => /^\d+$/.test(value))
-    .map((value) => `$MasterID = ${value}`)
-    .join(" OR ");
-}
-
 async function fetchBankReconciliationVouchers(
   tallyUrl,
   { companyName, dateFrom, dateTo, bankLedgerName, transactions },
@@ -3865,11 +3871,15 @@ async function fetchBankReconciliationVouchers(
   const startedAt = Date.now();
   const bankEntryFormulaName = "AutodealerBankLedgerEntry";
   const bankVoucherFormulaName = "AutodealerBankVoucher";
+  // The collection is already tightly restricted to one bank ledger and the
+  // statement period. Fetch bank-allocation references with the primary export
+  // so a missing top-level Reference does not trigger another serial Tally
+  // request for the same vouchers.
   const leanXml = await exportCollection(tallyUrl, {
     collectionName: "Gajkesari Bank Statement Reconciliation",
     tallyType: "Voucher",
     fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
     companyName,
     dateFrom,
     dateTo,
@@ -3890,59 +3900,16 @@ async function fetchBankReconciliationVouchers(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
   );
 
-  // Gajkesari-created vouchers expose the UTR in the top-level Reference.
-  // Only read expensive nested bank allocations for same-date/amount
-  // candidates whose exact reference is not already visible.
-  const detailMasterIds = new Set();
-  for (const transaction of transactions) {
-    const referenceNumber = String(transaction.referenceNumber || "").trim();
-    if (normalizeExactReference(referenceNumber).length < 5) continue;
-    const baseCandidates = baseBankTransactionCandidates(vouchers, transaction, bankLedgerName);
-    if (baseCandidates.some(({ voucher }) => voucherHasExactReference(voucher, referenceNumber))) continue;
-    for (const { voucher } of baseCandidates) {
-      if (isNumericMasterId(voucher.masterId)) detailMasterIds.add(String(voucher.masterId));
-    }
-  }
-
-  const detailBatches = chunkValues([...detailMasterIds], BANK_REFERENCE_VOUCHER_BATCH_SIZE);
-  const referenceByMasterId = new Map();
-  for (const [index, masterIds] of detailBatches.entries()) {
-    const masterFilterName = "GajkesariRequestedBankVoucher";
-    const formula = buildVoucherMasterIdFormula(masterIds);
-    if (!formula) continue;
-    const detailXml = await exportCollection(tallyUrl, {
-      collectionName: `Gajkesari Bank Reference Evidence ${index + 1}`,
-      tallyType: "Voucher",
-      fetchFields:
-        "MasterID,Reference,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
-      companyName,
-      dateFrom,
-      dateTo,
-      formulae: [{ name: masterFilterName, formula }],
-      filterNames: [masterFilterName],
-    });
-    for (const voucher of parseVoucherCollection(detailXml)) {
-      if (!voucher.masterId) continue;
-      referenceByMasterId.set(String(voucher.masterId), voucher.bankReferences || []);
-    }
-  }
-
-  for (const voucher of vouchers) {
-    const references = referenceByMasterId.get(String(voucher.masterId || ""));
-    if (references?.length) {
-      voucher.bankReferences = [...new Set([...(voucher.bankReferences || []), ...references])];
-    }
-  }
-
   return {
     vouchers,
     diagnostics: {
       leanExportMs: leanCompletedAt - startedAt,
-      referenceExportMs: Date.now() - leanCompletedAt,
+      referenceExportMs: 0,
       totalMs: Date.now() - startedAt,
       scannedVoucherCount: vouchers.length,
-      detailedVoucherCount: detailMasterIds.size,
-      detailBatchCount: detailBatches.length,
+      detailedVoucherCount: 0,
+      detailBatchCount: 0,
+      primaryIncludesBankReferences: true,
     },
   };
 }
