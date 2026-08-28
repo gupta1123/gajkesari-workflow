@@ -78,7 +78,7 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
     payload,
     phase: operation === "company_check"
     ? "company_check"
-    : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "verify_bank_transaction" || operation === "fetch_customer_open_bills"
+    : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "verify_bank_transaction" || operation === "match_bank_statement" || operation === "fetch_customer_open_bills"
       ? operation
       : operation === "scan"
         ? "scanning"
@@ -140,7 +140,7 @@ async function authenticate(socket, message) {
 async function handleBrowserRequest(socket, message, meta) {
   const requestId = String(message.requestId || randomUUID());
   const operation = String(message.operation ?? "");
-  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'create_debit_note'].includes(operation)) {
+  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'verify_bank_transaction', 'match_bank_statement', 'fetch_customer_open_bills', 'scan', 'create_debit_note'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
   }
@@ -192,8 +192,8 @@ async function handleBrowserRequest(socket, message, meta) {
           ? "bank_ledgers"
           : operation === "ledger_masters"
             ? "ledger_masters"
-            : operation === "verify_bank_transaction"
-              ? "verify_bank_transaction"
+            : operation === "verify_bank_transaction" || operation === "match_bank_statement"
+              ? operation
               : operation === "fetch_customer_open_bills"
                 ? "fetch_customer_open_bills"
         : operation === "scan"
@@ -231,7 +231,7 @@ async function handleConnectorResult(socket, message, meta) {
     return;
   }
 
-  if (["bank_ledgers", "ledger_masters", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.phase)) {
+  if (["bank_ledgers", "ledger_masters", "verify_bank_transaction", "match_bank_statement", "fetch_customer_open_bills"].includes(item.phase)) {
     clearPending(requestId);
     send(item.browser, { type: "result", requestId, success: true, data: message.data });
     return;

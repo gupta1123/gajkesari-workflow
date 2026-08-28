@@ -141,6 +141,39 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
 
   browser.send(JSON.stringify({
     type: "request",
+    requestId: "statement-match-1",
+    operation: "match_bank_statement",
+    companyName: "Solution Nyx",
+    payload: {
+      bankLedgerName: "State Bank of India - 42861007319",
+      transactions: [{ transactionId: "transaction-1", amount: 100 }],
+      ledgers: [{ ledgerName: "Customer A" }],
+    },
+  }));
+  const statementMatchOperation = await nextMessage(
+    connector,
+    (message) => message.type === "operation" && message.requestId === "statement-match-1"
+  );
+  assert.equal(statementMatchOperation.operation, "match_bank_statement");
+  assert.equal(statementMatchOperation.payload.transactions[0].transactionId, "transaction-1");
+  connector.send(JSON.stringify({
+    type: "operation_result",
+    requestId: "statement-match-1",
+    success: true,
+    data: {
+      transactions: [{ transactionId: "transaction-1", verificationStatus: "missing" }],
+      billsByLedger: { "customer a": [{ billName: "INV-1", pendingAmount: 100 }] },
+    },
+  }));
+  const statementMatchResult = await nextMessage(
+    browser,
+    (message) => message.type === "result" && message.requestId === "statement-match-1"
+  );
+  assert.equal(statementMatchResult.success, true);
+  assert.equal(statementMatchResult.data.billsByLedger["customer a"][0].billName, "INV-1");
+
+  browser.send(JSON.stringify({
+    type: "request",
     requestId: "request-1",
     operation: "scan",
     companyName: "Solution Nyx",
