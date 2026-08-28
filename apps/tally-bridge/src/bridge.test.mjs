@@ -11,6 +11,7 @@ import {
   classifyTaxLedgers,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
+  getBankVoucherCommandBatchKey,
   openBillBlockRequiresVoucherFallback,
   parseBankStatementMasterCollection,
   parseLedgerClosingBalance,
@@ -161,6 +162,63 @@ test("bank voucher batch puts every voucher in one documented Tally request", ()
   assert.doesNotMatch(xml, /<IMPORTDATA>|<REQUESTDESC>|<REQUESTDATA>/);
   assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-1<\/VOUCHERNUMBER>/);
   assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-50<\/VOUCHERNUMBER>/);
+});
+
+test("bank voucher batch supports mixed voucher types and bill allocation modes", () => {
+  const common = {
+    companyName: "Solution Nyx",
+    voucherDate: "2026-08-22",
+    bankLedgerName: "Axis Bank",
+    amount: 1000,
+  };
+  const xml = buildBankVoucherBatchXml(
+    [
+      {
+        ...common,
+        voucherType: "Receipt",
+        counterpartyLedgerName: "Customer A",
+        counterpartyIsPartyLedger: true,
+        bankLedgerEntryIsDebit: true,
+        referenceNumber: "MIXED-RECEIPT-BILL",
+        billAllocations: [{ referenceName: "INV-1", referenceType: "Agst Ref", amount: 1000 }],
+      },
+      {
+        ...common,
+        voucherType: "Payment",
+        counterpartyLedgerName: "Bank Charges",
+        counterpartyIsPartyLedger: false,
+        bankLedgerEntryIsDebit: false,
+        referenceNumber: "MIXED-PAYMENT-PLAIN",
+      },
+      {
+        ...common,
+        voucherType: "Contra",
+        counterpartyLedgerName: "Cash",
+        counterpartyIsPartyLedger: false,
+        bankLedgerEntryIsDebit: true,
+        referenceNumber: "MIXED-CONTRA",
+      },
+    ],
+    null
+  );
+
+  assert.equal((xml.match(/<TALLYMESSAGE\b/g) || []).length, 3);
+  assert.match(xml, /<VOUCHERTYPENAME>Receipt<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Payment<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Contra<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
+
+  const mixedKeys = [
+    { voucherType: "Receipt", billAllocations: [{ referenceName: "INV-1" }] },
+    { voucherType: "Payment", billAllocations: [] },
+    { voucherType: "Contra" },
+  ].map((variant) =>
+    getBankVoucherCommandBatchKey(
+      { ...common, ...variant },
+      null
+    )
+  );
+  assert.equal(new Set(mixedKeys).size, 1);
 });
 
 

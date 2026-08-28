@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.53";
+const BRIDGE_VERSION = "0.1.54";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -1906,17 +1906,24 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
   return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
 }
 
+export function getBankVoucherCommandBatchKey(payload = {}, fallbackCompanyName = null) {
+  return [
+    normalizeLooseName(payload.companyName || fallbackCompanyName),
+    normalizeLooseName(payload.bankLedgerName),
+  ].join("::");
+}
+
 async function runBankVoucherCommandBatch(config, commands, options = {}) {
   const groups = new Map();
   for (const command of commands) {
     const payload = command?.payload || {};
-    const hasBillAllocations = Array.isArray(payload.billAllocations) && payload.billAllocations.length > 0;
-    const key = [
-      normalizeLooseName(payload.companyName || config.companyName),
-      normalizeLooseName(payload.bankLedgerName),
-      normalizeLooseName(payload.voucherType),
-      hasBillAllocations ? "billwise" : "plain",
-    ].join("::");
+    // A Tally import envelope can contain different voucher types and each
+    // TALLYMESSAGE carries its own bill allocations. Splitting on those fields
+    // reduced a mixed bank statement to batches of one even though all commands
+    // had been claimed together. Keep only the values shared by the duplicate
+    // pre/post-flight lookup; this lets up to 50 statement vouchers use one
+    // Tally request without weakening per-command result isolation.
+    const key = getBankVoucherCommandBatchKey(payload, config.companyName);
     const group = groups.get(key) || [];
     group.push(command);
     groups.set(key, group);
