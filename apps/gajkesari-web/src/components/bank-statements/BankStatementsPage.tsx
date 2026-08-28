@@ -5500,10 +5500,10 @@ export function BankStatementsPage() {
     await syncCompanyData();
   }
 
-  async function fetchOpenBillsForLedgers(
-    connection: TallyConnection,
+  function openBillDataByLedgerFromResult(
+    result: Record<string, unknown>,
     ledgerNames: string[],
-    asOfDate?: string | null
+    resultField = "byLedger"
   ) {
     const requestedLedgerNames = Array.from(
       new Set(ledgerNames.map((ledgerName) => ledgerName.trim()).filter(Boolean))
@@ -5511,22 +5511,10 @@ export function BankStatementsPage() {
     if (requestedLedgerNames.length === 0) {
       return new Map<string, { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] }>();
     }
-
-    const result = await runCashDiscountLiveRequest<Record<string, unknown>>({
-      connectionId: connection.id,
-      companyName: selectedCompanyName || connection.lastCompanyName || "",
-      operation: "fetch_customer_open_bills",
-      payload: {
-        ledgerName: requestedLedgerNames[0],
-        ledgerNames: requestedLedgerNames,
-        companyName: selectedCompanyName || connection.lastCompanyName,
-        asOfDate: asOfDate || undefined,
-        queryPurpose: "bank_statement_match",
-      },
-    });
     const billDataByLedger = new Map<string, { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] }>();
-    const rawByLedger = result.byLedger && typeof result.byLedger === "object"
-      ? result.byLedger as Record<string, unknown>
+    const rawResult = result[resultField];
+    const rawByLedger = rawResult && typeof rawResult === "object"
+      ? rawResult as Record<string, unknown>
       : {};
 
     for (const ledgerName of requestedLedgerNames) {
@@ -5557,6 +5545,33 @@ export function BankStatementsPage() {
     }
 
     return billDataByLedger;
+  }
+
+  async function fetchOpenBillsForLedgers(
+    connection: TallyConnection,
+    ledgerNames: string[],
+    asOfDate?: string | null
+  ) {
+    const requestedLedgerNames = Array.from(
+      new Set(ledgerNames.map((ledgerName) => ledgerName.trim()).filter(Boolean))
+    );
+    if (requestedLedgerNames.length === 0) {
+      return new Map<string, { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] }>();
+    }
+
+    const result = await runCashDiscountLiveRequest<Record<string, unknown>>({
+      connectionId: connection.id,
+      companyName: selectedCompanyName || connection.lastCompanyName || "",
+      operation: "fetch_customer_open_bills",
+      payload: {
+        ledgerName: requestedLedgerNames[0],
+        ledgerNames: requestedLedgerNames,
+        companyName: selectedCompanyName || connection.lastCompanyName,
+        asOfDate: asOfDate || undefined,
+        queryPurpose: "bank_statement_match",
+      },
+    });
+    return openBillDataByLedgerFromResult(result, requestedLedgerNames);
   }
 
   async function waitForCommands(connectionId: string, commandIds: string[]) {
@@ -5592,7 +5607,15 @@ export function BankStatementsPage() {
     return [];
   }
 
-  async function verifyBankStatementPresence(connection: TallyConnection, rows: ReviewTransaction[]) {
+  async function verifyBankStatementPresence(
+    connection: TallyConnection,
+    rows: ReviewTransaction[],
+    options: {
+      includeOpenBills?: boolean;
+      billEligibleTransactionIds?: string[];
+      asOfDate?: string | null;
+    } = {}
+  ) {
     if (!bankLedgerName.trim()) {
       throw new Error("Select the Tally bank ledger before checking the statement.");
     }
@@ -5611,10 +5634,13 @@ export function BankStatementsPage() {
     const result = await runCashDiscountLiveRequest<{
       transactions?: Array<Record<string, unknown>>;
       balanceProof?: Record<string, unknown>;
+      billLedgerNames?: string[];
+      openBillsByLedger?: Record<string, unknown>;
+      matchDiagnostics?: Record<string, unknown>;
     }>({
       connectionId: connection.id,
       companyName: selectedCompanyName || connection.lastCompanyName || "",
-      operation: "verify_bank_transaction",
+      operation: options.includeOpenBills ? "match_bank_statement" : "verify_bank_transaction",
       payload: {
         companyName: selectedCompanyName || connection.lastCompanyName,
         bankLedgerName,
@@ -5623,6 +5649,8 @@ export function BankStatementsPage() {
         // Matching rows must stay interactive. Closing-balance proof is a
         // separate diagnostic and must not block the duplicate check.
         includeBalanceProof: false,
+        billEligibleTransactionIds: options.billEligibleTransactionIds,
+        asOfDate: options.asOfDate || undefined,
         transactions: rows.map((transaction) => {
             const incoming = isIncomingReceiptRow(transaction);
             const debitAmount = parseNumber(transaction.debitAmount) ?? 0;
@@ -5661,6 +5689,14 @@ export function BankStatementsPage() {
     const balanceProof = result.balanceProof && typeof result.balanceProof === "object" && !Array.isArray(result.balanceProof)
       ? result.balanceProof as TallyBalanceProof
       : null;
+    const billLedgerNames = Array.isArray(result.billLedgerNames)
+      ? result.billLedgerNames.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+      : [];
+    const billDataByLedger = openBillDataByLedgerFromResult(
+      result as Record<string, unknown>,
+      billLedgerNames,
+      "openBillsByLedger"
+    );
     setTallyPresenceByTransactionId(drafts);
     setOutgoingVerificationsByTransactionId(Object.fromEntries(
       rows.filter(isOutgoingPaymentRow).flatMap((transaction) => {
@@ -5669,7 +5705,7 @@ export function BankStatementsPage() {
       })
     ));
     setTallyBalanceProof(balanceProof);
-    return { drafts, balanceProof };
+    return { drafts, balanceProof, billDataByLedger, matchDiagnostics: result.matchDiagnostics ?? null };
   }
 
   async function verifyOutgoingPayments(connection: TallyConnection, rows: ReviewTransaction[]) {
@@ -5784,20 +5820,26 @@ export function BankStatementsPage() {
     try {
       setMatchingBills(true);
       setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
-      const { drafts: presenceDrafts, balanceProof } = await verifyBankStatementPresence(connection, validTransactions);
+      const billEligibleTransactionIds = pendingBillEligibleTransactions.map((transaction) => transaction.id);
+      const asOfDate = pendingBillEligibleTransactions
+        .map(getEffectiveTransactionDate)
+        .filter(Boolean)
+        .sort()
+        .at(-1);
+      const {
+        drafts: presenceDrafts,
+        balanceProof,
+        billDataByLedger,
+      } = await verifyBankStatementPresence(connection, validTransactions, {
+        includeOpenBills: true,
+        billEligibleTransactionIds,
+        asOfDate,
+      });
       const receiptTransactionsToMatch = pendingBillEligibleTransactions.filter(
         (transaction) => presenceDrafts[transaction.id]?.status === "missing"
       );
       const nextDrafts: Record<string, BillAllocationDraft> = {};
       if (receiptTransactionsToMatch.length > 0) {
-        const ledgers = Array.from(new Set(receiptTransactionsToMatch.map((transaction) => transaction.selectedLedgerName)));
-        const asOfDate = receiptTransactionsToMatch
-          .map(getEffectiveTransactionDate)
-          .filter(Boolean)
-          .sort()
-          .at(-1);
-        const billDataByLedger = await fetchOpenBillsForLedgers(connection, ledgers, asOfDate);
-
         for (const transaction of receiptTransactionsToMatch) {
           if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) {
             const context = getPartyBillMatchContext(transaction, ledgerMasters);

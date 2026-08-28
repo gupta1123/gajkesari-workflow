@@ -6,7 +6,7 @@ type LiveRequest = {
   connectionId: string;
   companyName: string;
   financialYear?: string | null;
-  operation: "company_check" | "bank_ledgers" | "ledger_masters" | "verify_bank_transaction" | "fetch_customer_open_bills" | "scan" | "create_debit_note";
+  operation: "company_check" | "bank_ledgers" | "ledger_masters" | "verify_bank_transaction" | "match_bank_statement" | "fetch_customer_open_bills" | "scan" | "create_debit_note";
   payload?: Record<string, unknown>;
   companyNames?: string[];
   proposal?: Record<string, unknown>;

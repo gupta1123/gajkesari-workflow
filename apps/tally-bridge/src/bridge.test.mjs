@@ -12,6 +12,7 @@ import {
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   getBankVoucherCommandBatchKey,
+  matchBankStatementInTally,
   openBillBlockRequiresVoucherFallback,
   parseBankStatementMasterCollection,
   parseLedgerClosingBalance,
@@ -446,6 +447,55 @@ test("statement reconciliation fetches bank allocations only for unresolved cand
   assert.match(calls[1].formulae[0].formula, /\$MasterID = 101/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 1);
+});
+
+test("live statement matching verifies vouchers and fetches bills in one connector operation", async () => {
+  const calls = [];
+  const outcome = await matchBankStatementInTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    {
+      companyName: "Solution Nyx",
+      bankLedgerName: "ICICI Current Account",
+      includeBalanceProof: false,
+      asOfDate: "2026-08-01",
+      billEligibleTransactionIds: ["txn-found", "txn-missing"],
+      transactions: [
+        {
+          transactionId: "txn-found",
+          voucherDate: "2026-08-01",
+          amount: 1250,
+          expectedDirection: "incoming",
+          referenceNumber: "UTR-FOUND-1",
+          counterpartyLedgerName: "Customer A",
+        },
+        {
+          transactionId: "txn-missing",
+          voucherDate: "2026-08-01",
+          amount: 500,
+          expectedDirection: "incoming",
+          referenceNumber: "UTR-MISSING-1",
+          counterpartyLedgerName: "Customer B",
+        },
+      ],
+    },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        if (options.tallyType === "Voucher") {
+          return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-FOUND-1</REFERENCE><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+        }
+        return '<ENVELOPE><BILL NAME="INV-B-1"><LEDGERNAME>Customer B</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260720</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.equal(calls.length, 2);
+  assert.equal(outcome.result.transactions[0].verificationStatus, "found");
+  assert.equal(outcome.result.transactions[1].verificationStatus, "missing");
+  assert.deepEqual(outcome.result.billLedgerNames, ["Customer B"]);
+  assert.equal(outcome.result.openBillsByLedger["Customer B"].openBills.length, 1);
+  assert.equal(outcome.result.openBillsByLedger["Customer A"], undefined);
+  assert.equal(outcome.result.matchDiagnostics.openBillCheck.requestedLedgerCount, 1);
 });
 
 test("open-bill classification preserves invoices and recovers exported advances", () => {

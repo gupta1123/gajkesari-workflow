@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.54";
+const BRIDGE_VERSION = "0.1.55";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -3775,6 +3775,79 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   };
 }
 
+async function matchBankStatementInTally(config, commandPayload = {}, dependencies = {}) {
+  const startedAt = Date.now();
+  const verificationOutcome = await reconcileBankTransactionsInTally(
+    config,
+    commandPayload,
+    dependencies
+  );
+  const verification = verificationOutcome.result || verificationOutcome;
+  const voucherCheckCompletedAt = Date.now();
+  const transactions = Array.isArray(commandPayload.transactions) ? commandPayload.transactions : [];
+  const transactionById = new Map(
+    transactions.map((transaction) => [String(transaction.transactionId || ""), transaction])
+  );
+  const billEligibleTransactionIds = new Set(
+    Array.isArray(commandPayload.billEligibleTransactionIds)
+      ? commandPayload.billEligibleTransactionIds.map((value) => String(value || ""))
+      : []
+  );
+  const missingLedgerNames = Array.from(new Set(
+    (Array.isArray(verification.transactions) ? verification.transactions : []).flatMap((result) => {
+      const transactionId = String(result?.transactionId || "");
+      if (result?.verificationStatus !== "missing" || !billEligibleTransactionIds.has(transactionId)) {
+        return [];
+      }
+      const ledgerName = String(transactionById.get(transactionId)?.counterpartyLedgerName || "").trim();
+      return ledgerName ? [ledgerName] : [];
+    })
+  ));
+
+  let billResult = {
+    ledgerNames: [],
+    byLedger: {},
+    openBills: [],
+    existingAdvances: [],
+    rawCount: 0,
+    queryDiagnostics: {
+      requestedLedgerCount: 0,
+      skipped: true,
+      reason: "No unmatched bill-eligible statement rows.",
+    },
+  };
+  if (missingLedgerNames.length > 0) {
+    const billOutcome = await fetchCustomerOpenBillsFromTally(
+      config,
+      {
+        companyName: commandPayload.companyName,
+        ledgerName: missingLedgerNames[0],
+        ledgerNames: missingLedgerNames,
+        asOfDate: commandPayload.asOfDate,
+        queryPurpose: "bank_statement_match",
+      },
+      dependencies
+    );
+    billResult = billOutcome.result || billOutcome;
+  }
+
+  return {
+    success: true,
+    result: {
+      ...verification,
+      billLedgerNames: missingLedgerNames,
+      openBillsByLedger: billResult.byLedger || {},
+      matchDiagnostics: {
+        voucherCheck: verification.queryDiagnostics || null,
+        openBillCheck: billResult.queryDiagnostics || null,
+        voucherCheckMs: voucherCheckCompletedAt - startedAt,
+        openBillCheckMs: Date.now() - voucherCheckCompletedAt,
+        totalMs: Date.now() - startedAt,
+      },
+    },
+  };
+}
+
 function buildVoucherMasterIdFormula(masterIds) {
   return masterIds
     .map((value) => String(value || "").trim())
@@ -5214,6 +5287,10 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           const outcome = await reconcileBankTransactionsInTally(config, message.payload || {});
           return outcome.result || outcome;
         }
+        if (operation === "match_bank_statement") {
+          const outcome = await matchBankStatementInTally(config, message.payload || {});
+          return outcome.result || outcome;
+        }
         if (operation === "fetch_customer_open_bills") {
           const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {});
           return outcome.result || outcome;
@@ -6158,6 +6235,7 @@ export {
   fetchBankLedgersFromTally,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
+  matchBankStatementInTally,
   normalizeTallyUrl,
   openBillBlockRequiresVoucherFallback,
   pairBridge,
