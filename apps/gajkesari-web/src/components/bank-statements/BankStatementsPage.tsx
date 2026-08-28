@@ -5620,6 +5620,9 @@ export function BankStatementsPage() {
         bankLedgerName,
         relevantLedgerNames,
         voucherTypes: ["Receipt", "Payment", "Contra", "Journal"],
+        // Matching rows must stay interactive. Closing-balance proof is a
+        // separate diagnostic and must not block the duplicate check.
+        includeBalanceProof: false,
         transactions: rows.map((transaction) => {
             const incoming = isIncomingReceiptRow(transaction);
             const debitAmount = parseNumber(transaction.debitAmount) ?? 0;

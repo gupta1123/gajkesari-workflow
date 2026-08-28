@@ -16,6 +16,7 @@ import {
   parseLedgerClosingBalance,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
+  reconcileBankTransactionsInTally,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
 
@@ -317,6 +318,76 @@ test("strict bank presence marks same-date amount evidence insufficient for Susp
   );
   assert.equal(result.candidates.length, 1);
   assert.equal(result.identityInsufficient, true);
+});
+
+test("statement reconciliation uses one lean export when top-level references match", async () => {
+  const calls = [];
+  const outcome = await reconcileBankTransactionsInTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    {
+      companyName: "Solution Nyx",
+      bankLedgerName: "ICICI Current Account",
+      includeBalanceProof: false,
+      transactions: [{
+        transactionId: "txn-1",
+        voucherDate: "2026-08-01",
+        amount: 1250,
+        debitAmount: 0,
+        creditAmount: 1250,
+        expectedDirection: "incoming",
+        referenceNumber: "UTR-123456",
+        counterpartyLedgerName: "Customer A",
+      }],
+    },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-123456</REFERENCE><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(calls[0].fetchFields, /BankAllocations/);
+  assert.equal(outcome.result.transactions[0].verificationStatus, "found");
+  assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
+});
+
+test("statement reconciliation fetches bank allocations only for unresolved candidate vouchers", async () => {
+  const calls = [];
+  const outcome = await reconcileBankTransactionsInTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    {
+      companyName: "Solution Nyx",
+      bankLedgerName: "ICICI Current Account",
+      includeBalanceProof: false,
+      transactions: [{
+        transactionId: "txn-1",
+        voucherDate: "2026-08-01",
+        amount: 1250,
+        debitAmount: 0,
+        creditAmount: 1250,
+        expectedDirection: "incoming",
+        referenceNumber: "UTR-123456",
+        counterpartyLedgerName: "Customer A",
+      }],
+    },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        if (calls.length === 1) {
+          return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+        }
+        return '<ENVELOPE><VOUCHER><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>UTR-123456</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].fetchFields, /BankAllocations/);
+  assert.match(calls[1].formulae[0].formula, /\$MasterID = 101/);
+  assert.equal(outcome.result.transactions[0].verificationStatus, "found");
+  assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 1);
 });
 
 test("open-bill classification preserves invoices and recovers exported advances", () => {

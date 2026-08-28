@@ -53,6 +53,9 @@ function clearPending(requestId) {
 function failPending(requestId, error) {
   const item = clearPending(requestId);
   if (!item) return;
+  console.error(
+    `[cash-discount-live] request failed operation=${item.operation} connection=${item.connectionId} request=${requestId} durationMs=${Date.now() - item.startedAt} error=${error instanceof Error ? error.message : String(error)}`
+  );
   send(item.browser, {
     type: "result",
     requestId,
@@ -81,12 +84,16 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
         ? "scanning"
         : "revalidating",
     commandPayload: null,
+    startedAt: Date.now(),
     debitNoteKey: operation === "create_debit_note"
       ? `${connectionId}|${String(proposal?.partyLedgerName ?? "").trim().toLowerCase()}|${String(proposal?.linkedInvoiceNumber ?? "").trim().toLowerCase()}`
       : null,
     timeout,
   };
   pending.set(requestId, item);
+  console.log(
+    `[cash-discount-live] request started operation=${operation} connection=${connectionId} request=${requestId}`
+  );
   return item;
 }
 
@@ -213,6 +220,10 @@ async function handleConnectorResult(socket, message, meta) {
     failPending(requestId, new Error(String(message.error ?? "Tally could not complete the live request.")));
     return;
   }
+
+  console.log(
+    `[cash-discount-live] connector phase completed operation=${item.operation} phase=${item.phase} connection=${item.connectionId} request=${requestId} durationMs=${Date.now() - item.startedAt}`
+  );
 
   if (item.phase === "company_check") {
     clearPending(requestId);

@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.52";
+const BRIDGE_VERSION = "0.1.53";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -19,6 +19,7 @@ const BACKEND_REQUEST_TIMEOUT_MS = 10_000;
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
+const BANK_REFERENCE_VOUCHER_BATCH_SIZE = 25;
 const CONFIG_DIR = path.join(os.homedir(), ".gajkesari-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
@@ -2873,12 +2874,10 @@ async function fetchLedgerClosingBalance(tallyUrl, options) {
   return parseTallyAmount(getTagText(xml, "CLOSINGBALANCE"));
 }
 
-function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes) {
+function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes = new Set()) {
   const voucherDate = normalizeDateForCompare(transaction.voucherDate);
   const amount = Number(transaction.amount || 0);
-  const referenceNumber = String(transaction.referenceNumber || "").trim();
-  const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
-  const baseCandidates = vouchers.flatMap((voucher, index) => {
+  return vouchers.flatMap((voucher, index) => {
     if (reservedVoucherIndexes.has(index)) return [];
     const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
     const bankEntry = getBankLedgerEntry(
@@ -2890,6 +2889,17 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
     if (!voucherDate || date !== voucherDate || !bankEntry) return [];
     return [{ voucher, index, bankEntry }];
   });
+}
+
+function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes) {
+  const referenceNumber = String(transaction.referenceNumber || "").trim();
+  const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
+  const baseCandidates = baseBankTransactionCandidates(
+    vouchers,
+    transaction,
+    bankLedgerName,
+    reservedVoucherIndexes
+  );
 
   const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
   const counterpartyKey = normalizeLooseName(counterpartyLedgerName);
@@ -2934,7 +2944,7 @@ function serializeStrictVoucherMatch(candidate) {
   };
 }
 
-async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
+async function reconcileBankTransactionsInTally(config, commandPayload = {}, dependencies = {}) {
   const transactions = Array.isArray(commandPayload.transactions) ? commandPayload.transactions : [];
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
@@ -2958,33 +2968,10 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
   const dates = normalizedTransactions.map((transaction) => transaction.voucherDate).sort();
   const dateFrom = dates[0];
   const dateTo = dates.at(-1);
-  const bankEntryFormulaName = "AutodealerBankLedgerEntry";
-  const bankVoucherFormulaName = "AutodealerBankVoucher";
-
-  const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Gajkesari Bank Statement Reconciliation",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
-    companyName,
-    dateFrom,
-    dateTo,
-    formulae: [
-      {
-        name: bankEntryFormulaName,
-        formula: buildRequestedLedgerFormula([bankLedgerName], ["$LedgerName"]),
-      },
-      {
-        name: bankVoucherFormulaName,
-        formula: `$$FilterCount:AllLedgerEntries:${bankEntryFormulaName} > 0`,
-      },
-    ],
-    // Do not filter by exact VoucherTypeName: Tally companies frequently use
-    // custom voucher types derived from Receipt/Payment/Contra/Journal.
-    filterNames: [bankVoucherFormulaName],
-  });
-  const vouchers = parseVoucherCollection(xml).filter(
-    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  const { vouchers, diagnostics: queryDiagnostics } = await fetchBankReconciliationVouchers(
+    tallyUrl,
+    { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions },
+    dependencies
   );
   const reservedVoucherIndexes = new Set();
   const results = normalizedTransactions.map((transaction) => {
@@ -3088,6 +3075,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
       dateTo,
       bankLedgerName,
       scannedCount: vouchers.length,
+      queryDiagnostics,
       transactions: results,
       balanceProof: {
         available: statementBalance.available && Number.isFinite(tallyClosingBalance),
@@ -3160,9 +3148,9 @@ function scoreBankTransactionVoucher(voucher, payload) {
   };
 }
 
-async function verifyBankTransactionInTally(config, commandPayload = {}) {
+async function verifyBankTransactionInTally(config, commandPayload = {}, dependencies = {}) {
   if (Array.isArray(commandPayload.transactions)) {
-    return reconcileBankTransactionsInTally(config, commandPayload);
+    return reconcileBankTransactionsInTally(config, commandPayload, dependencies);
   }
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
@@ -3180,21 +3168,21 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     throw new Error("Bank transaction verification requires a positive amount.");
   }
 
-  const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Gajkesari Bank Payment Verification",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
-    companyName,
-    dateFrom: voucherDate,
-    dateTo: voucherDate,
-  });
-  const vouchers = parseVoucherCollection(xml).filter(
-    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  const normalizedTransaction = { ...commandPayload, voucherDate, amount };
+  const { vouchers, diagnostics: queryDiagnostics } = await fetchBankReconciliationVouchers(
+    tallyUrl,
+    {
+      companyName,
+      dateFrom: voucherDate,
+      dateTo: voucherDate,
+      bankLedgerName,
+      transactions: [normalizedTransaction],
+    },
+    dependencies
   );
   const strictResult = strictBankTransactionCandidates(
     vouchers,
-    { ...commandPayload, voucherDate, amount },
+    normalizedTransaction,
     bankLedgerName,
     new Set()
   );
@@ -3214,6 +3202,7 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     result: {
       verificationStatus,
       scannedCount: vouchers.length,
+      queryDiagnostics,
       matchCount: strictMatches.length,
       duplicateInTally,
       duplicateVoucherCount: duplicateInTally ? strictMatches.length : 0,
@@ -3775,6 +3764,105 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
         voucherRetrySplitCount: voucherExport.retrySplitCount ?? 0,
         asOfDate,
       },
+    },
+  };
+}
+
+function buildVoucherMasterIdFormula(masterIds) {
+  return masterIds
+    .map((value) => String(value || "").trim())
+    .filter((value) => /^\d+$/.test(value))
+    .map((value) => `$MasterID = ${value}`)
+    .join(" OR ");
+}
+
+async function fetchBankReconciliationVouchers(
+  tallyUrl,
+  { companyName, dateFrom, dateTo, bankLedgerName, transactions },
+  dependencies = {}
+) {
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+  const startedAt = Date.now();
+  const bankEntryFormulaName = "AutodealerBankLedgerEntry";
+  const bankVoucherFormulaName = "AutodealerBankVoucher";
+  const leanXml = await exportCollection(tallyUrl, {
+    collectionName: "Gajkesari Bank Statement Reconciliation",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
+    companyName,
+    dateFrom,
+    dateTo,
+    formulae: [
+      {
+        name: bankEntryFormulaName,
+        formula: buildRequestedLedgerFormula([bankLedgerName], ["$LedgerName"]),
+      },
+      {
+        name: bankVoucherFormulaName,
+        formula: `$$FilterCount:AllLedgerEntries:${bankEntryFormulaName} > 0`,
+      },
+    ],
+    filterNames: [bankVoucherFormulaName],
+  });
+  const leanCompletedAt = Date.now();
+  const vouchers = parseVoucherCollection(leanXml).filter(
+    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  );
+
+  // Gajkesari-created vouchers expose the UTR in the top-level Reference.
+  // Only read expensive nested bank allocations for same-date/amount
+  // candidates whose exact reference is not already visible.
+  const detailMasterIds = new Set();
+  for (const transaction of transactions) {
+    const referenceNumber = String(transaction.referenceNumber || "").trim();
+    if (normalizeExactReference(referenceNumber).length < 5) continue;
+    const baseCandidates = baseBankTransactionCandidates(vouchers, transaction, bankLedgerName);
+    if (baseCandidates.some(({ voucher }) => voucherHasExactReference(voucher, referenceNumber))) continue;
+    for (const { voucher } of baseCandidates) {
+      if (isNumericMasterId(voucher.masterId)) detailMasterIds.add(String(voucher.masterId));
+    }
+  }
+
+  const detailBatches = chunkValues([...detailMasterIds], BANK_REFERENCE_VOUCHER_BATCH_SIZE);
+  const referenceByMasterId = new Map();
+  for (const [index, masterIds] of detailBatches.entries()) {
+    const masterFilterName = "GajkesariRequestedBankVoucher";
+    const formula = buildVoucherMasterIdFormula(masterIds);
+    if (!formula) continue;
+    const detailXml = await exportCollection(tallyUrl, {
+      collectionName: `Gajkesari Bank Reference Evidence ${index + 1}`,
+      tallyType: "Voucher",
+      fetchFields:
+        "MasterID,Reference,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+      companyName,
+      dateFrom,
+      dateTo,
+      formulae: [{ name: masterFilterName, formula }],
+      filterNames: [masterFilterName],
+    });
+    for (const voucher of parseVoucherCollection(detailXml)) {
+      if (!voucher.masterId) continue;
+      referenceByMasterId.set(String(voucher.masterId), voucher.bankReferences || []);
+    }
+  }
+
+  for (const voucher of vouchers) {
+    const references = referenceByMasterId.get(String(voucher.masterId || ""));
+    if (references?.length) {
+      voucher.bankReferences = [...new Set([...(voucher.bankReferences || []), ...references])];
+    }
+  }
+
+  return {
+    vouchers,
+    diagnostics: {
+      leanExportMs: leanCompletedAt - startedAt,
+      referenceExportMs: Date.now() - leanCompletedAt,
+      totalMs: Date.now() - startedAt,
+      scannedVoucherCount: vouchers.length,
+      detailedVoucherCount: detailMasterIds.size,
+      detailBatchCount: detailBatches.length,
     },
   };
 }
@@ -5024,6 +5112,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
     const requestId = String(message.requestId || "").trim();
     const operation = String(message.operation || "");
     if (!requestId) return;
+    const operationStartedAt = Date.now();
+    log("info", `Live operation started: ${operation} (${requestId}).`);
     try {
       const lockRequestedAt = Date.now();
       const data = await executeExclusive(async () => {
@@ -5123,8 +5213,16 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         }
         throw new Error("Unsupported live Tally operation.");
       });
+      log(
+        "info",
+        `Live operation completed: ${operation} (${requestId}) in ${Date.now() - operationStartedAt} ms.`
+      );
       send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
     } catch (error) {
+      log(
+        "error",
+        `Live operation failed: ${operation} (${requestId}) after ${Date.now() - operationStartedAt} ms: ${error instanceof Error ? error.message : String(error || "Unknown error")}`
+      );
       send({
         type: "operation_result",
         requestId,
