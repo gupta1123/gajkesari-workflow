@@ -639,6 +639,7 @@ export async function suggestBankLedgersForTransactions(input: {
   ownerUserId: string;
   connectionId?: string | null;
   companyName?: string | null;
+  ledgerCatalogue?: OfflineLedgerCatalogueEntry[];
   transactions: BankLedgerSuggestionTransaction[];
 }): Promise<BankLedgerSuggestion[]> {
   if (input.transactions.length === 0) return [];
@@ -651,7 +652,36 @@ export async function suggestBankLedgersForTransactions(input: {
     sourceKey: sourceKeyForNarration(item.accountId, item.transaction.description),
   }));
   const suggestions: Array<BankLedgerSuggestion | undefined> = input.transactions.map(() => undefined);
-  const ledgers = await fetchAllActiveTallyLedgers(input);
+  // Prefer the catalogue fetched live for this exact analysis. A connector can
+  // be freshly paired before its masters have been persisted, so querying only
+  // tally_masters here can incorrectly produce an empty catalogue and put every
+  // otherwise matchable transaction into Suspense.
+  const liveCatalogue = (input.ledgerCatalogue ?? [])
+    .filter((ledger) => typeof ledger.name === "string" && ledger.name.trim())
+    .map((ledger, index) => ({
+      id: ledger.id ?? `live-ledger-${index + 1}`,
+      connection_id: input.connectionId ?? "live-catalogue",
+      owner_user_id: input.ownerUserId,
+      company_name: input.companyName ?? "",
+      sync_run_id: null,
+      master_type: "ledger" as const,
+      master_key: normalizeMasterKey({ masterType: "ledger", name: ledger.name }),
+      tally_guid: null,
+      tally_name: ledger.name.trim(),
+      parent_name: ledger.parent?.trim() || null,
+      gstin: null,
+      hsn_code: null,
+      unit_name: null,
+      tax_rate: null,
+      raw_payload: { source: "live_analysis_catalogue" },
+      is_active: true,
+      last_synced_at: "",
+      created_at: "",
+      updated_at: "",
+    } satisfies TallyMasterRow));
+  const ledgers = liveCatalogue.length > 0
+    ? liveCatalogue
+    : await fetchAllActiveTallyLedgers(input);
   const activeLedgerByName = new Map(
     ledgers.map((ledger) => [normalizeName(ledger.tally_name), ledger])
   );

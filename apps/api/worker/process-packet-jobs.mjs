@@ -1973,6 +1973,7 @@ async function addBankLedgerRecommendations({
   connectionId,
   accountId,
   companyName,
+  ledgerNames,
 }) {
   if (rows.length === 0) return rows;
 
@@ -1981,6 +1982,7 @@ async function addBankLedgerRecommendations({
     ownerUserId,
     connectionId,
     companyName,
+    ledgerCatalogue: (ledgerNames || []).map((name) => ({ name })),
     transactions: rows.map((row) => ({
       accountId,
       transaction: bankLedgerMatchTransaction(row),
@@ -2294,9 +2296,10 @@ async function runBankStatementJob(job) {
         : await addBankLedgerRecommendations({
             rows,
             ownerUserId: job.owner_user_id,
-            connectionId: tallyConnectionId,
+            connectionId: effectiveTallyConnectionId,
             accountId: String(selectedAccountId || importRow.bank_account_id || ""),
             companyName,
+            ledgerNames,
           });
     } catch (error) {
       const detail = diagnosticError(error);
