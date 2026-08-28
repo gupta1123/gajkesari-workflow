@@ -9,6 +9,7 @@ import {
   buildRequestedLedgerFormula,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
+  createExclusiveScheduler,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   getBankVoucherCommandBatchKey,
@@ -21,6 +22,32 @@ import {
   reconcileBankTransactionsInTally,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("interactive Tally work runs before queued background work", async () => {
+  const scheduler = createExclusiveScheduler();
+  const order = [];
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+
+  const first = scheduler(async () => {
+    order.push("background-1");
+    markFirstStarted();
+    await firstBlocked;
+  }, "background");
+  await firstStarted;
+  const second = scheduler(() => order.push("background-2"), "background");
+  const interactive = scheduler(() => order.push("interactive"), "interactive");
+  releaseFirst();
+  await Promise.all([first, second, interactive]);
+
+  assert.deepEqual(order, ["background-1", "interactive", "background-2"]);
+});
 
 test("bank-statement master parser keeps lean ledger identity and targeted bank details", () => {
   const lean = parseBankStatementMasterCollection(

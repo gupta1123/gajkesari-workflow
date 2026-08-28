@@ -9,12 +9,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.56";
+const BRIDGE_VERSION = "0.1.57";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 const BACKEND_REQUEST_TIMEOUT_MS = 10_000;
+const TALLY_HEARTBEAT_PROBE_INTERVAL_MS = 15_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
@@ -4470,6 +4471,7 @@ async function sendCommandResult(config, command, outcome) {
       result: outcome.result ?? {},
       error,
     }),
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
 
@@ -5040,7 +5042,7 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
   return payload;
 }
 
-async function runOnce(config, options = {}) {
+async function runOnce(config, options = {}, executeExclusive = null) {
   // A verified Debit Note document needs the already-confirmed voucher fields
   // and the local PDF renderer, not a fresh Tally HTTP call. Claim and finish
   // it before a slow/unreachable Tally heartbeat can hold the customer send
@@ -5062,7 +5064,20 @@ async function runOnce(config, options = {}) {
     emitLog(options, "error", commandError instanceof Error ? commandError.message : String(commandError));
   }
 
-  const result = await testTally(config.tallyUrl);
+  const runTallyTask = (task) => executeExclusive
+    ? executeExclusive(task, "background")
+    : task();
+  const readinessCache = options.tallyReadinessCache || null;
+  const cachedReadinessIsFresh =
+    readinessCache?.result &&
+    Date.now() - Number(readinessCache.fetchedAt || 0) < TALLY_HEARTBEAT_PROBE_INTERVAL_MS;
+  const result = cachedReadinessIsFresh
+    ? readinessCache.result
+    : await runTallyTask(() => testTally(config.tallyUrl));
+  if (readinessCache && !cachedReadinessIsFresh) {
+    readinessCache.result = result;
+    readinessCache.fetchedAt = Date.now();
+  }
   const companyCache = options.companyHeartbeatCache || null;
   const cacheIsFresh =
     companyCache &&
@@ -5071,7 +5086,7 @@ async function runOnce(config, options = {}) {
   const availableCompanies = result.tallyReachable
     ? cacheIsFresh
       ? companyCache.companies
-      : await fetchAvailableCompanies(config.tallyUrl, result.companyName)
+      : await runTallyTask(() => fetchAvailableCompanies(config.tallyUrl, result.companyName))
     : [];
   if (companyCache && result.tallyReachable && !cacheIsFresh) {
     companyCache.activeCompanyName = result.companyName || null;
@@ -5090,25 +5105,7 @@ async function runOnce(config, options = {}) {
   );
 
   try {
-    const bankVoucherCommands = deferredCommands.filter(
-      (command) => command.commandType === "post_bank_voucher"
-    );
-    for (const command of deferredCommands) {
-      if (command.commandType !== "post_bank_voucher") {
-        try {
-          await runCommand(config, command, options);
-        } catch (error) {
-          console.error(
-            `Command ${command.id} failed without blocking the remaining queue: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
-        }
-      }
-    }
-    if (bankVoucherCommands.length > 0) {
-      await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
-    }
+    await processClaimedCommands(config, deferredCommands, options, executeExclusive);
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
   }
@@ -5137,6 +5134,48 @@ function tallyLiveGatewayUrl(config) {
   return url.toString();
 }
 
+function createExclusiveScheduler(options = {}) {
+  let active = false;
+  let stopped = false;
+  const interactiveQueue = [];
+  const backgroundQueue = [];
+
+  const scheduleNext = () => {
+    if (active || stopped) return;
+    const entry = interactiveQueue.shift() || backgroundQueue.shift();
+    if (!entry) return;
+    active = true;
+    Promise.resolve()
+      .then(entry.task)
+      .then(entry.resolve, entry.reject)
+      .finally(() => {
+        active = false;
+        scheduleNext();
+      });
+  };
+
+  const execute = (task, priority = "background") => new Promise((resolve, reject) => {
+    if (stopped || options.isStopped?.()) {
+      reject(new Error("The connector has stopped."));
+      return;
+    }
+    const queue = priority === "interactive" ? interactiveQueue : backgroundQueue;
+    queue.push({ task, resolve, reject });
+    scheduleNext();
+  });
+
+  execute.stop = () => {
+    stopped = true;
+    const error = new Error("The connector has stopped.");
+    for (const entry of [...interactiveQueue.splice(0), ...backgroundQueue.splice(0)]) {
+      entry.reject(error);
+    }
+  };
+  execute.hasPendingInteractive = () => interactiveQueue.length > 0;
+  execute.isBusy = () => active;
+  return execute;
+}
+
 function startTallyLiveChannel(config, executeExclusive, options = {}) {
   let socket = null;
   let reconnectTimer = null;
@@ -5160,11 +5199,14 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
     const operation = String(message.operation || "");
     if (!requestId) return;
     const operationStartedAt = Date.now();
+    let lockWaitMs = 0;
+    let executionStartedAt = operationStartedAt;
     log("info", `Live operation started: ${operation} (${requestId}).`);
     try {
       const lockRequestedAt = Date.now();
       const data = await executeExclusive(async () => {
-        const lockWaitMs = Date.now() - lockRequestedAt;
+        lockWaitMs = Date.now() - lockRequestedAt;
+        executionStartedAt = Date.now();
         if (operation === "company_check") return collectTallyCompanyCheck(config);
         if (operation === "bank_ledgers") {
           const outcome = await fetchBankLedgersFromTally(config, {
@@ -5263,10 +5305,27 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         throw new Error("Unsupported live Tally operation.");
-      });
+      }, "interactive");
+      const executionMs = Date.now() - executionStartedAt;
+      if (data && typeof data === "object") {
+        data.liveTimings = {
+          ...(data.liveTimings || {}),
+          lockWaitMs,
+          executionMs,
+          totalMs: Date.now() - operationStartedAt,
+        };
+        if (operation === "match_bank_statement" && data.matchDiagnostics) {
+          data.matchDiagnostics = {
+            ...data.matchDiagnostics,
+            lockWaitMs,
+            executionMs,
+            totalWithLockMs: Date.now() - operationStartedAt,
+          };
+        }
+      }
       log(
         "info",
-        `Live operation completed: ${operation} (${requestId}) in ${Date.now() - operationStartedAt} ms.`
+        `Live operation completed: ${operation} (${requestId}) in ${Date.now() - operationStartedAt} ms (lock wait ${lockWaitMs} ms, execution ${executionMs} ms).`
       );
       send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
     } catch (error) {
@@ -5353,12 +5412,15 @@ async function fetchCommandRealtimeConfig(config) {
   return payload.realtime ?? null;
 }
 
-async function processClaimedCommands(config, commands, options = {}) {
+async function processClaimedCommands(config, commands, options = {}, executeExclusive = null) {
+  const runBackgroundTask = (task) => executeExclusive
+    ? executeExclusive(task, "background")
+    : task();
   const bankVoucherCommands = commands.filter((command) => command.commandType === "post_bank_voucher");
   for (const command of commands) {
     if (command.commandType === "post_bank_voucher") continue;
     try {
-      await runCommand(config, command, options);
+      await runBackgroundTask(() => runCommand(config, command, options));
     } catch (error) {
       console.error(
         `Command ${command.id} failed without blocking the remaining queue: ${
@@ -5368,11 +5430,11 @@ async function processClaimedCommands(config, commands, options = {}) {
     }
   }
   if (bankVoucherCommands.length > 0) {
-    await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
+    await runBackgroundTask(() => runBankVoucherCommandBatch(config, bankVoucherCommands, options));
   }
 }
 
-async function drainPendingCommands(config, options = {}) {
+async function drainPendingCommands(config, options = {}, executeExclusive = null) {
   let processed = 0;
   while (processed < MAX_COMMANDS_PER_CYCLE) {
     const commands = await receiveNextCommands(
@@ -5383,7 +5445,7 @@ async function drainPendingCommands(config, options = {}) {
     // Preserve the bank-voucher batch path even when Realtime wakes the bridge.
     // Processing each notification independently would re-run duplicate
     // preflight once per voucher and be slower than the polling path.
-    await processClaimedCommands(config, commands, options);
+    await processClaimedCommands(config, commands, options, executeExclusive);
     processed += commands.length;
   }
   return processed;
@@ -5418,6 +5480,8 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
   let stopped = false;
   let messageRef = 1;
   let realtimeConfig = null;
+  let wakeRunning = false;
+  let wakeRequested = false;
 
   const log = (level, message) => emitLog(options, level, message);
   const clearSocketTimers = () => {
@@ -5431,13 +5495,23 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
     return ref;
   };
   const runWake = async (reason) => {
+    if (wakeRunning) {
+      wakeRequested = true;
+      return;
+    }
+    wakeRunning = true;
     try {
-      const processed = await executeExclusive(() => drainPendingCommands(config, options));
-      if (processed > 0) {
-        log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
-      }
+      do {
+        wakeRequested = false;
+        const processed = await drainPendingCommands(config, options, executeExclusive);
+        if (processed > 0) {
+          log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
+        }
+      } while (wakeRequested);
     } catch (error) {
       log("error", error instanceof Error ? error.message : "Immediate Tally command check failed.");
+    } finally {
+      wakeRunning = false;
     }
   };
   const scheduleReconnect = () => {
@@ -5527,35 +5601,24 @@ async function startBridge(args) {
   console.log(`Starting Tally bridge for ${config.tallyUrl}`);
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
-  let running = false;
-  let pendingExclusive = 0;
-  const executeExclusive = async (task) => {
-    pendingExclusive += 1;
-    while (running) await new Promise((resolve) => setTimeout(resolve, 25));
-    pendingExclusive -= 1;
-    running = true;
-    try {
-      return await task();
-    } finally {
-      running = false;
-    }
-  };
-  const runnerOptions = { companyHeartbeatCache: {} };
+  const executeExclusive = createExclusiveScheduler();
+  const runnerOptions = { companyHeartbeatCache: {}, tallyReadinessCache: {} };
+  let backgroundCycleRunning = false;
   const runSerially = async () => {
-    if (running || pendingExclusive > 0) {
+    if (backgroundCycleRunning) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
 
-    running = true;
+    backgroundCycleRunning = true;
     try {
-      await runOnce(config, runnerOptions);
+      await runOnce(config, runnerOptions, executeExclusive);
     } finally {
-      running = false;
+      backgroundCycleRunning = false;
     }
   };
 
-  await runOnce(config, runnerOptions);
+  await runOnce(config, runnerOptions, executeExclusive);
   startCommandWakeChannel(config, executeExclusive, runnerOptions);
   startTallyLiveChannel(config, executeExclusive);
   setInterval(() => {
@@ -5599,25 +5662,13 @@ function createBridgeRunner(options = {}) {
 
   const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
   let timer = null;
-  let running = false;
-  let pendingExclusive = 0;
+  let backgroundCycleRunning = false;
   let stopped = false;
   let stopTallyLiveChannel = null;
   let stopCommandWakeChannel = null;
   const companyHeartbeatCache = {};
-
-  const executeExclusive = async (task) => {
-    pendingExclusive += 1;
-    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 25));
-    pendingExclusive -= 1;
-    if (stopped) throw new Error("The connector has stopped.");
-    running = true;
-    try {
-      return await task();
-    } finally {
-      running = false;
-    }
-  };
+  const tallyReadinessCache = {};
+  const executeExclusive = createExclusiveScheduler({ isStopped: () => stopped });
 
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
@@ -5630,6 +5681,7 @@ function createBridgeRunner(options = {}) {
     stopTallyLiveChannel = null;
     stopCommandWakeChannel?.();
     stopCommandWakeChannel = null;
+    executeExclusive.stop();
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -5637,14 +5689,18 @@ function createBridgeRunner(options = {}) {
 
   const runSerially = async () => {
     if (stopped) return;
-    if (running || pendingExclusive > 0) {
+    if (backgroundCycleRunning) {
       emitLog(options, "info", "Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
 
-    running = true;
+    backgroundCycleRunning = true;
     try {
-      const cycle = await runOnce(config, { ...options, companyHeartbeatCache });
+      const cycle = await runOnce(
+        config,
+        { ...options, companyHeartbeatCache, tallyReadinessCache },
+        executeExclusive
+      );
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
@@ -5663,7 +5719,7 @@ function createBridgeRunner(options = {}) {
         stop(error?.status === 426 ? "update required" : "revoked", error);
       }
     } finally {
-      running = false;
+      backgroundCycleRunning = false;
     }
   };
 
@@ -6190,6 +6246,7 @@ export {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TALLY_URL,
   createBridgeRunner,
+  createExclusiveScheduler,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   buildCollectionExportXml,
