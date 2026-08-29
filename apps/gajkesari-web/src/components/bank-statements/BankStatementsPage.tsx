@@ -266,6 +266,7 @@ type LedgerRecommendationAction =
 
 type LedgerRecommendation = {
   matchType?: "direct_match" | "close_match" | "suspense";
+  status?: "completed" | "unavailable" | "deferred";
   action: LedgerRecommendationAction;
   ledgerName: string | null;
   candidateLedgerNames?: string[];
@@ -948,6 +949,8 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   const recommendation = readRecommendation(transaction);
   const suggestedLedgerName = transaction.suggestedLedgerName || "";
   const action = recommendation?.action ?? "needs_review";
+  const recommendationUnavailable =
+    recommendation?.status === "unavailable" || recommendation?.status === "deferred";
   const aiVetoesDerivedAutoMatch = Boolean(
     recommendation && (action === "use_suspense" || action === "needs_review")
   );
@@ -981,7 +984,7 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     standardLedger?.name ||
     matchedLedger?.name ||
     confirmedSuspenseLedger?.name ||
-    suspenseName;
+    (recommendationUnavailable ? "" : suspenseName);
   const ledgerAction: LedgerRecommendationAction = confirmedMappedLedger
     ? "use_existing_ledger"
     : standardLedger
@@ -990,7 +993,9 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     ? action === "use_standard_ledger"
       ? "use_standard_ledger"
       : "use_existing_ledger"
-    : "use_suspense";
+    : recommendationUnavailable
+      ? "needs_review"
+      : "use_suspense";
 
   return {
     id: transaction.id || crypto.randomUUID(),
@@ -1017,6 +1022,8 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
     suggestionReason: hasCloseMatchCandidates
         ? `Close Tally ledger matches found: ${candidateLedgerNames.join(", ")}.`
+      : ledgerAction === "needs_review"
+        ? recommendation?.reason || transaction.suggestionReason || "Ledger matching needs review."
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
         : recommendation?.reason || transaction.suggestionReason || "",

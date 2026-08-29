@@ -20,6 +20,7 @@ import {
   correctRowsFromRunningBalance,
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
+import { reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
 import {
   addBankStatementPageProvenance,
   shouldAttemptBankStatementSingleShot,
@@ -303,6 +304,22 @@ async function extractBankStatementPdfTextPages(data, options = {}) {
     pages,
     truncated: pdf.numPages > pageCount,
   };
+}
+
+async function readBankStatementPdfPageCount(data) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  if ("GlobalWorkerOptions" in pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
+  }
+  const pdf = await pdfjsLib.getDocument({
+    data: new Uint8Array(data),
+    disableWorker: true,
+    useSystemFonts: true,
+    verbosity: pdfjsLib.VerbosityLevel?.ERRORS,
+  }).promise;
+  const pageCount = pdf.numPages;
+  await pdf.destroy?.();
+  return pageCount;
 }
 
 function hasUsableBankStatementText(pages) {
@@ -1616,6 +1633,14 @@ async function extractBankStatementAdaptive({
   let extractionError = null;
   let textInfo = { pages: [], pageCount: isImage ? 1 : 0, truncated: false };
 
+  if (isPdf) {
+    try {
+      diagnostics.pageCount = await readBankStatementPdfPageCount(bytes);
+    } catch (error) {
+      diagnostics.errors.push({ stage: "pdf_page_count", error: diagnosticError(error) });
+    }
+  }
+
   if (isPdf && BANK_STATEMENT_ANYDOC_ENABLED) {
     try {
       await updateBankJob(jobId, { progress: 32, stage: "Converting PDF to Markdown" });
@@ -1667,12 +1692,14 @@ async function extractBankStatementAdaptive({
             );
         diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
         const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
+        parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText);
+        diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
         parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
         diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
         if (parsed.transactions.length > 0) {
           parsed.transactions = addBankStatementPageProvenance(parsed.transactions, {
             startPage: 1,
-            endPage: Math.max(1, anydocResult.tableCount),
+            endPage: Math.max(1, Number(diagnostics.pageCount || 1)),
             method: "anydoc_markdown_v1",
           });
           extractionSource = nextExtractionSource;
@@ -2039,8 +2066,8 @@ function markBankLedgerRecommendationsUnavailable(rows, reason, status = "unavai
       raw_payload: {
         ...rawPayload,
         aiLedgerRecommendation: {
-          matchType: "suspense",
-          action: "use_suspense",
+          matchType: null,
+          action: "needs_review",
           ledgerName: null,
           candidateLedgerNames: [],
           confidence: null,
@@ -2285,28 +2312,22 @@ async function runBankStatementJob(job) {
   let ledgerRecommendationError = null;
   let previewRows;
   const ledgerMatchingStartedAt = Date.now();
-  if (extractionIncomplete) {
-    ledgerRecommendationError =
-      "Ledger matching is paused because one or more statement pages still need extraction review.";
-    previewRows = markBankLedgerRecommendationsUnavailable(rows, ledgerRecommendationError, "deferred");
-  } else {
-    try {
-      previewRows = extractionSource === "anydoc_markdown_combined_ai"
-        ? markCombinedLedgerRecommendationsCompleted(rows, ledgerNames)
-        : await addBankLedgerRecommendations({
-            rows,
-            ownerUserId: job.owner_user_id,
-            connectionId: effectiveTallyConnectionId,
-            accountId: String(selectedAccountId || importRow.bank_account_id || ""),
-            companyName,
-            ledgerNames,
-          });
-    } catch (error) {
-      const detail = diagnosticError(error);
-      ledgerRecommendationError = `Statement rows were extracted, but ledger matching is temporarily unavailable: ${detail}`;
-      previewRows = markBankLedgerRecommendationsUnavailable(rows, ledgerRecommendationError);
-      console.warn(`[worker] ledger matching deferred for ${fileName}: ${detail}`);
-    }
+  try {
+    previewRows = extractionSource === "anydoc_markdown_combined_ai"
+      ? markCombinedLedgerRecommendationsCompleted(rows, ledgerNames)
+      : await addBankLedgerRecommendations({
+          rows,
+          ownerUserId: job.owner_user_id,
+          connectionId: effectiveTallyConnectionId,
+          accountId: String(selectedAccountId || importRow.bank_account_id || ""),
+          companyName,
+          ledgerNames,
+        });
+  } catch (error) {
+    const detail = diagnosticError(error);
+    ledgerRecommendationError = `Statement rows were extracted, but ledger matching is temporarily unavailable: ${detail}`;
+    previewRows = markBankLedgerRecommendationsUnavailable(rows, ledgerRecommendationError);
+    console.warn(`[worker] ledger matching deferred for ${fileName}: ${detail}`);
   }
   extractionDiagnostics.ledgerMatchingMs = Date.now() - ledgerMatchingStartedAt;
 
