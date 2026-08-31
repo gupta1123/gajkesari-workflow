@@ -150,6 +150,16 @@ async function authenticate(socket, message) {
   send(socket, { type: "authenticated", role, connectionId });
 }
 
+export function bankMatchingNeedsConnectorUpdate(operation, payload, bridgeVersion) {
+  const scopedRead = operation === "match_bank_statement" ||
+    (operation === "fetch_customer_open_bills" && payload?.queryPurpose === "bank_statement_match");
+  if (!scopedRead) return false;
+  const parts = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(bridgeVersion || ""));
+  if (!parts) return true;
+  const [major, minor, patch] = parts.slice(1).map(Number);
+  return major === 0 && (minor < 1 || (minor === 1 && patch < 59));
+}
+
 async function handleBrowserRequest(socket, message, meta) {
   const requestId = String(message.requestId || randomUUID());
   const operation = String(message.operation ?? "");
@@ -190,6 +200,13 @@ async function handleBrowserRequest(socket, message, meta) {
   if (meta.cancelledRequests.delete(requestId) || socket.readyState !== WebSocket.OPEN) return;
   if (authorized.sessionGeneration !== connectorMeta.sessionGeneration || authorized.installationId !== connectorMeta.installationId) {
     send(socket, { type: "result", requestId, success: false, error: "The connector session changed. Reconnect and refresh companies." });
+    return;
+  }
+  // Re-read version during authorization: a newly installed connector can
+  // authenticate its socket before its first version heartbeat reaches the DB.
+  if (bankMatchingNeedsConnectorUpdate(operation, message.payload, authorized.bridgeVersion)) {
+    send(socket, { type: "result", requestId, success: false,
+      error: "Install Gajkesari Tally Connector 0.1.59 or later on the Tally PC before checking matches. Older connectors use a heavy bill scan that can freeze Tally." });
     return;
   }
   if (pending.has(requestId)) {

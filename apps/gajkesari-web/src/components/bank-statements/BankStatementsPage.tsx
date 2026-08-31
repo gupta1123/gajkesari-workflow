@@ -5545,6 +5545,10 @@ export function BankStatementsPage() {
       const ledgerResult = rawByLedger[ledgerName] && typeof rawByLedger[ledgerName] === "object"
         ? rawByLedger[ledgerName] as Record<string, unknown>
         : null;
+      // Missing/failed reads are not evidence of zero outstanding bills. Leave
+      // them absent so allocation stays cannot_match_yet instead of Advance.
+      if (!ledgerResult || ledgerResult.complete === false || ledgerResult.error ||
+          !Array.isArray(ledgerResult.openBills) || !Array.isArray(ledgerResult.existingAdvances)) continue;
       billDataByLedger.set(ledgerName, {
         openBills: ledgerResult && Array.isArray(ledgerResult.openBills)
           ? ledgerResult.openBills as OpenBillReference[]
@@ -5555,7 +5559,9 @@ export function BankStatementsPage() {
       });
     }
 
-    if (Object.keys(rawByLedger).length === 0) {
+    if (!rawResult && result.complete !== false && !result.error &&
+        requestedLedgerNames.length === 1 && Array.isArray(result.openBills) &&
+        Array.isArray(result.existingAdvances)) {
       const legacyLedgerName =
         typeof result.ledgerName === "string" && requestedLedgerNames.includes(result.ledgerName)
           ? result.ledgerName
@@ -5942,21 +5948,28 @@ export function BankStatementsPage() {
         const draft = nextDrafts[transaction.id];
         return !draft || draft.requiresUserReview || !draft.isEligibleForPosting;
       }).length;
+      const incomingBillReviews = validTransactions.filter((transaction) => {
+        if (!isIncomingReceiptRow(transaction) || presenceDrafts[transaction.id]?.status !== "missing") return false;
+        if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) return false;
+        const draft = nextDrafts[transaction.id];
+        return !draft || draft.requiresUserReview || !draft.isEligibleForPosting;
+      }).length;
+      const readyIncomingRows = Math.max(0, missingReceiptRows - incomingBillReviews);
       const readyOutgoingRows = Math.max(0, missingOutgoingRows - outgoingBillReviews);
       const uncheckedRows = validTransactions.length - foundCount - ambiguousCount - missingReceiptRows - missingOutgoingRows;
       const hasRowReviewIssues =
         duplicateCount > 0 ||
         ambiguousCount > 0 ||
-        uncheckedRows > 0;
+        uncheckedRows > 0 || incomingBillReviews > 0 || outgoingBillReviews > 0;
       setBanner({
         tone: hasRowReviewIssues ? "info" : "success",
-        text: `Statement checked. ${missingReceiptRows > 0
-          ? `${missingReceiptRows} receipt${missingReceiptRows === 1 ? " is" : "s are"} ready to post.`
+        text: `Statement checked. ${readyIncomingRows > 0
+          ? `${readyIncomingRows} receipt${readyIncomingRows === 1 ? " is" : "s are"} ready to post.`
           : "No new receipts to post."} ${readyOutgoingRows > 0
             ? `${readyOutgoingRows} outgoing payment${readyOutgoingRows === 1 ? " is" : "s are"} ready to post.`
             : missingOutgoingRows > 0
               ? `${missingOutgoingRows} outgoing payment${missingOutgoingRows === 1 ? " needs" : "s need"} review.`
-              : "No new outgoing payments to post."}${hasRowReviewIssues ? " Review the highlighted rows." : ""}${
+              : "No new outgoing payments to post."}${incomingBillReviews > 0 ? ` ${incomingBillReviews} receipt${incomingBillReviews === 1 ? " needs" : "s need"} bill review.` : ""}${hasRowReviewIssues ? " Review the highlighted rows." : ""}${
             balanceProof?.balancesMatch === false
               ? " Balance differs from Tally, but this does not block posting."
               : ""

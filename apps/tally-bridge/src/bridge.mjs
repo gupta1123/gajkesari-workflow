@@ -14,7 +14,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.58";
+const BRIDGE_VERSION = "0.1.59";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -24,6 +24,10 @@ const TALLY_HEARTBEAT_PROBE_INTERVAL_MS = 15_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
+const BANK_MATCH_READ_TIMEOUT_MS = 20_000;
+const BANK_MATCH_MAX_XML_BYTES = 8 * 1024 * 1024;
+const BANK_MATCH_MAX_BILL_RESULT_BYTES = 4 * 1024 * 1024;
+const BANK_MATCH_BILL_BUDGET_MS = 90_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
 const CONFIG_DIR = path.join(os.homedir(), ".gajkesari-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
@@ -2205,13 +2209,15 @@ async function exportTallyCollection(tallyUrl, options) {
   return exportTallyXml(
     tallyUrl,
     buildCollectionExportXml(options),
-    options.collectionName
+    options.collectionName,
+    options
   );
 }
 
-async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
+async function exportTallyXml(tallyUrl, xml, label = "Tally export", options = {}) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TALLY_EXPORT_TIMEOUT_MS);
+  const timeoutMs = options.timeoutMs || TALLY_EXPORT_TIMEOUT_MS;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(tallyUrl, {
@@ -2224,7 +2230,30 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
         ? AbortSignal.any([controller.signal, liveReadContext.getStore().signal]) : controller.signal,
     });
 
-    const text = await response.text();
+    let text;
+    if (options.maxResponseBytes && response.body) {
+      // Bound memory before collecting/parsing XML on low-memory client PCs.
+      const reader = response.body.getReader();
+      const chunks = [];
+      let bytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > options.maxResponseBytes) {
+            controller.abort();
+            throw new Error(`${label} exceeded the safe response size. Narrow the statement period or review this ledger separately.`);
+          }
+          chunks.push(Buffer.from(value));
+        }
+        text = Buffer.concat(chunks, bytes).toString("utf8");
+      } finally {
+        reader.releaseLock();
+      }
+    } else {
+      text = await response.text();
+    }
     const result = parseExportResult(text, response.status);
     if (!result.success) {
       throw new Error(
@@ -2236,7 +2265,8 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
     return text;
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`${label} timed out after ${Math.round(TALLY_EXPORT_TIMEOUT_MS / 1000)} seconds.`);
+      if (liveReadContext.getStore()?.signal?.aborted) throw error;
+      throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)} seconds.`, { cause: error });
     }
     throw error;
   } finally {
@@ -3402,7 +3432,8 @@ function toOpenBill(block, ledgerName, evidence = {}) {
   if (pendingAmount <= 0) return null;
 
   const sourceVoucherType = getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null;
-  const kind = classifyOpenBillReferenceKind({
+  const nativeAdvance = String(getTagText(block, "ISADVANCE") || "").trim().toLowerCase();
+  const kind = nativeAdvance === "yes" ? "advance" : nativeAdvance === "no" ? "bill" : classifyOpenBillReferenceKind({
     billType: billReferenceType(block),
     sourceVoucherType,
     referenceName,
@@ -3666,7 +3697,112 @@ async function exportTargetedBillEvidenceXml(tallyUrl, { companyName, ledgerName
   return { xml: responses.join("\n"), batchCount: batches.length };
 }
 
+async function fetchLedgerScopedBankBills(config, commandPayload, dependencies) {
+  // ChildOf gathers only this ledger. A Filter on Type: Bill first gathers all
+  // company bills; a voucher-history fallback can freeze Tally on a 4 GB PC.
+  const ledgerNames = [...new Set([
+    ...(Array.isArray(commandPayload.ledgerNames) ? commandPayload.ledgerNames : []),
+    commandPayload.ledgerName,
+  ].map((name) => String(name || "").trim()).filter(Boolean))];
+  if (!ledgerNames.length) throw new Error("Party open bill fetch requires ledgerName.");
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+  const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
+  const startedAt = Date.now();
+  const byLedger = Object.fromEntries(ledgerNames.map((name) => [name, {
+    ...emptyOpenBillBucket(name), complete: false, error: "Bill read was not completed.",
+  }]));
+  let billBatchCount = 0;
+  let billResultBytes = 0;
+  let stopReason = null;
+  for (const [index, ledgerName] of ledgerNames.entries()) {
+    dependencies.signal?.throwIfAborted();
+    liveReadContext.getStore()?.signal?.throwIfAborted();
+    if (Date.now() - startedAt >= BANK_MATCH_BILL_BUDGET_MS) {
+      stopReason ||= "The bill-read time budget was reached. Unchecked ledgers need review; no automatic retry was made.";
+    }
+    if (stopReason) {
+      byLedger[ledgerName].error = stopReason;
+      continue;
+    }
+    dependencies.onProgress?.(`Reading open bills ${index + 1}/${ledgerNames.length}: ${ledgerName}`);
+    let xml;
+    try {
+      billBatchCount += 1;
+      xml = await exportCollection(tallyUrl, {
+        collectionName: `Gajkesari Ledger Open Bills ${index + 1}`,
+        tallyType: "Bills", childOf: tallyFormulaString(ledgerName),
+        fetchFields: "Name,Parent,LedgerName,BillDate,DueDate,OpeningBalance,ClosingBalance,IsAdvance,BillType",
+        companyName: commandPayload.companyName || null, dateTo: asOfDate,
+        timeoutMs: Math.min(BANK_MATCH_READ_TIMEOUT_MS, BANK_MATCH_BILL_BUDGET_MS - (Date.now() - startedAt)),
+        maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+      });
+    } catch (error) {
+      dependencies.signal?.throwIfAborted();
+      liveReadContext.getStore()?.signal?.throwIfAborted();
+      // Aborting HTTP does not stop Tally's internal report calculation. Do not
+      // queue more reads or retry against an unresponsive Tally in this run.
+      stopReason = `Bill reading stopped: ${error?.message || "Tally did not respond"}`;
+      byLedger[ledgerName].error = stopReason;
+      continue;
+    }
+    const bucket = emptyOpenBillBucket(ledgerName);
+    try {
+      if (!/<COLLECTION(?:\s|\/?>)/i.test(xml) || !/<\/ENVELOPE\s*>/i.test(xml) || /<LINEERROR[\s>]/i.test(xml)) {
+        throw new Error("Tally did not return a complete bill collection.");
+      }
+      for (const block of extractBlocks(xml, "BILL")) {
+        const parent = billLedgerName(block);
+        // Do not combine punctuation-distinct ledger identities or trust an
+        // unexpectedly unscoped result, even if Tally reports HTTP success.
+        if (parent && parent.trim().toLowerCase() !== ledgerName.toLowerCase()) {
+          throw new Error("Tally returned bills for another ledger.");
+        }
+        const closing = parseTallyAmount(getTagText(block, "CLOSINGBALANCE"));
+        if (closing === null) throw new Error("Tally omitted the pending bill balance.");
+        if (closing === 0) continue;
+        const nativeAdvance = String(getTagText(block, "ISADVANCE") || "").trim();
+        if (!/^(yes|no)$/i.test(nativeAdvance) && !/^(advance|new ref|agst ref)$/i.test(billReferenceType(block))) {
+          throw new Error("Tally omitted the bill/advance type. Review this ledger separately.");
+        }
+        const entry = toOpenBill(block, ledgerName);
+        if (!entry) throw new Error("Tally returned an incomplete bill reference.");
+        const { kind, ...value } = entry;
+        bucket[kind === "advance" ? "existingAdvances" : "openBills"].push(value);
+        bucket.rawCount += 1;
+      }
+      const bucketBytes = Buffer.byteLength(JSON.stringify(bucket), "utf8");
+      if (billResultBytes + bucketBytes > BANK_MATCH_MAX_BILL_RESULT_BYTES) {
+        stopReason = "The safe bill-result size was reached. Review the remaining ledgers separately.";
+        throw new Error(stopReason);
+      }
+      billResultBytes += bucketBytes;
+      byLedger[ledgerName] = { ...bucket, complete: true, error: null };
+    } catch (error) {
+      // Discard partial allocations for this ledger; other complete ledgers
+      // retain their results and can still be posted independently.
+      byLedger[ledgerName].error = error.message;
+    }
+  }
+  const first = byLedger[ledgerNames[0]];
+  return { success: true, result: {
+    ledgerName: ledgerNames[0], ledgerNames, byLedger,
+    complete: Object.values(byLedger).every((bucket) => bucket.complete),
+    ...(first.complete ? { openBills: first.openBills, existingAdvances: first.existingAdvances } : {}),
+    queryDiagnostics: {
+      requestedLedgerCount: ledgerNames.length, billBatchCount, billQueryMode: "ledger_child_of",
+      incompleteLedgerCount: Object.values(byLedger).filter((bucket) => !bucket.complete).length,
+      billObjectCount: Object.values(byLedger).reduce((total, bucket) => total + bucket.rawCount, 0),
+      voucherFallbackUsed: false, voucherBatchCount: 0, billResultBytes,
+      balanceBasis: "current_outstanding", totalMs: Date.now() - startedAt, asOfDate,
+    },
+  } };
+}
+
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, dependencies = {}) {
+  if (commandPayload.queryPurpose === "bank_statement_match") {
+    return fetchLedgerScopedBankBills(config, commandPayload, dependencies);
+  }
   const ledgerNames = uniquePayloadLedgerNames(commandPayload);
   if (ledgerNames.length === 0) {
     throw new Error("Party open bill fetch requires ledgerName.");
@@ -3677,12 +3813,9 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
   const requestedDateFrom = normalizeDateForCompare(commandPayload.dateFrom) || null;
-  // A full Bill collection is materially faster in large real-world companies
-  // than Tally formula-filtering a small set of party ledgers. Keep the large
-  // XML local to the connector and return only the requested ledger buckets.
-  const forceFull =
-    commandPayload.queryPurpose === "bank_statement_match" ||
-    commandPayload.queryStrategy === "full_snapshot";
+  // Legacy non-bank consumers may explicitly request a snapshot. Bank matching
+  // always takes the ChildOf path above, even if full_snapshot was requested.
+  const forceFull = commandPayload.queryStrategy === "full_snapshot";
   const forceTargeted = !forceFull && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   // Tally's local HTTP listener processes reports serially. Concurrent large
@@ -3857,7 +3990,7 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
         return [];
       }
       const ledgerName = String(transactionById.get(transactionId)?.counterpartyLedgerName || "").trim();
-      return ledgerName ? [ledgerName] : [];
+      return ledgerName && !/^suspense(?:\s|$)/i.test(ledgerName) ? [ledgerName] : [];
     })
   ));
 
@@ -3913,33 +4046,28 @@ async function fetchBankReconciliationVouchers(
 ) {
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   const startedAt = Date.now();
-  const bankEntryFormulaName = "AutodealerBankLedgerEntry";
-  const bankVoucherFormulaName = "AutodealerBankVoucher";
-  // The collection is already tightly restricted to one bank ledger and the
-  // statement period. Fetch bank-allocation references with the primary export
+  // Secondary collection: gather this bank's vouchers directly, instead of
+  // gathering all company vouchers and applying FilterCount afterwards.
+  // Fetch bank-allocation references with the primary export
   // so a missing top-level Reference does not trigger another serial Tally
   // request for the same vouchers.
   const leanXml = await exportCollection(tallyUrl, {
     collectionName: "Gajkesari Bank Statement Reconciliation",
-    tallyType: "Voucher",
+    tallyType: "Vouchers : Ledger",
+    childOf: tallyFormulaString(bankLedgerName),
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
     companyName,
     dateFrom,
     dateTo,
-    formulae: [
-      {
-        name: bankEntryFormulaName,
-        formula: buildRequestedLedgerFormula([bankLedgerName], ["$LedgerName"]),
-      },
-      {
-        name: bankVoucherFormulaName,
-        formula: `$$FilterCount:AllLedgerEntries:${bankEntryFormulaName} > 0`,
-      },
-    ],
-    filterNames: [bankVoucherFormulaName],
+    timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+    maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
   });
   const leanCompletedAt = Date.now();
+  if (!/<\/ENVELOPE\s*>/i.test(leanXml) ||
+      !/<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(leanXml)) {
+    throw new Error("Tally did not return a complete bank voucher collection. Duplicate checking could not be completed.");
+  }
   const vouchers = parseVoucherCollection(leanXml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
   );
@@ -3954,6 +4082,7 @@ async function fetchBankReconciliationVouchers(
       detailedVoucherCount: 0,
       detailBatchCount: 0,
       primaryIncludesBankReferences: true,
+      queryMode: "bank_ledger_child_of",
     },
   };
 }
@@ -5461,7 +5590,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "fetch_customer_open_bills") {
-          const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {});
+          const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {}, { signal: controller.signal, onProgress });
           await assertCompany();
           return outcome.result || outcome;
         }

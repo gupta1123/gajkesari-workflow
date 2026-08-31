@@ -145,3 +145,27 @@ test("UI and submission use ready scopes, with no unresolved advance fallback", 
   assert.equal((page.match(/setBillMatchingRequested\(false\)/g) || []).length, 2,
     "only clearing or loading a statement resets direct mode; failed checks must not reset it");
 });
+
+test("missing and failed bill buckets never become empty-ledger Advance candidates", async () => {
+  const page = await readFile(new URL("../components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("page.tsx", page, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let helper;
+  function find(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "openBillDataByLedgerFromResult") helper = node;
+    ts.forEachChild(node, find);
+  }
+  find(ast);
+  assert.ok(helper);
+  const js = ts.transpileModule(helper.getText(ast), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const parse = new Function(`${js}; return openBillDataByLedgerFromResult;`)();
+  const good = { complete: true, openBills: [], existingAdvances: [] };
+  const result = parse({ openBillsByLedger: {
+    ready: good, failed: { ...good, complete: false, error: "Timeout" }, malformed: { complete: true },
+  } }, ["ready", "failed", "missing", "malformed"], "openBillsByLedger");
+  assert.deepEqual([...result.keys()], ["ready"]);
+  assert.equal(parse({}, ["A"]).size, 0);
+  assert.equal(parse({ byLedger: {}, openBills: [], existingAdvances: [] }, ["A"]).size, 0);
+  assert.equal(parse({ complete: false, openBills: [], existingAdvances: [] }, ["A"]).size, 0);
+  assert.equal(parse({ openBills: [], existingAdvances: [] }, ["A", "B"]).size, 0);
+  assert.equal(parse({ ledgerName: "A", openBills: [], existingAdvances: [] }, ["A"]).size, 1);
+});

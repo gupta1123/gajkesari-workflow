@@ -3,7 +3,19 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { WebSocket } from "ws";
 
-import { startCashDiscountGateway } from "./server.mjs";
+import { startCashDiscountGateway, bankMatchingNeedsConnectorUpdate } from "./server.mjs";
+
+test("bank matching requires the scoped-read connector; unrelated operations remain available", () => {
+  for (const version of [undefined, "", "bad", "0.1.57", "0.1.58", "0.0.100"]) {
+    assert.equal(bankMatchingNeedsConnectorUpdate("match_bank_statement", {}, version), true);
+    assert.equal(bankMatchingNeedsConnectorUpdate("fetch_customer_open_bills", { queryPurpose: "bank_statement_match" }, version), true);
+    assert.equal(bankMatchingNeedsConnectorUpdate("company_check", {}, version), false);
+    assert.equal(bankMatchingNeedsConnectorUpdate("scan", {}, version), false);
+  }
+  for (const version of ["0.1.59", "0.1.60", "0.2.0", "1.0.0"]) {
+    assert.equal(bankMatchingNeedsConnectorUpdate("match_bank_statement", {}, version), false);
+  }
+});
 
 function nextMessage(socket, predicate = () => true) {
   return new Promise((resolve, reject) => {
@@ -30,6 +42,7 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     if (request.url === "/api/tally/live/session") {
       response.end(JSON.stringify({
         authenticated: true,
+        bridgeVersion: "0.1.59",
         ownerUserId: "user-1",
         connectionId: "connection-1",
         customerScope: null,
@@ -235,6 +248,7 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
 
 test("two PCs sharing a login stay isolated; cancellation and stale generations are fenced", async (t) => {
   const generations = { a: 1, b: 1 };
+  const versions = { a: "0.1.58", b: "0.1.59" };
   const httpServer = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -246,7 +260,7 @@ test("two PCs sharing a login stay isolated; cancellation and stale generations 
       : request.headers["x-tally-browser-binding"] === `binding-${pc}`);
     if (!allowed) { response.writeHead(403); response.end(JSON.stringify({ error: "Wrong PC binding" })); return; }
     response.end(JSON.stringify({
-      ownerUserId: "shared-login", connectionId: pc, installationId: `installation-${pc}`,
+      ownerUserId: "shared-login", connectionId: pc, installationId: `installation-${pc}`, bridgeVersion: versions[pc],
       sessionGeneration: generations[pc], target: {
         installationId: `installation-${pc}`, companyDatasetId: `dataset-${pc}`,
         companyGuid: `guid-${pc}`, connectionId: pc, sessionGeneration: generations[pc], companyName: "Same",
@@ -277,6 +291,13 @@ test("two PCs sharing a login stay isolated; cancellation and stale generations 
   assert.match(wrong.result.error, /Wrong PC/);
   let bOperations = 0;
   b.on("message", (buffer) => { if (JSON.parse(buffer).type === "operation") bOperations += 1; });
+  let aOperations = 0;
+  a.on("message", (buffer) => { if (JSON.parse(buffer).type === "operation") aOperations += 1; });
+  const updateRequired = nextMessage(browser, (message) => message.type === "result" && message.requestId === "old-connector");
+  browser.send(JSON.stringify({ type: "request", requestId: "old-connector", operation: "match_bank_statement", companyName: "Same" }));
+  assert.match((await updateRequired).error, /0\.1\.59/);
+  assert.equal(aOperations, 0, "old connector never receives the heavy request");
+  versions.a = "0.1.59"; // First heartbeat after upgrade; socket's cached metadata is still old.
   const operationPromise = nextMessage(a, (message) => message.type === "operation");
   browser.send(JSON.stringify({ type: "request", requestId: "isolated", operation: "match_bank_statement",
     companyName: "Same", companyDatasetId: "dataset-a", payload: { tallyUrl: "http://other-pc:9000" } }));

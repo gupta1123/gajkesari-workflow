@@ -391,14 +391,18 @@ test("voucher fallback is required only for incomplete Bill exports", () => {
   assert.equal(openBillBlockRequiresVoucherFallback(incomplete), true);
 });
 
-test("zero targeted bills avoids the voucher export", async () => {
+const billCollection = (bills = "") => `<ENVELOPE><STATUS>1</STATUS><COLLECTION>${bills}</COLLECTION></ENVELOPE>`;
+
+test("zero ledger-scoped bills avoids the voucher export", async () => {
   const calls = [];
-  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return billCollection(); } });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].tallyType, "Bill");
+  assert.equal(calls[0].tallyType, "Bills");
+  assert.equal(calls[0].childOf, '"Customer A"');
   assert.equal(calls[0].filterNames, undefined);
   assert.deepEqual(result.result.openBills, []);
-  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "ledger_child_of");
+  assert.equal(result.result.byLedger["Customer A"].complete, true);
   assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
@@ -409,20 +413,107 @@ test("complete Bill data avoids the voucher fallback", async () => {
   assert.equal(result.result.openBills[0].pendingAmount, 500);
 });
 
-test("incomplete Bill data performs a targeted voucher fallback", async () => {
+test("incomplete bank Bill data is held, never a voucher-history fallback", async () => {
   const calls = [];
-  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return options.tallyType === "Bill" ? '<ENVELOPE><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><OPENINGBALANCE>500</OPENINGBALANCE></BILL></ENVELOPE>' : '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>'; } });
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map((call) => call.tallyType), ["Bill", "Voucher"]);
-  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, true);
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return billCollection('<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><OPENINGBALANCE>500</OPENINGBALANCE></BILL>'); } });
+  assert.equal(calls.length, 1);
+  assert.equal(result.result.byLedger["Customer A"].complete, false);
+  assert.match(result.result.byLedger["Customer A"].error, /pending bill balance/);
+  assert.equal(result.result.openBills, undefined);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
-test("large ledger sets use one full Bill collection", async () => {
+test("51 ledgers stay sequential and ledger-scoped, even with full_snapshot requested", async () => {
   const calls = [];
+  let active = 0;
   const ledgerNames = Array.from({ length: 51 }, (_, index) => `Customer ${index + 1}`);
-  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames, queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
-  assert.equal(calls.length, 1);
-  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames, queryPurpose: "bank_statement_match", queryStrategy: "full_snapshot" }, { exportCollection: async (_url, options) => {
+    assert.equal(++active, 1); calls.push(options); await Promise.resolve(); active--; return billCollection();
+  } });
+  assert.equal(calls.length, 51);
+  for (const [index, call] of calls.entries()) {
+    assert.equal(call.childOf, JSON.stringify(ledgerNames[index]));
+    assert.equal(call.tallyType, "Bills");
+    assert.equal(call.filterNames, undefined);
+    assert.equal(call.formulae, undefined);
+    assert.equal(call.timeoutMs <= 20000, true);
+    assert.equal(call.maxResponseBytes, 8 * 1024 * 1024);
+  }
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "ledger_child_of");
+});
+
+test("native IsAdvance and remaining balance are authoritative without voucher evidence", async () => {
+  const ledgerNames = ['A & B "Ltd"', 'A-B', 'AB'];
+  const calls = [];
+  const outcome = await fetchCustomerOpenBillsFromTally({}, { ledgerNames, queryPurpose: "bank_statement_match" }, {
+    exportCollection: async (_url, options) => { calls.push(options); return billCollection(
+      '<BILL NAME="ADV-named-invoice"><ISADVANCE>No</ISADVANCE><BILLDATE>20260801</BILLDATE><OPENINGBALANCE>-125000</OPENINGBALANCE><CLOSINGBALANCE>-20000</CLOSINGBALANCE></BILL>' +
+      '<BILL NAME="Receipt-123"><ISADVANCE>Yes</ISADVANCE><CLOSINGBALANCE>30000</CLOSINGBALANCE></BILL>'); },
+  });
+  assert.equal(calls.length, 3, "punctuation-distinct ledgers are not merged");
+  assert.match(buildCollectionExportXml(calls[0]), /CHILD OF : &quot;A &amp; B \\&quot;Ltd\\&quot;&quot;/);
+  const bucket = outcome.result.byLedger[ledgerNames[0]];
+  assert.equal(bucket.complete, true);
+  assert.equal(bucket.openBills[0].pendingAmount, 20000);
+  assert.equal(bucket.openBills[0].originalAmount, 125000);
+  assert.equal(bucket.openBills[0].invoiceDate, "2026-08-01");
+  assert.equal(bucket.existingAdvances[0].pendingAdvanceAmount, 30000);
+  assert.equal(outcome.result.queryDiagnostics.voucherBatchCount, 0);
+});
+
+test("partial or unscoped bill XML holds only that ledger, not complete ledgers", async () => {
+  const responses = [
+    billCollection('<BILL NAME="INV"><PARENT>Wrong ledger</PARENT><ISADVANCE>No</ISADVANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>'),
+    billCollection('<BILL NAME="INV"><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>'),
+    '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>',
+    billCollection(),
+  ];
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A", "B", "C", "D"], queryPurpose: "bank_statement_match" }, {
+    exportCollection: async () => responses.shift(),
+  });
+  for (const name of ["A", "B", "C"]) assert.equal(result.byLedger[name].complete, false);
+  assert.equal(result.byLedger.D.complete, true);
+  assert.deepEqual(result.byLedger.D.openBills, []);
+  assert.equal(result.queryDiagnostics.incompleteLedgerCount, 3);
+});
+
+test("timeout stops subsequent reads but preserves completed ledger buckets", async () => {
+  let count = 0;
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A", "B", "C"], queryPurpose: "bank_statement_match" }, {
+    exportCollection: async () => { if (++count === 2) throw new Error("Tally timed out"); return billCollection(); },
+  });
+  assert.equal(count, 2);
+  assert.equal(result.byLedger.A.complete, true);
+  assert.equal(result.byLedger.B.complete, false);
+  assert.equal(result.byLedger.C.complete, false);
+  assert.match(result.byLedger.C.error, /stopped.*timed out/);
+});
+
+test("bank bill response byte limit is enforced before parsing", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response("x".repeat(8 * 1024 * 1024 + 1)));
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A"], queryPurpose: "bank_statement_match" });
+  assert.equal(result.byLedger.A.complete, false);
+  assert.match(result.byLedger.A.error, /safe response size/);
+});
+
+test("combined ledger results remain bounded for the live socket", async () => {
+  let calls = 0;
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A", "B", "C"], queryPurpose: "bank_statement_match" }, {
+    exportCollection: async () => { calls++; return billCollection(`<BILL NAME="${"x".repeat(1500000)}"><ISADVANCE>No</ISADVANCE><CLOSINGBALANCE>100</CLOSINGBALANCE></BILL>`); },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.byLedger.A.complete, true);
+  assert.equal(result.byLedger.B.complete, false);
+  assert.equal(result.byLedger.C.complete, false);
+  assert.match(result.byLedger.B.error, /safe bill-result size/);
+  assert.ok(result.queryDiagnostics.billResultBytes < 4 * 1024 * 1024);
+});
+
+test("malformed bank response cannot mark every row missing", async () => {
+  await assert.rejects(() => reconcileBankTransactionsInTally({}, {
+    bankLedgerName: "Bank", includeBalanceProof: false,
+    transactions: [{ transactionId: "A", voucherDate: "2026-08-24", amount: 100, expectedDirection: "incoming" }],
+  }, { exportCollection: async () => '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>' }), /Duplicate checking could not be completed/);
 });
 
 test("a failed Bill query is not reported as an empty result", async () => {
@@ -523,6 +614,11 @@ test("statement reconciliation uses one complete export when top-level reference
 
   assert.equal(calls.length, 1);
   assert.match(calls[0].fetchFields, /BankAllocations/);
+  assert.equal(calls[0].tallyType, "Vouchers : Ledger");
+  assert.equal(calls[0].childOf, '"ICICI Current Account"');
+  assert.equal(calls[0].dateFrom, "2026-08-01");
+  assert.equal(calls[0].dateTo, "2026-08-01");
+  assert.equal(calls[0].formulae, undefined);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
 });
@@ -593,10 +689,10 @@ test("live statement matching verifies vouchers and fetches bills in one connect
     {
       exportCollection: async (_url, options) => {
         calls.push(options);
-        if (options.tallyType === "Voucher") {
+        if (options.tallyType === "Vouchers : Ledger") {
           return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-FOUND-1</REFERENCE><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
         }
-        return '<ENVELOPE><BILL NAME="INV-B-1"><LEDGERNAME>Customer B</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260720</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>';
+        return billCollection('<BILL NAME="INV-B-1"><LEDGERNAME>Customer B</LEDGERNAME><ISADVANCE>No</ISADVANCE><BILLDATE>20260720</BILLDATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>');
       },
     }
   );
@@ -608,6 +704,24 @@ test("live statement matching verifies vouchers and fetches bills in one connect
   assert.equal(outcome.result.openBillsByLedger["Customer B"].openBills.length, 1);
   assert.equal(outcome.result.openBillsByLedger["Customer A"], undefined);
   assert.equal(outcome.result.matchDiagnostics.openBillCheck.requestedLedgerCount, 1);
+});
+
+test("Suspense and non-bill-wise rows get duplicate checking but no bill reads", async () => {
+  const calls = [];
+  const { result } = await matchBankStatementInTally({}, {
+    bankLedgerName: "Bank", includeBalanceProof: false,
+    billEligibleTransactionIds: ["party", "suspense"],
+    transactions: ["party", "suspense", "direct"].map((id) => ({
+      transactionId: id, voucherDate: "2026-08-24", amount: 100,
+      expectedDirection: "incoming", referenceNumber: id,
+      counterpartyLedgerName: id === "party" ? "Customer" : id === "suspense" ? "Suspense" : "Interest Income",
+    })),
+  }, { exportCollection: async (_url, options) => { calls.push(options); return billCollection(); } });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.childOf), ['"Bank"', '"Customer"']);
+  assert.equal(result.transactions.length, 3);
+  assert.ok(result.transactions.every((row) => row.verificationStatus === "missing"));
+  assert.deepEqual(result.billLedgerNames, ["Customer"]);
 });
 
 test("open-bill classification preserves invoices and recovers exported advances", () => {
