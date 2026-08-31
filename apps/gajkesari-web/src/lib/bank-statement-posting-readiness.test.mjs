@@ -41,6 +41,27 @@ test("unknown, failed, found, and ambiguous checks are excluded independently", 
   assert.equal([ready(), ready({ presence: { status: "ambiguous" } })].filter(isReadyForTallyPosting).length, 1);
 });
 
+test("direct posting permits unchecked normal, party and Suspense vouchers without allocations", () => {
+  for (const ledgerName of ["Customer A", "Supplier B", "Bank Charges", "Suspense"]) {
+    for (const billRequired of [true, false]) {
+      assert.equal(isReadyForTallyPosting(ready({
+        ledgerName, billRequired, directPosting: true, presence: undefined,
+      })), true);
+    }
+  }
+});
+
+test("direct posting never bypasses known duplicates, failed checks or allocation review", () => {
+  for (const status of ["checking", "failed", "found", "ambiguous"]) {
+    assert.equal(isReadyForTallyPosting(ready({ directPosting: true, presence: { status } })), false);
+  }
+  for (const overrides of [
+    { ledgerName: "" }, { ledgerNeedsReview: true }, { amount: 0 }, { amount: NaN },
+    { allocation: allocation() }, { allocation: allocation({status: "stale_data"}) },
+    { presence: {status: "missing", duplicateInTally: true} },
+  ]) assert.equal(isReadyForTallyPosting(ready({directPosting: true, ...overrides})), false);
+});
+
 test("missing ledgers and unresolved ledger confirmation are not ready", () => {
   assert.equal(isReadyForTallyPosting(ready({ ledgerName: "  " })), false);
   assert.equal(isReadyForTallyPosting(ready({ ledgerNeedsReview: true })), false);
@@ -118,4 +139,9 @@ test("UI and submission use ready scopes, with no unresolved advance fallback", 
   assert.doesNotMatch(page, /Review ambiguous Tally matches before sending anything/);
   assert.doesNotMatch(page, /buildDirectAdvanceAllocation\(reviewedTransaction\)/);
   assert.match(page, /held for review — not included in posting/);
+  assert.match(page, /const directPosting = !billMatchingRequested/);
+  assert.match(page, /async function matchPendingBills\(\) \{\s*setBillMatchingRequested\(true\)/);
+  assert.match(page, /!directPosting && billAllocation\?\.status === "ready_to_post"/);
+  assert.equal((page.match(/setBillMatchingRequested\(false\)/g) || []).length, 2,
+    "only clearing or loading a statement resets direct mode; failed checks must not reset it");
 });

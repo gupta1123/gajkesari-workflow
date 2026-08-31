@@ -26,6 +26,19 @@ import {
   testTally,
 } from "./bridge.mjs";
 
+test("direct receipt and payment XML contain no bill reference or Advance allocation", () => {
+  for (const voucherType of ["Receipt", "Payment"]) {
+    const xml = buildBankVoucherXml({
+      voucherType, voucherDate: "2026-08-24", bankLedgerName: "Axis Bank",
+      counterpartyLedgerName: "Test Party", counterpartyIsPartyLedger: true,
+      amount: 20000, referenceNumber: "DIRECT-TEST", billAllocations: [],
+    }, "Test Company");
+    assert.match(xml, /Test Party/);
+    assert.match(xml, /Axis Bank/);
+    assert.doesNotMatch(xml, /BILLALLOCATIONS\.LIST|<BILLTYPE>|Advance|Agst Ref/);
+  }
+});
+
 test("cancelled and expired interactive work never enters Tally", async () => {
   const scheduler = createExclusiveScheduler();
   let release;
@@ -190,7 +203,7 @@ test("outgoing supplier payments create Payment vouchers with bill allocations",
   assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>/);
 });
 
-test("direct party posting creates an Advance without settling an existing bill", () => {
+test("explicitly requested Advance allocation does not settle an existing bill", () => {
   const xml = buildBankVoucherXml({
     companyName: "Solution Nyx",
     voucherType: "Receipt",

@@ -3183,6 +3183,9 @@ export function BankStatementsPage() {
   const [matchingBills, setMatchingBills] = useState(false);
   const matchAbortRef = useRef<AbortController | null>(null);
   const [tallyCheckAttempted, setTallyCheckAttempted] = useState(false);
+  // Unlike tallyCheckAttempted, this remains true after a failed/stale check.
+  // A failed review must never silently switch the statement to direct posting.
+  const [billMatchingRequested, setBillMatchingRequested] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
   const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
@@ -3567,8 +3570,10 @@ export function BankStatementsPage() {
     () => transactionsNeedingTallyWork.filter(isOutgoingPaymentRow),
     [transactionsNeedingTallyWork]
   );
+  const directPosting = !billMatchingRequested;
   const readyPostingTransactions = useMemo(() => validTransactions.filter((transaction) =>
     isReadyForTallyPosting({
+      directPosting,
       ledgerName: transaction.selectedLedgerName,
       ledgerNeedsReview: getReviewStatus(transaction) === "needs_review",
       presence: tallyPresenceByTransactionId[transaction.id],
@@ -3576,7 +3581,7 @@ export function BankStatementsPage() {
       amount: Math.max(parseNumber(transaction.creditAmount) ?? 0, parseNumber(transaction.debitAmount) ?? 0),
       allocation: billAllocationsByTransactionId[transaction.id],
     })
-  ), [validTransactions, tallyPresenceByTransactionId, ledgerMasters, billAllocationsByTransactionId]);
+  ), [validTransactions, tallyPresenceByTransactionId, ledgerMasters, billAllocationsByTransactionId, directPosting]);
   const readyReceiptTransactions = readyPostingTransactions.filter(isIncomingReceiptRow);
   const readyPaymentTransactions = readyPostingTransactions.filter(isOutgoingPaymentRow);
   const readyPostingIds = useMemo(() => new Set(readyPostingTransactions.map((row) => row.id)), [readyPostingTransactions]);
@@ -4371,6 +4376,7 @@ export function BankStatementsPage() {
     setPostedTransactionIds(new Set());
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
+    setBillMatchingRequested(false);
     selectReviewTransaction(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
@@ -4999,6 +5005,7 @@ export function BankStatementsPage() {
     setPostedTransactionIds(new Set());
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
+    setBillMatchingRequested(false);
     setReviewFiltersOpen(false);
     setReviewSearch("");
     setReviewWorkStatusFilter("all");
@@ -5817,6 +5824,7 @@ export function BankStatementsPage() {
   }
 
   async function matchPendingBills() {
+    setBillMatchingRequested(true);
     if (preview?.requiresManualExtraction || preview?.extractionDiagnostics?.coverageComplete === false) {
       const unresolvedPages = preview.extractionDiagnostics?.unresolvedPages ?? [];
       showToast(
@@ -6030,6 +6038,7 @@ export function BankStatementsPage() {
       return;
     }
     const billEligibleTransactions = selectedTallyWorkTransactions.filter((transaction) => {
+      if (directPosting) return false;
       const draft = billAllocationsByTransactionId[transaction.id];
       return (
         isBillMatchEligibleTransaction(transaction, ledgerMasters) &&
@@ -6224,7 +6233,7 @@ export function BankStatementsPage() {
               const billAllocation = reviewedTransaction
                 ? billAllocationsByTransactionId[reviewedTransaction.id]
                 : null;
-              const reviewedBillAllocations = billAllocation?.status === "ready_to_post"
+              const reviewedBillAllocations = !directPosting && billAllocation?.status === "ready_to_post"
                 ? billAllocation.allocations
                 : [];
               const postingBillAllocations = reviewedBillAllocations.length > 0
@@ -6238,6 +6247,7 @@ export function BankStatementsPage() {
                   "Suspense",
                 createLedgerName: "",
                 createLedgerParentName: "",
+                directPosting,
                 billMatchingVerified:
                   !reviewedTransaction ||
                   !isBillMatchEligibleTransaction(reviewedTransaction, ledgerMasters) ||
@@ -8743,6 +8753,11 @@ export function BankStatementsPage() {
               ) : null}
             </div>
             <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
+              {directPosting && !statementDoneSummary && (
+                <span className="text-[10px] text-slate-600">
+                  Direct vouchers · No bill allocation or Advance · Duplicates checked before posting
+                </span>
+              )}
               <Button
                 className="h-8 flex-1 rounded-lg border-[#ddd3c5] bg-white px-3 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] sm:flex-none"
                 onClick={() => clearStatementReview()}

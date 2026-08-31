@@ -4,6 +4,7 @@ type PostingReadiness = {
   presence?: { status: string; duplicateInTally?: boolean };
   billRequired: boolean;
   amount: number;
+  directPosting?: boolean;
   allocation?: {
     status: string;
     requiresUserReview: boolean;
@@ -14,11 +15,17 @@ type PostingReadiness = {
 };
 
 // Shared by the displayed counts and the rows sent to confirmation/queueing.
-// Unknown, duplicate, and unresolved rows must never become an implicit advance.
+// Direct posting relies on the connector's live duplicate preflight and sends no
+// bill allocations. It must not bypass a failed/ambiguous check or become Advance.
 export function isReadyForTallyPosting(row: PostingReadiness): boolean {
   if (!row.ledgerName.trim() || row.ledgerNeedsReview) return false;
-  if (row.presence?.status !== "missing" || row.presence.duplicateInTally) return false;
+  if (row.presence?.duplicateInTally) return false;
+  if (row.directPosting) {
+    if (row.presence && !["missing", "not_checked"].includes(row.presence.status)) return false;
+    if (row.allocation) return false;
+  } else if (row.presence?.status !== "missing") return false;
   if (!Number.isFinite(row.amount) || row.amount <= 0) return false;
+  if (row.directPosting) return true;
   if (!row.billRequired) return true;
   const draft = row.allocation;
   if (!draft || draft.status !== "ready_to_post" || draft.requiresUserReview || !draft.isEligibleForPosting) return false;

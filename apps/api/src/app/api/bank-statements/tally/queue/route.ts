@@ -1,4 +1,5 @@
 import { resolveTallyTarget } from "@/lib/tally/browser-scope";
+import { validateBankVoucherBillPolicy } from "@/lib/bank-voucher-bill-policy";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { normalizeName } from "@/lib/bank-statements";
@@ -44,6 +45,7 @@ type QueuePayload = {
       amount?: number | string;
     }>;
     billMatchingVerified?: boolean;
+    directPosting?: boolean;
     duplicateCheckVerified?: boolean;
     saveMapping?: boolean;
   }>;
@@ -148,6 +150,7 @@ type TransactionLedgerSelection = {
     amount: number;
   }>;
   billMatchingVerified: boolean;
+  directPosting: boolean;
   duplicateCheckVerified: boolean;
 };
 
@@ -346,6 +349,7 @@ export async function POST(request: Request) {
               createLedgerParentName,
               billAllocations,
               billMatchingVerified: transaction?.billMatchingVerified === true,
+              directPosting: transaction?.directPosting === true,
               duplicateCheckVerified: transaction?.duplicateCheckVerified === true,
             },
           ] as const,
@@ -853,6 +857,7 @@ export async function POST(request: Request) {
         }
         const billAllocations = ledgerSelectionByTransactionId.get(transaction.id)?.billAllocations ?? [];
         const billMatchingVerified = ledgerSelectionByTransactionId.get(transaction.id)?.billMatchingVerified === true;
+        const directPosting = ledgerSelectionByTransactionId.get(transaction.id)?.directPosting === true;
         const originalVoucherType = getVoucherType(transaction);
         const statementImport = transaction.statement_import_id
           ? importsById.get(transaction.statement_import_id)
@@ -913,9 +918,13 @@ export async function POST(request: Request) {
           shouldCreateCounterpartyLedger ||
           ledgerBillWiseEnabledByName.get(normalizeName(counterpartyLedgerName)) !== false
         );
-        if (counterpartyRequiresBillMatching && !billMatchingVerified) {
-          return skipTransaction(transaction, "billMatchingNotVerified");
-        }
+        const billPolicyError = validateBankVoucherBillPolicy({
+          directPosting,
+          requiresBillMatching: counterpartyRequiresBillMatching,
+          billMatchingVerified,
+          allocationCount: billAllocations.length,
+        });
+        if (billPolicyError) return skipTransaction(transaction, billPolicyError);
         if (
           (counterpartyIsPartyLedger && billAllocations.length > 0 && Math.abs(billAllocationTotal(billAllocations) - amount) >= 0.005) ||
           (!counterpartyIsPartyLedger && billAllocations.length > 0)
