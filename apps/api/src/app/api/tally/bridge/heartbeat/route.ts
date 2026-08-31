@@ -53,7 +53,7 @@ function toCompanies(value: unknown, activeCompanyName: string | null) {
     }
     const text = toNullableText(name);
     if (!text) continue;
-    const key = text.toLowerCase();
+    const key = toNullableText(row.guid) || text.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     companies.push({
@@ -64,12 +64,12 @@ function toCompanies(value: unknown, activeCompanyName: string | null) {
       booksFrom: toNullableText(row.booksFrom),
       currentPeriod: toNullableText(row.currentPeriod),
       isActive:
-        key === activeCompanyName?.trim().toLowerCase() ||
+        text.toLowerCase() === activeCompanyName?.trim().toLowerCase() ||
         (row.isActive === true && Boolean(activeCompanyName)),
     });
   }
 
-  if (activeCompanyName && !seen.has(activeCompanyName.toLowerCase())) {
+  if (activeCompanyName && !companies.some((company) => company.companyName.toLowerCase() === activeCompanyName.toLowerCase())) {
     companies.unshift({
       companyName: activeCompanyName,
       guid: null,
@@ -225,7 +225,28 @@ export async function POST(request: Request) {
     }
 
     const now = new Date().toISOString();
+    if (body.livenessOnly === true) {
+      // A liveness ping says nothing new about Tally or the active company.
+      // Persist presence at most once per 30 seconds, without refreshing probes.
+      if (Date.now() - Date.parse(connection.last_heartbeat_at || "") >= 30_000 || !connection.last_heartbeat_at) {
+        const { error: presenceError } = await supabase.from("tally_connections")
+          .update({ last_heartbeat_at: now })
+          .eq("id", connection.id).eq("bridge_token_hash", hashSecret(token))
+          .eq("session_generation", connection.session_generation).is("revoked_at", null);
+        if (presenceError) throw presenceError;
+      }
+      return jsonWithCors(request, { connection: serializeTallyConnectionStatus({ ...connection, last_heartbeat_at: now }) });
+    }
     const resolvedCompanyName = companyLoaded ? companyName : null;
+    if (connection.installation_ref && snapshotChanged(connection.last_companies_snapshot, companies) && companies.some((company) => company.guid)) {
+      const { error: datasetError } = await supabase.from("tally_company_datasets").upsert(
+        companies.filter((company) => company.guid).map((company) => ({
+          owner_user_id: connection.owner_user_id, installation_id: connection.installation_ref,
+          company_guid: company.guid!.trim().toLowerCase(), company_name: company.companyName,
+          financial_year: company.financialYear,
+        })), { onConflict: "installation_id,company_guid" });
+      if (datasetError) throw datasetError;
+    }
     const heartbeatStateChanged =
       connection.status !== status ||
       connection.last_tally_reachable !== tallyReachable ||
@@ -233,6 +254,13 @@ export async function POST(request: Request) {
       (connection.last_company_name ?? null) !== resolvedCompanyName ||
       (connection.last_error ?? null) !== errorMessage ||
       snapshotChanged(connection.last_companies_snapshot, companies);
+
+    if (!heartbeatStateChanged && Date.now() - Date.parse(connection.last_heartbeat_at || "") < 30_000) {
+      return jsonWithCors(request, { connection: serializeTallyConnectionStatus({
+        ...connection, last_heartbeat_at: now,
+        last_tested_at: typeof body.observedAt === "string" ? body.observedAt : now,
+      }) });
+    }
 
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
@@ -242,15 +270,19 @@ export async function POST(request: Request) {
         bridge_version: bridgeVersion,
         bridge_machine_name: bridgeMachineName ?? connection.bridge_machine_name,
         last_heartbeat_at: now,
-        last_tested_at: now,
+        last_tested_at: typeof body.observedAt === "string" && Number.isFinite(Date.parse(body.observedAt))
+          ? new Date(Math.min(Date.now(), Date.parse(body.observedAt))).toISOString() : now,
         last_tally_reachable: tallyReachable,
         last_company_loaded: companyLoaded,
         last_company_name: resolvedCompanyName,
+        active_company_guid: companies.find((company) => company.isActive)?.guid?.trim().toLowerCase() || null,
         last_error: errorMessage,
         last_companies_snapshot: companies,
       })
       .eq("id", connection.id)
       .eq("installation_id", bridgeMachineId)
+      .eq("bridge_token_hash", hashSecret(token))
+      .eq("session_generation", connection.session_generation)
       .is("revoked_at", null)
       .select(TALLY_CONNECTION_SELECT)
       .single();

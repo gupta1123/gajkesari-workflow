@@ -1,3 +1,4 @@
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { masterParentDescendsFromGroup } from "@/lib/bank-statement-ledger-safety";
@@ -256,6 +257,7 @@ export async function GET(
       .select("*")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .single();
 
     if (importError || !importRow) {

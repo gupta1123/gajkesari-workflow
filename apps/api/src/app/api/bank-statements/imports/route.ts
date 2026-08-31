@@ -8,6 +8,8 @@ import {
 import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
 import { PdfSecurityError, unlockPdfIfNeeded } from "@/lib/pdf-security";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { createHash } from "node:crypto";
+import { browserDatasetIds, resolveTallyTarget } from "@/lib/tally/browser-scope";
 
 export const runtime = "nodejs";
 const BANK_STATEMENT_MAX_UPLOAD_BYTES = Math.max(
@@ -136,8 +138,9 @@ export async function GET(request: Request) {
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("bank_statement_imports")
-      .select("*")
+      .select("id,bank_account_id,original_file_name,status,extracted_bank_name,extracted_account_number,extracted_account_holder_name,extracted_ifsc_code,statement_period_start,statement_period_end,imported_transaction_count,duplicate_transaction_count,created_at")
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .order("created_at", { ascending: false })
       .limit(20);
 
@@ -191,10 +194,21 @@ export async function POST(request: Request) {
     if (!connectionId) {
       return jsonWithCors(request, { error: "Select a Tally company before upload." }, { status: 400 });
     }
+    const target = await resolveTallyTarget(request, user.id, connectionId, companyName);
     const bytes = new Uint8Array(await file.arrayBuffer());
     const uploadBytes = isPdfUpload(file) ? await unlockPdfIfNeeded(bytes, statementPassword) : bytes;
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
     const supabase = createSupabaseAdminClient();
+
+    const catalogue = { ledgerNames: liveTallyLedgerNames, bankAccountCandidates: liveTallyBankAccountCandidates };
+    const checksum = createHash("sha256").update(JSON.stringify(catalogue)).digest("hex");
+    const { error: snapshotInsertError } = await supabase.from("tally_catalogue_snapshots").upsert({
+      owner_user_id: user.id, company_dataset_id: target.companyDatasetId, checksum, catalogue,
+    }, { onConflict: "company_dataset_id,checksum", ignoreDuplicates: true });
+    if (snapshotInsertError) throw snapshotInsertError;
+    const { data: snapshot, error: snapshotError } = await supabase.from("tally_catalogue_snapshots")
+      .select("id").eq("company_dataset_id", target.companyDatasetId).eq("checksum", checksum).single();
+    if (snapshotError) throw snapshotError;
 
     const upload = await supabase.storage.from(BANK_STATEMENT_BUCKET).upload(storagePath, uploadBytes, {
       contentType: file.type || "application/octet-stream",
@@ -204,6 +218,8 @@ export async function POST(request: Request) {
 
     const insertPayload = {
       owner_user_id: user.id,
+      company_dataset_id: target.companyDatasetId,
+      catalogue_snapshot_id: snapshot.id,
       bank_account_id: null,
       original_file_name: file.name || "bank-statement",
       storage_bucket: BANK_STATEMENT_BUCKET,
@@ -217,13 +233,12 @@ export async function POST(request: Request) {
         source: "bank_statement_upload",
         tallyLedgerName: bankLedgerName,
         selectedContext: {
+          target,
           connectionId,
           companyName,
           financialYear,
           bankLedgerName,
           syncBeforeAnalysis,
-          liveTallyLedgerNames,
-          liveTallyBankAccountCandidates,
         },
         analysis: {
           status: "queued",
@@ -235,8 +250,6 @@ export async function POST(request: Request) {
           financialYear,
           bankLedgerName,
           syncBeforeAnalysis,
-          liveTallyLedgerNames,
-          liveTallyBankAccountCandidates,
           manualAccount,
           startedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),

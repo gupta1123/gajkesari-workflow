@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 
 import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { browserOwnsConnection } from "@/lib/tally/browser-scope";
 
 type RequestUser = { id: string };
 
@@ -141,9 +142,17 @@ export async function requireRequestUser(request: Request): Promise<RequestUser 
   }
 
   const bearerUser = await resolveUserFromBearer(request);
-  if (bearerUser) {
-    return bearerUser;
+  const user = bearerUser || await resolveUserFromCookies();
+  if (!user) return null;
+  const url = new URL(request.url);
+  // Every connection-scoped HTTP handler shares this authorization boundary.
+  // Knowing another PC's UUID under a shared login is not sufficient access.
+  let connectionId = url.pathname.match(/^\/api\/tally\/connections\/([0-9a-f-]{36})(?:\/|$)/i)?.[1]
+    || (url.pathname === "/api/tally/companies" || url.pathname.startsWith("/api/collections/") ? url.searchParams.get("connectionId") : null);
+  if (!connectionId && url.pathname.startsWith("/api/collections/") && request.headers.get("content-type")?.includes("application/json")) {
+    const body = await request.clone().json().catch(() => ({}));
+    connectionId = body.connectionId || body.connection_id || body.proposal?.connectionId || null;
   }
-
-  return resolveUserFromCookies();
+  if (connectionId && !await browserOwnsConnection(request, user.id, connectionId)) return null;
+  return user;
 }

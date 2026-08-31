@@ -103,6 +103,8 @@ function buildInternalQueueHeaders(request: Request) {
   const workerOwnerId = request.headers.get("x-worker-owner-id");
   if (workerSecret) headers.set("x-worker-secret", workerSecret);
   if (workerOwnerId) headers.set("x-worker-owner-id", workerOwnerId);
+  const jobId = request.headers.get("x-tally-queue-job-id");
+  if (jobId) headers.set("x-tally-queue-job-id", jobId);
   return headers;
 }
 
@@ -146,6 +148,7 @@ export async function POST(
     }
 
     const payload = readPayload(job.request_payload);
+    request.headers.set("x-tally-queue-job-id", id);
     const allTransactionIds = transactionIdsFromPayload(payload);
     const processedCount = Math.max(0, Number(job.processed_count ?? 0));
     const totalCount = allTransactionIds.length || Number(job.total_count ?? 1) || 1;

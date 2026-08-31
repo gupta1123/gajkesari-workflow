@@ -1,3 +1,4 @@
+import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { normalizeName } from "@/lib/bank-statements";
@@ -373,6 +374,8 @@ export async function POST(request: Request) {
 
     const supabase = createSupabaseAdminClient();
     const expectedCompanyName = toText(body.companyName, 240);
+    const target = await resolveTallyTarget(request, user.id, submittedConnectionId, expectedCompanyName);
+    const datasetIds = [target.companyDatasetId];
     if (!expectedCompanyName) {
       return jsonWithCors(request, { error: "Select the Tally company before sending entries." }, { status: 400 });
     }
@@ -396,7 +399,7 @@ export async function POST(request: Request) {
     const connectionIsLive =
       submittedConnection.last_tally_reachable === true &&
       ["company_loaded", "tally_reachable", "bridge_connected"].includes(submittedConnection.status) &&
-      heartbeatAgeMs <= 60_000;
+      heartbeatAgeMs <= 45_000;
     if (!connectionIsLive) {
       return jsonWithCors(
         request,
@@ -426,10 +429,12 @@ export async function POST(request: Request) {
         .insert({
           owner_user_id: user.id,
           connection_id: connectionId,
+          company_dataset_id: target.companyDatasetId,
           bank_account_id: accountId || null,
           status: "queued",
           request_payload: {
             ...body,
+            target,
             async: false,
             connectionId,
           },
@@ -462,6 +467,7 @@ export async function POST(request: Request) {
       .from("bank_transactions")
       .select("*")
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", datasetIds)
       .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
       .order("transaction_date", { ascending: true })
       .limit(100);
@@ -480,7 +486,8 @@ export async function POST(request: Request) {
       let summaryQuery = supabase
         .from("bank_transactions")
         .select("tally_status")
-        .eq("owner_user_id", user.id);
+        .eq("owner_user_id", user.id)
+      .in("company_dataset_id", datasetIds);
 
       if (requestedTransactionIds.length) {
         summaryQuery = summaryQuery.in("id", requestedTransactionIds);
@@ -525,6 +532,7 @@ export async function POST(request: Request) {
       .from("bank_accounts")
       .select("id, bank_name, account_number_masked, account_holder_name, tally_ledger_name")
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", datasetIds)
       .in("id", accountIds);
 
     if (accountError) throw accountError;
@@ -543,6 +551,7 @@ export async function POST(request: Request) {
           .from("bank_statement_imports")
           .select("id, extracted_bank_name")
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", datasetIds)
           .in("id", importIds)
       : { data: [], error: null };
 
@@ -649,7 +658,7 @@ export async function POST(request: Request) {
         .from("tally_masters")
         .select("tally_name, parent_name, raw_payload")
         .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+        .eq("company_dataset_id", target.companyDatasetId)
         .eq("master_type", "ledger")
         .eq("is_active", true)
         .in("tally_name", names)
@@ -660,7 +669,7 @@ export async function POST(request: Request) {
         .from("tally_masters")
         .select("tally_name, parent_name, raw_payload")
         .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+        .eq("company_dataset_id", target.companyDatasetId)
         .eq("master_type", "ledger")
         .eq("is_active", true)
         .or("tally_name.ilike.%suspense%,parent_name.ilike.%suspense%")
@@ -708,7 +717,7 @@ export async function POST(request: Request) {
             .from("tally_masters")
             .select("tally_name, parent_name")
             .eq("owner_user_id", user.id)
-            .eq("connection_id", connectionId)
+            .eq("company_dataset_id", target.companyDatasetId)
             .eq("master_type", "group")
             .eq("is_active", true)
             .in("tally_name", nameChunk)
@@ -1075,135 +1084,20 @@ export async function POST(request: Request) {
       const { error: mappingError } = await supabase
         .from("tally_mapping_settings")
         .upsert(uniqueMappingRows, {
-          onConflict: "connection_id,company_name,mapping_type,source_key",
+          onConflict: "company_dataset_id,mapping_type,source_key",
         });
 
       if (mappingError) throw mappingError;
     }
 
-    const { data: createdCommands, error: commandError } = await supabase
-      .from("tally_bridge_commands")
-      .insert(commands)
-      .select("*");
-
+    const { data: createdCommands, error: commandError } = await supabase.rpc("enqueue_bank_tally_commands", {
+      p_owner: user.id, p_connection: connectionId, p_dataset: target.companyDatasetId,
+      p_generation: target.sessionGeneration,
+      p_commands: commands.map((command) => ({ ...command, payload: { ...command.payload, target } })),
+    });
     if (commandError) throw commandError;
-
-    const createdCommandRows = (createdCommands ?? []) as Array<{
-      id: string;
-      command_type: string;
-      payload: Record<string, unknown>;
-    }>;
-    const logRows = createdCommandRows.flatMap((command) => {
-      const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
-      const transaction = transactions.find((row) => row.id === payload.transactionId);
-      const account = transaction ? accountsById.get(transaction.bank_account_id) : null;
-      if (!transaction || !account) return [];
-
-      return [
-        {
-          owner_user_id: user.id,
-          bank_account_id: transaction.bank_account_id,
-          connection_id: connectionId,
-          source_transaction_id: transaction.id,
-          fingerprint: transaction.fingerprint,
-          transaction_date: transaction.transaction_date,
-          reference_number: transaction.reference_number,
-          description: transaction.description,
-          debit_amount: transaction.debit_amount,
-          credit_amount: transaction.credit_amount,
-          amount: getTransactionAmount(transaction),
-          voucher_type: getVoucherType(transaction),
-          bank_ledger_name: payload.bankLedgerName,
-          counterparty_ledger_name: payload.counterpartyLedgerName,
-          command_id: command.id,
-          status: "queued",
-          error: null,
-          result: {},
-        },
-      ];
-    });
-
-    if (logRows.length > 0) {
-      const { error: logError } = await supabase
-        .from("bank_transaction_posting_log")
-        .upsert(logRows, {
-          onConflict: "owner_user_id,bank_account_id,fingerprint",
-        });
-
-      if (logError) throw logError;
-    }
-
-    const queuedTransactionIds = voucherCommands
-      .map((command) => command.payload.transactionId)
-      .filter((value): value is string => typeof value === "string");
-    const verificationTransactionIds = verificationCommands
-      .map((command) => command.payload.transactionId)
-      .filter((value): value is string => typeof value === "string");
-
-    if (queuedTransactionIds.length > 0) {
-      const { error: queuedStatusError } = await supabase
-        .from("bank_transactions")
-        .update({ tally_status: "pending" })
-        .eq("owner_user_id", user.id)
-        .in("id", queuedTransactionIds);
-
-      if (queuedStatusError) throw queuedStatusError;
-    }
-
-    if (verificationTransactionIds.length > 0) {
-      const { error: verificationStatusError } = await supabase
-        .from("bank_transactions")
-        .update({ tally_status: "checking_in_tally" })
-        .eq("owner_user_id", user.id)
-        .in("id", verificationTransactionIds);
-
-      if (verificationStatusError) throw verificationStatusError;
-    }
-
-    const transactionUpdates = createdCommandRows.flatMap((command) => {
-      const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
-      const transactionId = typeof payload.transactionId === "string" ? payload.transactionId : "";
-      const counterpartyLedgerName =
-        typeof payload.matchedLedgerName === "string"
-          ? payload.matchedLedgerName
-          : typeof payload.counterpartyLedgerName === "string"
-            ? payload.counterpartyLedgerName
-            : "";
-      if (!transactionId || !counterpartyLedgerName) return [];
-      return [{ transactionId, counterpartyLedgerName }];
-    });
-
-    await Promise.all(
-      transactionUpdates.map((update) =>
-        supabase
-          .from("bank_transactions")
-          .update({
-            confirmed_ledger_name: update.counterpartyLedgerName,
-            ledger_mapping_source: "queue_confirmation",
-          })
-          .eq("owner_user_id", user.id)
-          .eq("id", update.transactionId)
-      )
-    );
-
-    const bankLedgerByAccountId = new Map(
-      createdCommandRows.flatMap((command) => {
-        const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
-        const bankAccountId = typeof payload.bankAccountId === "string" ? payload.bankAccountId : "";
-        const ledgerName = typeof payload.bankLedgerName === "string" ? payload.bankLedgerName : "";
-        return bankAccountId && ledgerName ? [[bankAccountId, ledgerName] as const] : [];
-      })
-    );
-
-    await Promise.all(
-      Array.from(bankLedgerByAccountId.entries()).map(([bankAccountId, ledgerName]) =>
-        supabase
-          .from("bank_accounts")
-          .update({ tally_connection_id: connectionId, tally_ledger_name: ledgerName })
-          .eq("owner_user_id", user.id)
-          .eq("id", bankAccountId)
-      )
-    );
+    const queuedTransactionIds = voucherCommands.map((command) => command.payload.transactionId);
+    const verificationTransactionIds = verificationCommands.map((command) => command.payload.transactionId);
 
     await supabase.from("tally_connection_events").insert({
       connection_id: connectionId,

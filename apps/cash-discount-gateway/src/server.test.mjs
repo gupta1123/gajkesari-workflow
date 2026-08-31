@@ -19,7 +19,7 @@ function nextMessage(socket, predicate = () => true) {
   });
 }
 
-test("live scan relays browser to connector and returns analysed dashboard", async () => {
+test("live scan relays browser to connector and returns analysed dashboard", async (t) => {
   const requests = [];
   const httpServer = createServer(async (request, response) => {
     const chunks = [];
@@ -54,6 +54,11 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     server: httpServer,
     path: "/cash-discount-live",
     apiBaseUrl: baseUrl,
+  });
+  t.after(async () => {
+    for (const socket of gateway.clients) socket.terminate();
+    await new Promise((resolve) => gateway.close(resolve));
+    await new Promise((resolve) => httpServer.close(resolve));
   });
 
   const connector = new WebSocket(`${baseUrl.replace("http", "ws")}/cash-discount-live`);
@@ -219,14 +224,72 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
   );
   assert.equal(secondResult.success, true);
 
-  // One connector authentication and one browser authentication serve both
-  // scans; repeat refreshes do not re-run the live-session database checks.
-  assert.equal(requests.filter((request) => request.url === "/api/tally/live/session").length, 2);
+  // Handshake plus per-operation authorization fences revoked bindings and
+  // changed session generations without dropping other pending requests.
+  assert.equal(requests.filter((request) => request.url === "/api/tally/live/session").length, 7);
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse").length, 2);
 
   browser.close();
   connector.close();
-  for (const socket of gateway.clients) socket.terminate();
-  await new Promise((resolve) => gateway.close(resolve));
-  await new Promise((resolve) => httpServer.close(resolve));
+});
+
+test("two PCs sharing a login stay isolated; cancellation and stale generations are fenced", async (t) => {
+  const generations = { a: 1, b: 1 };
+  const httpServer = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+    response.setHeader("Content-Type", "application/json");
+    const pc = body.connectionId;
+    const allowed = generations[pc] && (body.role === "connector"
+      ? request.headers["x-bridge-token"] === `bridge-${pc}`
+      : request.headers["x-tally-browser-binding"] === `binding-${pc}`);
+    if (!allowed) { response.writeHead(403); response.end(JSON.stringify({ error: "Wrong PC binding" })); return; }
+    response.end(JSON.stringify({
+      ownerUserId: "shared-login", connectionId: pc, installationId: `installation-${pc}`,
+      sessionGeneration: generations[pc], target: {
+        installationId: `installation-${pc}`, companyDatasetId: `dataset-${pc}`,
+        companyGuid: `guid-${pc}`, connectionId: pc, sessionGeneration: generations[pc], companyName: "Same",
+      },
+    }));
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${httpServer.address().port}`;
+  const gateway = startCashDiscountGateway({ server: httpServer, path: "/live", apiBaseUrl: base });
+  t.after(async () => {
+    for (const socket of gateway.clients) socket.terminate();
+    await new Promise((resolve) => gateway.close(resolve));
+    await new Promise((resolve) => httpServer.close(resolve));
+  });
+  async function connect(pc, role, binding = pc) {
+    const socket = new WebSocket(base.replace("http", "ws") + "/live");
+    await new Promise((resolve) => socket.once("open", resolve));
+    const authenticated = nextMessage(socket, (message) => ["authenticated","error"].includes(message.type));
+    socket.send(JSON.stringify({ type: "authenticate", role, connectionId: pc,
+      token: role === "connector" ? `bridge-${pc}` : "same-access-token", browserBinding: `binding-${binding}` }));
+    return { socket, result: await authenticated };
+  }
+  const a = (await connect("a", "connector")).socket;
+  const b = (await connect("b", "connector")).socket;
+  const browser = (await connect("a", "browser")).socket;
+  const wrong = await connect("b", "browser", "a");
+  assert.equal(wrong.result.type, "error");
+  assert.match(wrong.result.error, /Wrong PC/);
+  let bOperations = 0;
+  b.on("message", (buffer) => { if (JSON.parse(buffer).type === "operation") bOperations += 1; });
+  const operationPromise = nextMessage(a, (message) => message.type === "operation");
+  browser.send(JSON.stringify({ type: "request", requestId: "isolated", operation: "match_bank_statement",
+    companyName: "Same", companyDatasetId: "dataset-a", payload: { tallyUrl: "http://other-pc:9000" } }));
+  const operation = await operationPromise;
+  assert.equal(operation.target.companyDatasetId, "dataset-a");
+  assert.equal(operation.payload.tallyUrl, undefined);
+  assert.equal(bOperations, 0);
+  const cancelled = nextMessage(a, (message) => message.type === "cancel");
+  browser.send(JSON.stringify({ type: "cancel", requestId: "isolated" }));
+  assert.equal((await cancelled).requestId, "isolated");
+  generations.a = 2;
+  const stale = nextMessage(browser, (message) => message.type === "result" && message.requestId === "stale");
+  browser.send(JSON.stringify({ type: "request", requestId: "stale", operation: "match_bank_statement", companyName: "Same" }));
+  assert.match((await stale).error, /session changed/i);
+  assert.equal(bOperations, 0);
 });

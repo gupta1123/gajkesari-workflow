@@ -1,5 +1,8 @@
 "use client";
 
+import { tallyBrowserStorage } from "@/lib/tally-browser-storage";
+
+
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
@@ -24,6 +27,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
 import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
+import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 import { pdfToImagePages } from "@/services/pdf";
@@ -115,7 +119,7 @@ function readStoredCompanySelection(): CompanyOption | null {
   if (typeof window === "undefined") return null;
 
   try {
-    const raw = window.localStorage.getItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
+    const raw = tallyBrowserStorage.getItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
     if (!raw) return null;
     const value = JSON.parse(raw) as Partial<CompanyOption>;
     const id = typeof value.id === "string" ? value.id.trim() : "";
@@ -149,11 +153,11 @@ function writeStoredCompanySelection(company: CompanyOption | null) {
   if (typeof window === "undefined") return;
 
   if (!company) {
-    window.localStorage.removeItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
+    tallyBrowserStorage.removeItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
     return;
   }
 
-  window.localStorage.setItem(
+  tallyBrowserStorage.setItem(
     BANK_STATEMENT_COMPANY_SELECTION_KEY,
     JSON.stringify({
       id: company.id,
@@ -172,6 +176,7 @@ function findStoredCompanySelection(options: CompanyOption[]) {
 }
 
 type TallyConnection = {
+  lastHeartbeatAt?: string | null;
   id: string;
   displayName: string;
   status: string;
@@ -190,6 +195,7 @@ type TallyCommand = {
   status: string;
   result: Record<string, unknown> | null;
   error: string | null;
+  reconciliationRequired?: boolean;
 };
 
 type TallyQueueJob = {
@@ -2087,10 +2093,11 @@ function getBillAllocationSubtext(
       transaction &&
       isIncomingReceiptRow(transaction) &&
       transaction.selectedLedgerName.trim() &&
-      !isSuspenseLedgerName(transaction.selectedLedgerName) &&
       !isBillMatchEligibleTransaction(transaction, ledgerMasters)
     ) {
-      return "Bill matching not applicable";
+      return isSuspenseLedgerName(transaction.selectedLedgerName)
+        ? "Will post to Suspense · Bill matching not applicable"
+        : "Bill matching not applicable";
     }
     return "";
   }
@@ -2327,8 +2334,11 @@ function getPartyBillMatchContext(transaction: ReviewTransaction, ledgerMasters:
   if (amount <= 0 || !direction) {
     return { eligible: false, amount: 0, direction: null, partyKind: null, reason: "No receipt or payment amount found." };
   }
-  if (!transaction.selectedLedgerName.trim() || isSuspenseLedgerName(transaction.selectedLedgerName)) {
+  if (!transaction.selectedLedgerName.trim()) {
     return { eligible: false, amount, direction, partyKind: null, reason: "Select the party ledger first." };
+  }
+  if (isSuspenseLedgerName(transaction.selectedLedgerName)) {
+    return { eligible: false, amount, direction, partyKind: null, reason: "Posts directly to Suspense; bill allocation is not applicable." };
   }
   const ledger = getSelectedLedger(transaction, ledgerMasters);
   const parent = ledger?.parent || transaction.ledgerGroup || "";
@@ -2388,9 +2398,10 @@ function getBillAllocationBadgeText(
   if (context.eligible) return "Not Matched";
   if (isOutgoingPaymentRow(transaction)) return "Check Entry";
   if (context.partyKind && context.reason.includes("bill-wise")) return "Needs Bill-Wise";
-  if (!transaction.selectedLedgerName.trim() || isSuspenseLedgerName(transaction.selectedLedgerName)) {
+  if (!transaction.selectedLedgerName.trim()) {
     return "Needs Ledger";
   }
+  if (isSuspenseLedgerName(transaction.selectedLedgerName)) return "Post to Suspense";
   if (isIncomingReceiptRow(transaction)) return "Direct Receipt";
   return "Not Applicable";
 }
@@ -2404,7 +2415,7 @@ function getBillAllocationBadgeClass(
   const context = getPartyBillMatchContext(transaction, ledgerMasters);
   if (context.eligible) return "border-amber-200 bg-amber-50 text-amber-800";
   if (isOutgoingPaymentRow(transaction)) return "border-blue-200 bg-blue-50 text-blue-800";
-  if (!transaction.selectedLedgerName.trim() || isSuspenseLedgerName(transaction.selectedLedgerName)) {
+  if (!transaction.selectedLedgerName.trim()) {
     return "border-amber-200 bg-amber-50 text-amber-800";
   }
   if (isIncomingReceiptRow(transaction)) return "border-emerald-200 bg-emerald-50 text-emerald-800";
@@ -2437,22 +2448,6 @@ function buildAdvanceReference(transaction: ReviewTransaction) {
   const date = getEffectiveTransactionDate(transaction).replace(/-/g, "");
   const suffix = normalizeReferenceToken(transaction.referenceNumber || transaction.id).slice(-8) || transaction.id.slice(0, 8);
   return `ADV-${date}-${suffix}`.slice(0, 80);
-}
-
-function buildDirectAdvanceAllocation(transaction: ReviewTransaction): BillAllocationLine[] {
-  const amount = Math.max(
-    parseNumber(transaction.creditAmount) ?? 0,
-    parseNumber(transaction.debitAmount) ?? 0
-  );
-  if (amount <= 0) return [];
-
-  return [{
-    referenceType: "Advance",
-    referenceName: buildAdvanceReference(transaction),
-    allocatedAmount: Number(amount.toFixed(2)),
-    pendingAmountAfterAllocation: Number(amount.toFixed(2)),
-    statusAfterAllocation: "advance",
-  }];
 }
 
 function isAllocationTotalValid(receiptAmount: number, totalAllocatedAmount: number) {
@@ -3186,6 +3181,7 @@ export function BankStatementsPage() {
   const [tallyPostingScope, setTallyPostingScope] = useState<TallyPostingScope>("all");
   const sending = sendingMode !== null;
   const [matchingBills, setMatchingBills] = useState(false);
+  const matchAbortRef = useRef<AbortController | null>(null);
   const [tallyCheckAttempted, setTallyCheckAttempted] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
   const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
@@ -3571,8 +3567,25 @@ export function BankStatementsPage() {
     () => transactionsNeedingTallyWork.filter(isOutgoingPaymentRow),
     [transactionsNeedingTallyWork]
   );
-  const newReceiptCount = receiptTransactionsNeedingPost.length;
-  const missingOutgoingCount = outgoingTransactionsNeedingPost.length;
+  const readyPostingTransactions = useMemo(() => validTransactions.filter((transaction) =>
+    isReadyForTallyPosting({
+      ledgerName: transaction.selectedLedgerName,
+      ledgerNeedsReview: getReviewStatus(transaction) === "needs_review",
+      presence: tallyPresenceByTransactionId[transaction.id],
+      billRequired: isBillMatchEligibleTransaction(transaction, ledgerMasters),
+      amount: Math.max(parseNumber(transaction.creditAmount) ?? 0, parseNumber(transaction.debitAmount) ?? 0),
+      allocation: billAllocationsByTransactionId[transaction.id],
+    })
+  ), [validTransactions, tallyPresenceByTransactionId, ledgerMasters, billAllocationsByTransactionId]);
+  const readyReceiptTransactions = readyPostingTransactions.filter(isIncomingReceiptRow);
+  const readyPaymentTransactions = readyPostingTransactions.filter(isOutgoingPaymentRow);
+  const readyPostingIds = useMemo(() => new Set(readyPostingTransactions.map((row) => row.id)), [readyPostingTransactions]);
+  const newReceiptCount = readyReceiptTransactions.length;
+  const missingOutgoingCount = readyPaymentTransactions.length;
+  const heldPostingRowCount = validTransactions.filter((transaction) =>
+    tallyPresenceByTransactionId[transaction.id]?.status !== "found" &&
+    !readyPostingIds.has(transaction.id)
+  ).length;
   const statementCompletedCleanly = Boolean(
     statementDoneSummary && statementDoneSummary.tone !== "error"
   );
@@ -3627,29 +3640,11 @@ export function BankStatementsPage() {
       const presence = tallyPresenceByTransactionId[transaction.id];
       const isIncoming = isIncomingReceiptRow(transaction);
       const isOutgoing = isOutgoingPaymentRow(transaction);
-      const hasLedgerIssue = getReviewStatus(transaction) === "needs_review";
-      const allocation = billAllocationsByTransactionId[transaction.id];
-      const hasBlockingBillAllocation =
-        (isIncoming || isOutgoing) &&
-        presence?.status === "missing" &&
-        isBillMatchEligibleTransaction(transaction, ledgerMasters) &&
-        (!allocation ||
-          allocation.status === "cannot_match_yet" ||
-          allocation.status === "needs_review" ||
-          allocation.status === "stale_data");
-
-      if (
-        hasLedgerIssue ||
-        hasBlockingBillAllocation ||
-        presence?.status === "ambiguous" ||
-        presence?.duplicateInTally === true
-      ) {
-        counts.needsAttention += 1;
-      } else if (presence?.status === "found") {
+      if (presence?.status === "found") {
         counts.alreadyInTally += 1;
-      } else if (isIncoming && presence?.status === "missing") {
+      } else if (isIncoming && readyPostingIds.has(transaction.id)) {
         counts.receiptsToCreate += 1;
-      } else if (isOutgoing && presence?.status === "missing") {
+      } else if (isOutgoing && readyPostingIds.has(transaction.id)) {
         counts.paymentsToCreate += 1;
       } else {
         counts.needsAttention += 1;
@@ -3658,8 +3653,7 @@ export function BankStatementsPage() {
 
     return counts;
   }, [
-    billAllocationsByTransactionId,
-    ledgerMasters,
+    readyPostingIds,
     tallyPresenceByTransactionId,
     validTransactions,
   ]);
@@ -3785,10 +3779,10 @@ export function BankStatementsPage() {
     transactionOutcomeCounts.receiptsToCreate === 0 &&
     transactionOutcomeCounts.paymentsToCreate === 0;
   const selectedPostingTransactions = tallyPostingScope === "receipts"
-    ? receiptTransactionsNeedingPost
+    ? readyReceiptTransactions
     : tallyPostingScope === "payments"
-      ? outgoingTransactionsNeedingPost
-      : transactionsNeedingTallyWork;
+      ? readyPaymentTransactions
+      : readyPostingTransactions;
   const selectedPostingMissingLedgerCount = selectedPostingTransactions.filter(
     (transaction) => !transaction.selectedLedgerName.trim()
   ).length;
@@ -3797,9 +3791,7 @@ export function BankStatementsPage() {
   ).length;
   const postTallyButtonLabel = sendingMode
     ? "Sending..."
-    : ambiguousTallyPresenceCount > 0
-      ? `Review ${ambiguousTallyPresenceCount} Ambiguous`
-      : `Post to Tally (${selectedPostingTransactions.length})`;
+    : `Post to Tally (${selectedPostingTransactions.length})`;
   const statementReviewLocked = Boolean(statementDoneSummary) || tallyPostingInProgress;
   const statementReviewDrawerLocked = tallyPostingInProgress;
   const openPostingReviewAction = useCallback(
@@ -4209,25 +4201,31 @@ export function BankStatementsPage() {
 
     let cancelled = false;
     let attempts = 0;
+    let inFlight = false;
+    const controller = new AbortController();
     tallyStatusStartedAtRef.current = Date.now();
     setCheckingLiveTallyCompany(true);
 
     const pollLiveCompany = async () => {
+      if (inFlight || cancelled) return false;
+      inFlight = true;
       try {
-        const response = await apiFetch(`/api/tally/connections/${tallyConnectionId}/status`, { cache: "no-store" });
+        const response = await apiFetch(`/api/tally/connections/${tallyConnectionId}/status`, { cache: "no-store", signal: controller.signal });
         if (!response.ok || cancelled) return false;
         const payload = (await response.json()) as { connection?: TallyConnection };
         const connection = payload.connection;
         if (!connection) return false;
         setConnections((current) => current.map((item) => (item.id === connection.id ? connection : item)));
 
-        const updatedAt = connection.updatedAt ? Date.parse(connection.updatedAt) : Number.NaN;
-        if (Number.isFinite(updatedAt) && updatedAt >= tallyStatusStartedAtRef.current - 1000) {
+        const updatedAt = connection.lastHeartbeatAt ? Date.parse(connection.lastHeartbeatAt) : Number.NaN;
+        if (Number.isFinite(updatedAt) && Date.now() - updatedAt < 45_000) {
           setCheckingLiveTallyCompany(false);
           return true;
         }
       } catch {
         // Do not present a stale company as the active Tally company.
+      } finally {
+        inFlight = false;
       }
       return false;
     };
@@ -4236,15 +4234,24 @@ export function BankStatementsPage() {
     const timer = window.setInterval(() => {
       attempts += 1;
       void pollLiveCompany().then((fresh) => {
-        if (fresh || attempts >= 7) window.clearInterval(timer);
+        if (fresh || attempts >= 5) window.clearInterval(timer);
       });
     }, 3000);
+    const deadlineTimer = window.setTimeout(() => {
+      if (cancelled) return;
+      controller.abort();
+      window.clearInterval(timer);
+      setCheckingLiveTallyCompany(false);
+    }, 15_000);
 
     return () => {
       cancelled = true;
+      controller.abort();
+      window.clearTimeout(deadlineTimer);
       window.clearInterval(timer);
     };
   }, [tallyConnectionId]);
+  useEffect(() => () => matchAbortRef.current?.abort(), [tallyConnectionId, selectedCompanyId]);
 
   const waitForCommand = useCallback(
     async (
@@ -4270,6 +4277,9 @@ export function BankStatementsPage() {
       const payload = (await response.json()) as { commands?: TallyCommand[] };
       const command = (payload.commands ?? []).find((item) => item.id === commandId);
       if (!command) continue;
+      if (command.reconciliationRequired) {
+        throw new Error(command.error || "The Tally result is uncertain. Check Tally before retrying; this command will not be replayed automatically.");
+      }
       if (command.status === "succeeded" || command.status === "failed" || command.status === "canceled") {
         return command;
       }
@@ -5619,6 +5629,7 @@ export function BankStatementsPage() {
     rows: ReviewTransaction[],
     options: {
       includeOpenBills?: boolean;
+      signal?: AbortSignal;
       billEligibleTransactionIds?: string[];
       asOfDate?: string | null;
     } = {}
@@ -5648,6 +5659,9 @@ export function BankStatementsPage() {
       connectionId: connection.id,
       companyName: selectedCompanyName || connection.lastCompanyName || "",
       operation: options.includeOpenBills ? "match_bank_statement" : "verify_bank_transaction",
+      signal: options.signal,
+      onProgress: (text) => setBanner({ tone: "info", text }),
+      onPartialResult: () => setBanner({ tone: "info", text: "Voucher check complete. Reading outstanding bills; posting remains disabled until all checks finish." }),
       payload: {
         companyName: selectedCompanyName || connection.lastCompanyName,
         bankLedgerName,
@@ -5824,6 +5838,10 @@ export function BankStatementsPage() {
     }
 
     setTallyCheckAttempted(true);
+    const matchController = new AbortController();
+    matchAbortRef.current?.abort();
+    matchAbortRef.current = matchController;
+    setTallyPresenceByTransactionId({});
     try {
       setMatchingBills(true);
       setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
@@ -5839,6 +5857,7 @@ export function BankStatementsPage() {
         billDataByLedger,
       } = await verifyBankStatementPresence(connection, validTransactions, {
         includeOpenBills: true,
+        signal: matchController.signal,
         billEligibleTransactionIds,
         asOfDate,
       });
@@ -5942,6 +5961,7 @@ export function BankStatementsPage() {
       });
     } finally {
       setMatchingBills(false);
+      if (matchAbortRef.current === matchController) matchAbortRef.current = null;
     }
   }
 
@@ -5958,10 +5978,14 @@ export function BankStatementsPage() {
       return;
     }
     const selectedTallyWorkTransactions = mode === "post_receipts"
-      ? receiptTransactionsNeedingPost
+      ? readyReceiptTransactions
       : mode === "post_payments"
-        ? outgoingTransactionsNeedingPost
-        : transactionsNeedingTallyWork;
+        ? readyPaymentTransactions
+        : readyPostingTransactions;
+    const selectedWorkIds = new Set(selectedTallyWorkTransactions.map((row) => row.id));
+    const hasUnselectedStatementRows = validTransactions.some((row) =>
+      tallyPresenceByTransactionId[row.id]?.status !== "found" && !selectedWorkIds.has(row.id)
+    );
     if (selectedTallyWorkTransactions.length === 0) {
       showToast(
         "info",
@@ -5969,7 +5993,7 @@ export function BankStatementsPage() {
           ? "No new receipts to post."
           : mode === "post_payments"
             ? "No new outgoing payments to post."
-            : "No new bank transactions to post."
+            : "No ready entries to post. Check Tally matches and resolve the rows needing review."
       );
       return;
     }
@@ -5990,10 +6014,6 @@ export function BankStatementsPage() {
     ).length;
     if (selectedMissingLedgerCount > 0) {
       showToast("error", "Select a ledger for every row before sending to Tally.");
-      return;
-    }
-    if (ambiguousTallyPresenceCount > 0) {
-      showToast("error", "Review ambiguous Tally matches before sending anything.");
       return;
     }
     if (transactionsNeedingTallyWork.length === 0) {
@@ -6157,13 +6177,15 @@ export function BankStatementsPage() {
 
         setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
         setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
-        setStatementDoneSummary({
+        setStatementDoneSummary(hasUnselectedStatementRows ? null : {
           tone: "info",
           title: "Done. Nothing new to send.",
           text: `${confirmPayload.importedTransactionCount} transaction(s) imported. No new row needed Tally posting or payment checking.`,
         });
-        setBillAllocationsByTransactionId({});
-        setOutgoingVerificationsByTransactionId({});
+        if (!hasUnselectedStatementRows) {
+          setBillAllocationsByTransactionId({});
+          setOutgoingVerificationsByTransactionId({});
+        }
         setBillAllocationReviewTransactionId(null);
         setOutgoingReviewTransactionId(null);
         showToast(
@@ -6207,9 +6229,7 @@ export function BankStatementsPage() {
                 : [];
               const postingBillAllocations = reviewedBillAllocations.length > 0
                 ? reviewedBillAllocations
-                : reviewedTransaction && isBillMatchEligibleTransaction(reviewedTransaction, ledgerMasters)
-                  ? buildDirectAdvanceAllocation(reviewedTransaction)
-                  : [];
+                : [];
               return {
                 counterpartyLedgerName:
                   reviewedTransaction?.selectedLedgerName ||
@@ -8659,13 +8679,20 @@ export function BankStatementsPage() {
                       ? "Posted & verified"
                       : "Verified in Tally"
                   : uncheckedTallyPresenceCount > 0
-                    ? `${transactionsNeedingTallyWork.length} entr${transactionsNeedingTallyWork.length === 1 ? "y" : "ies"} ready · bill matching optional`
-                  : transactionsNeedingTallyWork.length > 0
-                    ? `${transactionsNeedingTallyWork.length} entr${transactionsNeedingTallyWork.length === 1 ? "y" : "ies"} ready to post · ${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
+                    ? `${readyPostingTransactions.length} ready · ${uncheckedTallyPresenceCount} need Tally check`
+                  : readyPostingTransactions.length > 0
+                    ? `${readyPostingTransactions.length} entr${readyPostingTransactions.length === 1 ? "y" : "ies"} ready to post · ${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
+                  : heldPostingRowCount > 0
+                    ? "No ready entries · Resolve rows needing review"
                   : alreadyInTallyCount > 0
                     ? "All entries already in Tally · Nothing to post"
                     : "Nothing to post"}
                 </span>
+                {!statementCompletedCleanly && heldPostingRowCount > 0 ? (
+                  <span className="text-[11px] font-bold text-amber-800" role="status">
+                    {heldPostingRowCount} held for review — not included in posting
+                  </span>
+                ) : null}
                 {!statementCompletedCleanly && selectedPostingSuspenseCount > 0 ? (
                   <span className="inline-flex h-6 items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-bold text-amber-800">
                     {selectedPostingSuspenseCount} entr{selectedPostingSuspenseCount === 1 ? "y" : "ies"} will use Suspense
@@ -8759,12 +8786,15 @@ export function BankStatementsPage() {
                         onChange={(event) => setTallyPostingScope(event.target.value as TallyPostingScope)}
                         value={tallyPostingScope}
                       >
-                        <option value="all">All ready entries</option>
+                        <option value="all">All ready entries ({readyPostingTransactions.length})</option>
                         <option disabled={newReceiptCount === 0} value="receipts">Receipts only ({newReceiptCount})</option>
                         <option disabled={missingOutgoingCount === 0} value="payments">Payments only ({missingOutgoingCount})</option>
                       </select>
                       <Button
                         className="h-8 flex-1 rounded-l-none rounded-r-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a] sm:flex-none"
+                        title={selectedPostingTransactions.length === 0
+                          ? "No ready entries in this scope. Check Tally matches and resolve held rows."
+                          : `Post ${selectedPostingTransactions.length} ready entries only; held rows will stay for review.`}
                         onClick={() => {
                           const mode = tallyPostingScope === "receipts"
                             ? "post_receipts"
@@ -8783,7 +8813,6 @@ export function BankStatementsPage() {
                           preview.extractionDiagnostics?.coverageComplete === false ||
                           selectedPostingTransactions.length === 0 ||
                           selectedPostingMissingLedgerCount > 0 ||
-                          ambiguousTallyPresenceCount > 0 ||
                           !bankLedgerName.trim()
                         }
                         type="button"

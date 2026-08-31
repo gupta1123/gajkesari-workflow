@@ -1,3 +1,4 @@
+import { browserDatasetIds, targetForDataset } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -12,15 +13,6 @@ import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/t
 function isMissingTableError(error: unknown) {
   const message = error instanceof Error ? error.message : String((error as { message?: unknown })?.message ?? "");
   return /debit_note_proposals|relation .* does not exist|schema cache/i.test(message);
-}
-
-function toTallyCompanyName(value: unknown) {
-  const text = String(value ?? "").trim();
-  return text && !/^tally prime$/i.test(text) ? text : null;
-}
-
-function isLiveConnection(row: { status?: string | null; last_tally_reachable?: boolean | null; last_company_loaded?: boolean | null }) {
-  return row.status === "company_loaded" || (row.last_tally_reachable === true && row.last_company_loaded === true);
 }
 
 export function OPTIONS(request: Request) {
@@ -44,6 +36,7 @@ export async function POST(
       .select("*")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .maybeSingle();
 
     if (proposalError) throw proposalError;
@@ -74,36 +67,12 @@ export async function POST(
       );
     }
 
-    const { data: connection, error: connectionError } = await supabase
-      .from("tally_connections")
-      .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
-      .eq("id", proposal.connection_id)
-      .eq("owner_user_id", user.id)
-      .maybeSingle();
-
-    if (connectionError) throw connectionError;
-    if (!connection) {
-      return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
-    }
-
-    let commandConnection = connection;
-    const proposalCompanyName = toTallyCompanyName(proposal.company_name) || toTallyCompanyName(connection.last_company_name);
-
-    if (proposalCompanyName) {
-      const { data: liveRows, error: liveError } = await supabase
-        .from("tally_connections")
-        .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
-        .eq("owner_user_id", user.id)
-        .eq("last_company_name", proposalCompanyName)
-        .order("last_heartbeat_at", { ascending: false, nullsFirst: false })
-        .order("updated_at", { ascending: false })
-        .limit(20);
-
-      if (liveError) throw liveError;
-      commandConnection = (liveRows ?? []).find(isLiveConnection) ?? connection;
-    }
+    const target = await targetForDataset(request, user.id, String(proposalData.company_dataset_id));
+    const commandConnection = { id: target.connectionId };
+    const proposalCompanyName = target.companyName;
 
     const commandPayload = {
+      target,
       proposalId: proposal.id,
       companyName: proposalCompanyName,
       partyLedgerName: proposal.party_ledger_name,
@@ -122,40 +91,13 @@ export async function POST(
       gstMode: proposal.gst_mode,
     };
 
-    const { data: commandData, error: commandError } = await supabase
-      .from("tally_bridge_commands")
-      .insert({
-        connection_id: commandConnection.id,
-        owner_user_id: user.id,
-        command_type: "create_debit_note",
-        status: "queued",
-        priority: 35,
-        payload: commandPayload,
-      })
-      .select("*")
-      .single();
-
-    if (commandError) throw commandError;
-    const command = commandData as unknown as TallyBridgeCommandRow;
-
-    const now = new Date().toISOString();
-    const { data: updatedData, error: updateError } = await supabase
-      .from("debit_note_proposals")
-      .update({
-        status: "queued_in_tally",
-        connection_id: commandConnection.id,
-        approval_by: user.id,
-        approved_at: now,
-        tally_command_id: command.id,
-        updated_at: now,
-        last_error: null,
-      })
-      .eq("id", proposal.id)
-      .eq("owner_user_id", user.id)
-      .select("*")
-      .single();
-
-    if (updateError) throw updateError;
+    const { data: queued, error: queueError } = await supabase.rpc("enqueue_debit_note_proposal", {
+      p_owner: user.id, p_proposal: proposal.id, p_connection: target.connectionId,
+      p_target: target, p_payload: commandPayload,
+    });
+    if (queueError) throw queueError;
+    const command = queued.command as TallyBridgeCommandRow;
+    const updatedData = queued.proposal as DebitNoteProposalRow;
 
     await supabase.from("tally_connection_events").insert({
       connection_id: commandConnection.id,

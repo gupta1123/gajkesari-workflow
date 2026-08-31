@@ -124,7 +124,7 @@ export async function GET(
           ownerUserId: user.id,
           ids: requestedCommandIds,
           limit,
-        })).map(serializeTallyBridgeCommand),
+        })).map((row) => serializeTallyBridgeCommand(row)),
       });
     }
 
@@ -146,7 +146,7 @@ export async function GET(
     if (error) throw error;
 
     return jsonWithCors(request, {
-      commands: ((data ?? []) as unknown as TallyBridgeCommandRow[]).map(serializeTallyBridgeCommand),
+      commands: ((data ?? []) as unknown as TallyBridgeCommandRow[]).map((row) => serializeTallyBridgeCommand(row)),
     });
   } catch (error) {
     console.error("Error in GET /api/tally/connections/[id]/commands:", error);

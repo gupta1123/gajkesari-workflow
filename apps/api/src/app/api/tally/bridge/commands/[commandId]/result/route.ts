@@ -168,7 +168,9 @@ export async function POST(
       .select("*")
       .eq("id", commandId)
       .eq("connection_id", connection.id)
-      .in("status", ["claimed", "queued"])
+      .in("status", ["claimed", "succeeded", "failed"])
+      .eq("claim_token", body.claimToken || "00000000-0000-0000-0000-000000000000")
+      .eq("target_session_generation", connection.session_generation)
       .maybeSingle();
 
     if (pendingCommandError) throw pendingCommandError;
@@ -183,20 +185,13 @@ export async function POST(
         : {};
     const isPurchaseVoucher = pendingCommand.command_type === "create_purchase_voucher";
 
-    const { data: commandData, error: updateError } = await supabase
-      .from("tally_bridge_commands")
-      .update({
-        status: success ? "succeeded" : "failed",
-        payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
-        result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
-        error: errorMessage,
-        completed_at: now,
-      })
-      .eq("id", commandId)
-      .eq("connection_id", connection.id)
-      .in("status", ["claimed", "queued"])
-      .select("*")
-      .maybeSingle();
+    const { data: commandData, error: updateError } = await supabase.rpc("complete_tally_command", {
+      p_connection: connection.id, p_token_hash: hashSecret(token), p_command: commandId,
+      p_claim: body.claimToken, p_success: success,
+      p_payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
+      p_result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
+      p_error: errorMessage,
+    });
 
     if (updateError) throw updateError;
     if (!commandData) {
@@ -252,73 +247,13 @@ export async function POST(
             last_synced_at: now,
           },
           {
-            onConflict: "connection_id,company_name,master_type,master_key",
+            onConflict: "company_dataset_id,master_type,master_key",
           }
         );
       }
     }
 
-    if (command.command_type === "post_bank_voucher") {
-      const transactionId = toNullableText(commandPayload.transactionId, 80);
-      const bankAccountId = toNullableText(commandPayload.bankAccountId, 80);
-      const fingerprint = toNullableText(commandPayload.fingerprint, 500);
-      const voucherId =
-        toNullableText((result as Record<string, unknown>).voucherId, 500) ??
-        toNullableText((result as Record<string, unknown>).masterId, 500) ??
-        commandId;
-      const possibleDuplicateInTally = Boolean((result as Record<string, unknown>).possibleDuplicateInTally);
-      const nextStatus = success ? "posted" : possibleDuplicateInTally ? "needs_tally_review" : "failed";
-
-      if (transactionId) {
-        const { error: transactionUpdateError } = await supabase
-          .from("bank_transactions")
-          .update({
-            tally_status: nextStatus,
-            tally_posted_at: success ? now : null,
-            tally_voucher_id: success ? voucherId : null,
-          })
-          .eq("id", transactionId)
-          .eq("owner_user_id", connection.owner_user_id);
-
-        if (transactionUpdateError) throw transactionUpdateError;
-      }
-
-      if (bankAccountId && fingerprint) {
-        const { error: postingLogError } = await supabase
-          .from("bank_transaction_posting_log")
-          .upsert(
-            {
-              owner_user_id: connection.owner_user_id,
-              bank_account_id: bankAccountId,
-              connection_id: connection.id,
-              source_transaction_id: transactionId,
-              fingerprint,
-              transaction_date: toNullableText(commandPayload.voucherDate, 20) ?? now.slice(0, 10),
-              reference_number: toNullableText(commandPayload.referenceNumber, 500),
-              description: toNullableText(commandPayload.narration, 2000) ?? "Bank transaction",
-              amount:
-                typeof commandPayload.amount === "number"
-                  ? commandPayload.amount
-                  : Number(commandPayload.amount ?? 0) || null,
-              voucher_type: toNullableText(commandPayload.voucherType, 80),
-              bank_ledger_name: toNullableText(commandPayload.bankLedgerName, 500),
-              counterparty_ledger_name: toNullableText(commandPayload.counterpartyLedgerName, 500),
-              command_id: commandId,
-              status: nextStatus,
-              tally_voucher_id: success ? voucherId : null,
-              tally_posted_at: success ? now : null,
-              error: errorMessage,
-              result,
-            },
-            {
-              onConflict: "owner_user_id,bank_account_id,fingerprint",
-            }
-          );
-
-        if (postingLogError) throw postingLogError;
-      }
-
-    }
+    // Bank posting checkpoints are committed atomically with the command above.
 
     if (command.command_type === "create_purchase_voucher") {
       const postingId = toNullableText(commandPayload.postingId, 80);

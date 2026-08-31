@@ -1,3 +1,4 @@
+import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -71,11 +72,12 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
+    const target = await resolveTallyTarget(request, user.id, id, url.searchParams.get("companyName") || connection.last_company_name || "");
     const buildMasterQuery = () => {
       let builder = supabase
         .from("tally_masters")
         .select(includeRawMetadata ? MASTER_METADATA_SELECT : MASTER_LIST_SELECT)
-        .eq("connection_id", id)
+        .eq("company_dataset_id", target.companyDatasetId)
         .eq("owner_user_id", user.id)
         .eq("company_name", connection.last_company_name ?? "Unknown company")
         .eq("is_active", true)
@@ -108,7 +110,7 @@ export async function GET(
     const { data: runData, error: runError } = await supabase
       .from("tally_master_sync_runs")
       .select("id, status, company_name, totals, error, completed_at")
-      .eq("connection_id", id)
+      .eq("company_dataset_id", target.companyDatasetId)
       .eq("owner_user_id", user.id)
       .order("created_at", { ascending: false })
       .limit(1)
@@ -125,7 +127,7 @@ export async function GET(
         const { data, error } = await supabase
           .from("tally_masters")
           .select(MASTER_LIST_SELECT)
-          .eq("connection_id", id)
+          .eq("company_dataset_id", target.companyDatasetId)
           .eq("owner_user_id", user.id)
           .eq("company_name", connection.last_company_name ?? "Unknown company")
           .eq("master_type", "group")

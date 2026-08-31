@@ -1,3 +1,4 @@
+import { browserDatasetIds, targetForDataset } from "@/lib/tally/browser-scope";
 import { applyCorsHeaders, jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { NextResponse } from "next/server";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -12,14 +13,6 @@ import {
 } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/tally/commands";
-
-function normalizeCompanyName(value: string | null | undefined) {
-  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function isLiveConnection(row: { status?: string | null; last_tally_reachable?: boolean | null; last_company_loaded?: boolean | null }) {
-  return row.status === "company_loaded" || (row.last_tally_reachable === true && row.last_company_loaded === true);
-}
 
 function debitNotePdfFilename(proposal: DebitNoteProposalRow) {
   const voucherNumber = String(proposal.tally_voucher_number ?? "tally-debit-note")
@@ -44,6 +37,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       .select("*")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .maybeSingle();
     if (error) throw error;
     if (!data) return jsonWithCors(request, { error: "Debit note proposal not found." }, { status: 404 });
@@ -94,6 +88,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       .select("*")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .maybeSingle();
     if (error) throw error;
     if (!data) return jsonWithCors(request, { error: "Debit note proposal not found." }, { status: 404 });
@@ -110,6 +105,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         .from("debit_note_proposals")
         .select("*")
         .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
         .eq("tally_command_id", proposal.tally_command_id)
         .eq("status", "created_in_tally")
         .order("updated_at", { ascending: false })
@@ -126,25 +122,10 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       return jsonWithCors(request, { ready: true, proposal: serializeDebitNoteProposal(proposal) });
     }
 
-    const connectionId = requestedConnectionId ?? proposal.connection_id;
-    if (!connectionId) return jsonWithCors(request, { error: "A live Tally connection is required." }, { status: 409 });
-    const { data: connection, error: connectionError } = await supabase
-      .from("tally_connections")
-      .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded")
-      .eq("id", connectionId)
-      .eq("owner_user_id", user.id)
-      .maybeSingle();
-    if (connectionError) throw connectionError;
-    if (!connection) return jsonWithCors(request, { error: "The active Tally connection was not found." }, { status: 404 });
-    if (!isLiveConnection(connection)) {
-      return jsonWithCors(request, { error: "The active Tally connection is not live." }, { status: 409 });
-    }
-    if (!proposal.company_name || normalizeCompanyName(connection.last_company_name) !== normalizeCompanyName(proposal.company_name)) {
-      return jsonWithCors(
-        request,
-        { error: `Tally is currently open to ${connection.last_company_name || "another company"}. Switch it to ${proposal.company_name || "the Debit Note company"}, refresh, then try again.` },
-        { status: 409 }
-      );
+    const target = await targetForDataset(request, user.id, String(data.company_dataset_id));
+    const connection = { id: target.connectionId };
+    if (requestedConnectionId && requestedConnectionId !== connection.id) {
+      return jsonWithCors(request, { error: "Select the connector belonging to this document's company." }, { status: 409 });
     }
 
     const { data: existingCommand, error: existingCommandError } = await supabase
@@ -179,6 +160,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         status: "queued",
         priority: 45,
         payload: {
+          target,
           proposalId: proposal.id,
           operation: "export_native_pdf",
           companyName: proposal.company_name,

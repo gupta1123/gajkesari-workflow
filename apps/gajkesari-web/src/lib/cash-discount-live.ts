@@ -1,6 +1,6 @@
 "use client";
 
-import { getApiAccessToken } from "@/lib/api-client";
+import { getApiAccessToken, getTallyBrowserBinding, getSelectedTallyDatasetId } from "@/lib/api-client";
 
 type LiveRequest = {
   connectionId: string;
@@ -12,6 +12,8 @@ type LiveRequest = {
   proposal?: Record<string, unknown>;
   customerScope?: Record<string, unknown>;
   onProgress?: (message: string) => void;
+  onPartialResult?: (data: unknown) => void;
+  signal?: AbortSignal;
 };
 
 type LiveResult<T> = {
@@ -27,6 +29,8 @@ type PendingRequest = {
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   onProgress?: (message: string) => void;
+  onPartialResult?: (data: unknown) => void;
+  cleanup?: () => void;
   timeout: number;
 };
 
@@ -41,9 +45,10 @@ type BrowserLiveSession = {
   readySettled: boolean;
   ended: boolean;
   pending: Map<string, PendingRequest>;
+  authTimeout: number;
 };
 
-const SESSION_MAX_AGE_MS = 2 * 60_000;
+const AUTH_TIMEOUT_MS = 10_000;
 let cachedGatewayUrl: Promise<string> | null = null;
 let cachedSession: BrowserLiveSession | null = null;
 
@@ -64,7 +69,7 @@ async function gatewayUrl() {
   ).trim();
   const gatewayBaseUrl = apiBaseUrl;
   if (!gatewayBaseUrl && !["localhost", "127.0.0.1"].includes(window.location.hostname)) {
-    const response = await fetch("/api/cash-discount-live-url", { cache: "no-store" });
+    const response = await fetch("/api/cash-discount-live-url", { cache: "no-store", signal: AbortSignal.timeout(AUTH_TIMEOUT_MS) });
     const payload = await response.json().catch(() => ({})) as { url?: string; error?: string };
     if (!response.ok || !payload.url) {
       throw new Error(payload.error || "The Cash Discount gateway URL is not configured.");
@@ -96,16 +101,21 @@ function liveGatewayUrl() {
 function endSession(session: BrowserLiveSession, error: Error) {
   if (session.ended) return;
   session.ended = true;
+  window.clearTimeout(session.authTimeout);
   if (!session.readySettled) {
     session.readySettled = true;
     session.rejectReady(error);
   }
   for (const pending of session.pending.values()) {
     window.clearTimeout(pending.timeout);
+    pending.cleanup?.();
     pending.reject(error);
   }
   session.pending.clear();
   if (cachedSession === session) cachedSession = null;
+  if (session.socket.readyState === WebSocket.OPEN || session.socket.readyState === WebSocket.CONNECTING) {
+    session.socket.close(1000, "Session ended");
+  }
 }
 
 function closeSession(session: BrowserLiveSession) {
@@ -140,7 +150,12 @@ function createSession(params: {
     readySettled: false,
     ended: false,
     pending: new Map(),
+    authTimeout: 0,
   };
+  session.authTimeout = window.setTimeout(() => {
+    endSession(session, new Error("Live Tally authentication timed out. Reconnect and try again."));
+    socket.close();
+  }, AUTH_TIMEOUT_MS);
 
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({
@@ -149,12 +164,14 @@ function createSession(params: {
       connectionId: params.connectionId,
       companyName: params.companyName,
       token: params.token,
+      browserBinding: getTallyBrowserBinding(),
     }));
   });
   socket.addEventListener("message", (event) => {
     try {
       const message = JSON.parse(String(event.data ?? "{}")) as LiveResult<unknown>;
       if (message.type === "authenticated") {
+        window.clearTimeout(session.authTimeout);
         if (!session.readySettled) {
           session.readySettled = true;
           session.resolveReady();
@@ -164,13 +181,17 @@ function createSession(params: {
 
       const requestId = String(message.requestId ?? "");
       const pending = requestId ? session.pending.get(requestId) : null;
-      if (message.type === "progress" && pending) {
+      if ((message.type === "progress" || message.type === "accepted") && pending) {
         pending.onProgress?.(message.message || "Reading live Tally data...");
+      } else if (message.type === "partial_result" && pending) {
+        pending.onPartialResult?.(message.data);
       } else if (message.type === "result" && pending) {
         window.clearTimeout(pending.timeout);
+        pending.cleanup?.();
         session.pending.delete(requestId);
         if (message.success === true) pending.resolve(message.data);
         else pending.reject(new Error(readableLiveError(message.error)));
+        if (cachedSession !== session && session.pending.size === 0) closeSession(session);
       } else if (message.type === "error") {
         endSession(session, new Error(readableLiveError(message.error || "The live Cash Discount channel failed.")));
       }
@@ -193,16 +214,17 @@ async function getLiveSession(request: LiveRequest) {
   if (!accessToken && !localMode) throw new Error("Your session has expired. Sign in and try again.");
   const token = accessToken || "local-development";
   const gateway = await liveGatewayUrl();
-  const key = `${gateway}|${request.connectionId}`;
+  const key = `${gateway}|${request.connectionId}|${getTallyBrowserBinding()}`;
   const reusable =
     cachedSession &&
     !cachedSession.ended &&
     cachedSession.key === key &&
     cachedSession.token === token &&
-    Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS &&
     (cachedSession.socket.readyState === WebSocket.CONNECTING || cachedSession.socket.readyState === WebSocket.OPEN);
   if (reusable) return cachedSession as BrowserLiveSession;
-  if (cachedSession) closeSession(cachedSession);
+  // Token renewal must not kill a long-running request. Drain that authenticated
+  // session while new requests use the refreshed credential.
+  if (cachedSession && cachedSession.pending.size === 0) closeSession(cachedSession);
   cachedSession = createSession({
     key,
     token,
@@ -216,26 +238,49 @@ async function getLiveSession(request: LiveRequest) {
 }
 
 export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
-  const session = await getLiveSession(request);
-  await session.ready;
+  request.signal?.throwIfAborted();
+  const deadlineAt = Date.now() + (request.operation === "company_check" ? 15_000 : 240_000);
+  let authenticationTimer: number | undefined;
+  const session = await Promise.race([
+    (async () => { const session = await getLiveSession(request); await session.ready; return session; })(),
+    new Promise<never>((_resolve, reject) => {
+      authenticationTimer = window.setTimeout(() => reject(new Error("Live Tally authentication timed out. Reconnect and try again.")), AUTH_TIMEOUT_MS);
+    }),
+  ]).finally(() => window.clearTimeout(authenticationTimer));
+  request.signal?.throwIfAborted();
   return new Promise<T>((resolve, reject) => {
     const requestId = crypto.randomUUID();
+    const cancel = (reason: string) => {
+      const pending = session.pending.get(requestId);
+      if (!pending) return;
+      window.clearTimeout(pending.timeout);
+      pending.cleanup?.();
+      session.pending.delete(requestId);
+      if (session.socket.readyState === WebSocket.OPEN) {
+        session.socket.send(JSON.stringify({ type: "cancel", requestId }));
+      }
+      reject(new Error(reason));
+      if (cachedSession !== session && session.pending.size === 0) closeSession(session);
+    };
+    const onAbort = () => cancel("The live Tally request was cancelled.");
     const timeout = window.setTimeout(
-      () => {
-        session.pending.delete(requestId);
-        reject(new Error("The live Tally request timed out. Check the connector and try again."));
-      },
-      4 * 60_000
+      () => cancel("The live Tally request timed out. Check the connector and try again."),
+      Math.max(0, deadlineAt - Date.now())
     );
     session.pending.set(requestId, {
       resolve: (data) => resolve(data as T),
       reject,
       onProgress: request.onProgress,
+      onPartialResult: request.onPartialResult,
+      cleanup: () => request.signal?.removeEventListener("abort", onAbort),
       timeout,
     });
-    session.socket.send(JSON.stringify({
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    try { session.socket.send(JSON.stringify({
       type: "request",
       requestId,
+      deadlineAt,
+      companyDatasetId: getSelectedTallyDatasetId(),
       operation: request.operation,
       companyName: request.companyName,
       companyNames: request.companyNames,
@@ -243,6 +288,8 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
       proposal: request.proposal,
       payload: request.payload,
       customerScope: request.customerScope,
-    }));
+    })); } catch {
+      cancel("The live Tally channel disconnected. Reconnect and try again.");
+    }
   });
 }

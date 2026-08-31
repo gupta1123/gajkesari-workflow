@@ -1,5 +1,8 @@
 "use client";
 
+import { tallyBrowserStorage } from "@/lib/tally-browser-storage";
+
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -311,13 +314,13 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   const selectedConnectionId = selectedConnection?.id ?? "";
   const expectedMachineId =
     typeof window !== "undefined" && selectedConnectionId
-      ? window.localStorage.getItem(
+      ? tallyBrowserStorage.getItem(
           `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnectionId}`,
         )
       : null;
   const selectedControlToken =
     typeof window !== "undefined" && selectedConnectionId
-      ? window.localStorage.getItem(
+      ? tallyBrowserStorage.getItem(
           `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnectionId}`,
         )
       : null;
@@ -383,7 +386,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       setSelectedId((current) => {
         const stored =
           typeof window !== "undefined"
-            ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ??
+            ? (tallyBrowserStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ??
               "")
             : "";
         const preferred = current || stored;
@@ -393,12 +396,17 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           ? preferred
           : nextConnections[0]?.id || "";
         if (typeof window !== "undefined" && nextId) {
-          window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, nextId);
+          tallyBrowserStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, nextId);
         }
         return nextId;
       });
 
-      const companyResponse = await apiFetch("/api/tally/companies", {
+      const preferredId = selectedId || tallyBrowserStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) || "";
+      if (!nextConnections.some((connection) => connection.id === preferredId)) {
+        setCompanies([]);
+        return;
+      }
+      const companyResponse = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(preferredId)}`, {
         method: "GET",
         cache: "no-store",
       });
@@ -488,6 +496,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           displayName:
             setupMode === "same_machine" ? "Tally Prime" : "Tally Prime LAN",
           tallyUrl,
+          controlToken: selectedConnection ? tallyBrowserStorage.getItem(`${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`) : null,
           reuseConnectionId:
             selectedConnection && !connectorActive ? selectedConnection.id : null,
         }),
@@ -512,14 +521,14 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         ...current,
       ]);
       setSelectedId(payload.connection.id);
-      window.localStorage.setItem(
+      tallyBrowserStorage.setItem(
         SELECTED_CONNECTION_STORAGE_KEY,
         payload.connection.id,
       );
-      window.localStorage.removeItem(
+      tallyBrowserStorage.removeItem(
         `${EXPECTED_MACHINE_STORAGE_PREFIX}${payload.connection.id}`,
       );
-      window.localStorage.setItem(
+      tallyBrowserStorage.setItem(
         `${CONNECTION_CONTROL_STORAGE_PREFIX}${payload.connection.id}`,
         payload.controlToken,
       );
@@ -557,7 +566,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     try {
       setDisconnecting(true);
       setMessage(null);
-      const controlToken = window.localStorage.getItem(
+      const controlToken = tallyBrowserStorage.getItem(
         `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`,
       );
       if (!controlToken) {
@@ -588,12 +597,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           ),
         );
       }
-      window.localStorage.removeItem(
+      tallyBrowserStorage.removeItem(
         `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`,
       );
-      window.localStorage.removeItem(
-        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`,
-      );
+      // Keep this browser's binding so a paused installation can be resumed.
       setMessage({
         tone: "success",
         text: "Connector disconnected.",
@@ -634,10 +641,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       const payload = (await response.json()) as DisconnectOthersResponse;
       const disconnectedIds = payload.disconnectedConnectionIds ?? [];
       for (const connectionId of disconnectedIds) {
-        window.localStorage.removeItem(
+        tallyBrowserStorage.removeItem(
           `${EXPECTED_MACHINE_STORAGE_PREFIX}${connectionId}`,
         );
-        window.localStorage.removeItem(
+        tallyBrowserStorage.removeItem(
           `${CONNECTION_CONTROL_STORAGE_PREFIX}${connectionId}`,
         );
       }
@@ -744,7 +751,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
 
   useEffect(() => {
     if (!selectedConnection?.id) return;
-    window.localStorage.setItem(
+    tallyBrowserStorage.setItem(
       SELECTED_CONNECTION_STORAGE_KEY,
       selectedConnection.id,
     );
@@ -759,8 +766,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       return;
     }
     const key = `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`;
-    if (!window.localStorage.getItem(key)) {
-      window.localStorage.setItem(key, selectedConnection.bridgeMachineId);
+    if (!tallyBrowserStorage.getItem(key)) {
+      tallyBrowserStorage.setItem(key, selectedConnection.bridgeMachineId);
     }
   }, [
     selectedConnection?.bridgeConnected,
@@ -1016,22 +1023,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       Pause connection
                     </Button>
                   )}
-                {otherActiveConnectionCount > 0 ? (
-                  <Button
-                    className="w-fit whitespace-nowrap rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
-                    disabled={disconnectingOthers}
-                    onClick={() => void disconnectOtherConnectors()}
-                    type="button"
-                    variant="outline"
-                  >
-                    {disconnectingOthers ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                    ) : (
-                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                    )}
-                    Disconnect other sessions
-                  </Button>
-                ) : null}
+                {/* This browser cannot disconnect another installation. */}
               </div>
             </div>
           </div>

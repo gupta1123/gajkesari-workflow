@@ -21,7 +21,79 @@ import {
   purchaseVoucherReadbackComparison,
   reconcileBankTransactionsInTally,
   strictBankTransactionCandidates,
+  indexBankVouchersByDate,
+  fetchAvailableCompanies,
+  testTally,
 } from "./bridge.mjs";
+
+test("cancelled and expired interactive work never enters Tally", async () => {
+  const scheduler = createExclusiveScheduler();
+  let release;
+  let started;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const first = scheduler(async () => { started(); await new Promise((resolve) => { release = resolve; }); }, "background");
+  await ready;
+  let invoked = false;
+  const controller = new AbortController();
+  const cancelled = scheduler(() => { invoked = true; }, "interactive", { signal: controller.signal });
+  const cancellation = assert.rejects(cancelled);
+  controller.abort();
+  await cancellation;
+  const expired = scheduler(() => { invoked = true; }, "interactive", { deadlineAt: Date.now() + 20 });
+  await assert.rejects(expired, /timed out|deadline|expired|wait/i);
+  release();
+  await first;
+  assert.equal(invoked, false);
+  assert.equal(await scheduler(() => "next", "interactive"), "next");
+  scheduler.stop();
+});
+
+test("readiness uses one small current-company query, not a ledger export", async (t) => {
+  const bodies = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    bodies.push(options.body);
+    return new Response("<ENVELOPE><RESULT>Gajkesari</RESULT></ENVELOPE>");
+  });
+  const result = await testTally("http://tally.invalid");
+  assert.equal(result.companyName, "Gajkesari");
+  assert.equal(result.companyLoaded, true);
+  assert.equal(bodies.length, 1);
+  assert.match(bodies[0], /\$\$CurrentCompany/);
+  assert.doesNotMatch(bodies[0], /<COLLECTION|SVCURRENTCOMPANY|Ledger/i);
+});
+
+test("different company GUIDs with the same name are not silently collapsed", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response(
+    '<ENVELOPE><STATUS>1</STATUS><COMPANY NAME="Same"><GUID>guid-a</GUID></COMPANY><COMPANY NAME="Same"><GUID>guid-b</GUID></COMPANY></ENVELOPE>'
+  ));
+  const companies = await fetchAvailableCompanies("http://tally.invalid", "Same");
+  assert.deepEqual(companies.map((company) => company.guid), ["guid-a", "guid-b"]);
+  assert.equal(companies.filter((company) => company.isActive).length, 2);
+});
+
+for (const size of [9227, 12000]) {
+  test(`indexed matching preserves exact identities and reservations for ${size} vouchers`, () => {
+    const vouchers = Array.from({ length: size }, (_, index) => ({
+      ...bankVoucher({ reference: `UTR-${index % 100}`, party: `Party ${index % 7}` }),
+      date: `202608${String(index % 28 + 1).padStart(2, "0")}`,
+      effectiveDate: `202608${String(index % 28 + 1).padStart(2, "0")}`,
+    }));
+    const byDate = indexBankVouchersByDate(vouchers);
+    const reserved = new Set([0, 100, 2800]);
+    for (let index = 0; index < 35; index += 1) {
+      const transaction = {
+        voucherDate: `2026-08-${String(index % 28 + 1).padStart(2, "0")}`,
+        amount: 1250, expectedDirection: "incoming",
+        referenceNumber: index % 2 ? `UTR-${index % 100}` : "",
+        counterpartyLedgerName: index % 3 ? `Party ${index % 7}` : "Suspense",
+      };
+      const baseline = strictBankTransactionCandidates(vouchers, transaction, "ICICI Current Account", reserved);
+      const indexed = strictBankTransactionCandidates(vouchers, transaction, "ICICI Current Account", reserved, byDate);
+      assert.deepEqual(indexed, baseline);
+    }
+    assert.ok(Math.max(...[...byDate.values()].map((rows) => rows.length)) < size / 20);
+  });
+}
 
 test("interactive Tally work runs before queued background work", async () => {
   const scheduler = createExclusiveScheduler();

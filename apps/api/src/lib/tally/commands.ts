@@ -35,6 +35,10 @@ export type TallyBridgeCommandRow = {
   bridge_version: string | null;
   created_at: string;
   updated_at: string;
+  claim_token?: string | null;
+  lease_expires_at?: string | null;
+  target_session_generation?: number | null;
+  reconciliation_required?: boolean;
 };
 
 export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
@@ -50,7 +54,7 @@ export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
   "verify_bank_transaction",
 ];
 
-export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow) {
+export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow, includeClaimToken = false) {
   return {
     id: row.id,
     connectionId: row.connection_id,
@@ -68,6 +72,10 @@ export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow) {
     bridgeVersion: row.bridge_version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ...(includeClaimToken ? { claimToken: row.claim_token ?? null } : {}),
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    sessionGeneration: row.target_session_generation ?? null,
+    reconciliationRequired: row.reconciliation_required ?? false,
   };
 }
 

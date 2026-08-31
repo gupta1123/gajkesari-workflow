@@ -826,8 +826,8 @@ function bankAccountNumberFromTallyLedger(ledger) {
   return numbers.length === 1 ? numbers[0] : "";
 }
 
-async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
-  if (!connectionId) return [];
+async function getTallyBankAccountCandidates(ownerUserId, companyDatasetId) {
+  if (!companyDatasetId) throw new Error("This historical statement needs company-dataset reconciliation.");
   const ledgers = [];
   const groups = [];
   const pageSize = 1000;
@@ -837,7 +837,7 @@ async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
         .from("tally_masters")
         .select("tally_name, parent_name, raw_payload")
         .eq("owner_user_id", ownerUserId)
-        .eq("connection_id", connectionId)
+        .eq("company_dataset_id", companyDatasetId)
         .eq("master_type", masterType)
         .eq("is_active", true)
         .order("tally_name", { ascending: true })
@@ -875,8 +875,8 @@ async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
   });
 }
 
-async function getActiveTallyLedgerNames(ownerUserId, connectionId) {
-  if (!connectionId) return [];
+async function getActiveTallyLedgerNames(ownerUserId, companyDatasetId) {
+  if (!companyDatasetId) throw new Error("This historical statement needs company-dataset reconciliation.");
   const names = [];
   const pageSize = 1000;
   for (let from = 0; from < 20000; from += pageSize) {
@@ -884,7 +884,7 @@ async function getActiveTallyLedgerNames(ownerUserId, connectionId) {
       .from("tally_masters")
       .select("tally_name")
       .eq("owner_user_id", ownerUserId)
-      .eq("connection_id", connectionId)
+      .eq("company_dataset_id", companyDatasetId)
       .eq("master_type", "ledger")
       .eq("is_active", true)
       .order("tally_name", { ascending: true })
@@ -2156,7 +2156,7 @@ async function runBankStatementJob(job) {
       : {};
   const analysisContext =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
-      ? processingMeta.analysis
+      ? { ...processingMeta.analysis }
       : {};
   const tallyConnectionId =
     typeof selectedContext.connectionId === "string"
@@ -2170,19 +2170,16 @@ async function runBankStatementJob(job) {
       : typeof analysisContext.companyName === "string"
         ? analysisContext.companyName
         : null;
-  let effectiveTallyConnectionId = tallyConnectionId;
-  if (companyName) {
-    const { data: latestConnection } = await supabase
-      .from("tally_connections")
-      .select("id")
-      .eq("owner_user_id", job.owner_user_id)
-      .is("revoked_at", null)
-      .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
-      .eq("last_company_name", companyName)
-      .order("updated_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (latestConnection?.id) effectiveTallyConnectionId = latestConnection.id;
+  const effectiveTallyConnectionId = tallyConnectionId;
+  // Dataset ownership survives reconnects. Never route a worker by a company
+  // name on the newest connection (which might belong to another PC).
+  if (importRow.catalogue_snapshot_id) {
+    const { data: snapshot, error: snapshotError } = await supabase.from("tally_catalogue_snapshots")
+      .select("catalogue").eq("id", importRow.catalogue_snapshot_id)
+      .eq("owner_user_id", job.owner_user_id).eq("company_dataset_id", importRow.company_dataset_id).single();
+    if (snapshotError) throw snapshotError;
+    analysisContext.liveTallyLedgerNames = snapshot.catalogue.ledgerNames || [];
+    analysisContext.liveTallyBankAccountCandidates = snapshot.catalogue.bankAccountCandidates || [];
   }
   const liveTallyLedgerNames = Array.isArray(analysisContext.liveTallyLedgerNames)
     ? Array.from(new Set(analysisContext.liveTallyLedgerNames.map((name) => textCell(name)).filter(Boolean))).slice(0, 20_000)
@@ -2197,10 +2194,10 @@ async function runBankStatementJob(job) {
     : [];
   const bankAccountCandidates = liveTallyBankAccountCandidates.length > 0
     ? liveTallyBankAccountCandidates
-    : await getTallyBankAccountCandidates(job.owner_user_id, effectiveTallyConnectionId);
+    : await getTallyBankAccountCandidates(job.owner_user_id, importRow.company_dataset_id);
   const ledgerNames = liveTallyLedgerNames.length > 0
     ? liveTallyLedgerNames
-    : await getActiveTallyLedgerNames(job.owner_user_id, effectiveTallyConnectionId);
+    : await getActiveTallyLedgerNames(job.owner_user_id, importRow.company_dataset_id);
   console.log(
     `[worker] using ${ledgerNames.length} Tally ledger name(s) and ${bankAccountCandidates.length} bank candidate(s) for ${fileName}`
   );
@@ -2690,9 +2687,15 @@ async function main() {
     `[worker] started name=${WORKER_NAME} pool=${WORKER_POOL} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=adaptive_ai batchPages=${BANK_STATEMENT_BATCH_PAGE_SIZE} concurrency=${BANK_STATEMENT_BATCH_CONCURRENCY}`
   );
   let lastIdleLogAt = 0;
+  let lastLeaseCleanupAt = 0;
 
   while (true) {
     try {
+      if (Date.now() - lastLeaseCleanupAt >= 60_000) {
+        lastLeaseCleanupAt = Date.now();
+        const { error } = await supabase.rpc("quarantine_expired_tally_commands");
+        if (error) console.warn("[worker] command lease cleanup unavailable:", error.code);
+      }
       const tallyQueueJob = await claimNextTallyQueueJob();
       if (tallyQueueJob) {
         try {

@@ -120,7 +120,12 @@ export async function POST(request: Request) {
       }
     }
 
+    const { data: dataset, error: datasetError } = await supabase.from("tally_company_datasets")
+      .select("id").eq("owner_user_id", connection.owner_user_id)
+      .eq("installation_id", connection.installation_ref).eq("company_name", companyName).single();
+    if (datasetError) throw datasetError;
     const syncRunBase = {
+      company_dataset_id: dataset.id,
       connection_id: connection.id,
       owner_user_id: connection.owner_user_id,
       status: "failed",
@@ -167,13 +172,12 @@ export async function POST(request: Request) {
     // This sync can explicitly read a company that is not currently open in
     // Tally. Do not overwrite the heartbeat's active-company value here; doing
     // so would make the UI believe a different company is live.
-    await supabase
-      .from("tally_connections")
-      .update({ last_tested_at: now })
-      .eq("id", connection.id);
+    // Master exports are not active-company observations. Only the readiness
+    // probe may advance last_tested_at.
 
     const rowsWithRun = rows.map((row) => ({
       ...row,
+      company_dataset_id: dataset.id,
       sync_run_id: syncRunId,
     }));
 
@@ -202,7 +206,7 @@ export async function POST(request: Request) {
           supabase
             .from("tally_masters")
             .upsert(batch, {
-              onConflict: "connection_id,company_name,master_type,master_key",
+              onConflict: "company_dataset_id,master_type,master_key",
             })
         ));
         const failedIndex = results.findIndex((result) => result.error);
@@ -218,20 +222,14 @@ export async function POST(request: Request) {
     // Only retire the prior snapshot after the new rows have been written.
     // This prevents a failed upsert from leaving the company with no active
     // masters, and sync_run_id keeps the just-upserted rows active.
-    const { error: otherCompanyDeactivateError } = await supabase
-      .from("tally_masters")
-      .update({ is_active: false, last_synced_at: now })
-      .eq("connection_id", connection.id)
-      .neq("company_name", companyName)
-      .eq("is_active", true);
-    if (otherCompanyDeactivateError) throw otherCompanyDeactivateError;
+    // A workstation can hold several companies. Refresh only this company's
+    // snapshot; switching Tally must not invalidate another company's masters.
 
     if (syncedTypes.size > 0) {
       const { error: priorSnapshotDeactivateError } = await supabase
         .from("tally_masters")
         .update({ is_active: false, last_synced_at: now })
-        .eq("connection_id", connection.id)
-        .eq("company_name", companyName)
+        .eq("company_dataset_id", dataset.id)
         .in("master_type", Array.from(syncedTypes))
         .or(`sync_run_id.is.null,sync_run_id.neq.${syncRunId}`)
         .eq("is_active", true);

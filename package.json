@@ -30,6 +30,7 @@
     "typecheck": "npm run typecheck:web && npm run typecheck:api",
     "test:tally-bridge": "node --test apps/tally-bridge/src/bridge.test.mjs",
     "test:tally-live-gateway": "node --test apps/cash-discount-gateway/src/server.test.mjs",
+    "test:tally-browser-live": "node --test apps/gajkesari-web/src/lib/cash-discount-live.test.mjs",
     "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
     "evaluate:ledger-matching": "node --env-file=apps/api/.env.local scripts/evaluate-ledger-matching.mjs",
     "worker": "npm run worker --workspace @gajkesari/api",

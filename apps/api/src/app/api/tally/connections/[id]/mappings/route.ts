@@ -1,3 +1,4 @@
+import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -19,7 +20,7 @@ async function requireConnection(ownerUserId: string, connectionId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("tally_connections")
-    .select("id, owner_user_id")
+    .select("id, owner_user_id, last_company_name")
     .eq("id", connectionId)
     .eq("owner_user_id", ownerUserId)
     .maybeSingle();
@@ -51,11 +52,12 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
+    const target = await resolveTallyTarget(request, user.id, id, new URL(request.url).searchParams.get("companyName") || connection.last_company_name || "");
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_mapping_settings")
       .select("*")
-      .eq("connection_id", id)
+      .eq("company_dataset_id", target.companyDatasetId)
       .eq("owner_user_id", user.id)
       .order("updated_at", { ascending: false });
 
@@ -89,6 +91,7 @@ export async function POST(
     }
 
     const body = await request.json().catch(() => ({}));
+    const target = await resolveTallyTarget(request, user.id, id, body.companyName || connection.last_company_name || "");
     const mappingType = parseMappingType(body.mappingType);
     const sourceKey = toRequiredText(body.sourceKey).slice(0, 240);
     const sourceLabel = toRequiredText(body.sourceLabel || body.sourceKey).slice(0, 500);
@@ -106,6 +109,8 @@ export async function POST(
       .upsert(
         {
           connection_id: id,
+          company_dataset_id: target.companyDatasetId,
+          company_name: target.companyName,
           owner_user_id: user.id,
           mapping_type: mappingType,
           source_key: sourceKey,
@@ -117,7 +122,7 @@ export async function POST(
           notes: toNullableText(body.notes, 1000),
         },
         {
-          onConflict: "connection_id,mapping_type,source_key",
+          onConflict: "company_dataset_id,mapping_type,source_key",
         }
       )
       .select("*")

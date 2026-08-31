@@ -1,6 +1,7 @@
 "use client";
 
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { tallyBrowserStorage, setTallyStorageUser, clearTallyBrowserCredentials } from "@/lib/tally-browser-storage";
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
 const USE_CROSS_ORIGIN_API =
@@ -23,7 +24,11 @@ function clearCachedAccessToken() {
 function getBrowserClient() {
   if (!browserClient) {
     browserClient = createSupabaseBrowserClient();
-    browserClient.auth.onAuthStateChange(clearCachedAccessToken);
+    browserClient.auth.onAuthStateChange((event, session) => {
+      clearCachedAccessToken();
+      if (event === "SIGNED_OUT") clearTallyBrowserCredentials();
+      else setTallyStorageUser(session?.user.id || null);
+    });
   }
 
   return browserClient;
@@ -31,6 +36,7 @@ function getBrowserClient() {
 
 async function readAccessToken() {
   if (isLocalDbMode()) {
+    setTallyStorageUser("local-dev-user");
     return null;
   }
 
@@ -45,6 +51,7 @@ async function readAccessToken() {
   pendingAccessToken = getBrowserClient()
     .auth.getSession()
     .then(({ data: { session } }) => {
+      setTallyStorageUser(session?.user.id || null);
       const token = session?.access_token ?? null;
       const expiresAtSeconds = session?.expires_at;
 
@@ -102,12 +109,29 @@ export async function getApiAccessToken() {
   return readAccessToken();
 }
 
+export function getTallyBrowserBinding() {
+  if (typeof window === "undefined") return "";
+  const id = tallyBrowserStorage.getItem("gajkesari:selected-tally-connection");
+  return id ? tallyBrowserStorage.getItem(`gajkesari:tally-connection-control:${id}`) || "" : "";
+}
+
+export function getSelectedTallyDatasetId() {
+  try {
+    const selected = JSON.parse(tallyBrowserStorage.getItem("gajkesari.bankStatements.selectedCompany.v1") || "{}");
+    return /^[0-9a-f-]{36}$/i.test(selected.id || "") ? selected.id as string : "";
+  } catch { return ""; }
+}
+
 export async function apiFetch(path: string, init?: RequestInit) {
   const accessToken = await readAccessToken();
   const apiUrl = buildApiUrl(path);
 
   async function sendRequest(token: string | null) {
     const headers = new Headers(init?.headers);
+    const binding = getTallyBrowserBinding();
+    if (binding) headers.set("x-tally-browser-binding", binding);
+    const datasetId = getSelectedTallyDatasetId();
+    if (datasetId && path.startsWith("/api/bank-statements")) headers.set("x-tally-dataset-id", datasetId);
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }

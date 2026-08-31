@@ -16,7 +16,6 @@ function disconnectedUpdatePayload(disconnectedAt: string) {
     pairing_code_hash: null,
     pairing_code_expires_at: null,
     bridge_token_hash: null,
-    control_token_hash: null,
     // This is a temporary pause. Preserve the connection identity and
     // installation_id so the next pairing can reuse the same catalogue.
     paired_at: null,
@@ -137,7 +136,7 @@ export async function POST(
         completed_at: disconnectedAt,
       })
       .eq("connection_id", connection.id)
-      .in("status", ["queued", "claimed"]);
+      .eq("status", "queued");
 
     if (cancelError) throw cancelError;
 

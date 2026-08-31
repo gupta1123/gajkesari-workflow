@@ -1,3 +1,4 @@
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -106,6 +107,7 @@ export async function GET(request: Request) {
       .select("id")
       .eq("id", accountId)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .maybeSingle();
 
     if (accountError) throw accountError;
@@ -120,6 +122,7 @@ export async function GET(request: Request) {
         { count: "exact" }
       )
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .eq("bank_account_id", accountId)
       .order("transaction_date", { ascending: true })
       .order("id", { ascending: true })

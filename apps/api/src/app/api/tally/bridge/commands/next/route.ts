@@ -4,6 +4,7 @@ import { isLocalDbMode } from "@/lib/local/mode";
 import { claimNextLocalTallyCommand } from "@/lib/local/tally-store";
 import {
   hashSecret,
+  connectorSupportsReliableActiveCompany,
   TALLY_CONNECTION_SELECT,
   type TallyConnectionRow,
 } from "@/lib/tally/connections";
@@ -77,76 +78,18 @@ export async function GET(request: Request) {
     if (!connection?.bridge_token_hash || hashSecret(token) !== connection.bridge_token_hash) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
-
-    const now = new Date().toISOString();
-    const staleClaimedBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { error: exhaustedClaimError } = await supabase
-      .from("tally_bridge_commands")
-      .update({
-        status: "failed",
-        completed_at: now,
-        error: "Bridge claimed this command but did not report a result before the retry limit.",
-      })
-      .eq("connection_id", connection.id)
-      .eq("status", "claimed")
-      .lt("claimed_at", staleClaimedBefore)
-      .gte("attempts", 3);
-
-    if (exhaustedClaimError) throw exhaustedClaimError;
-
-    const { error: staleClaimError } = await supabase
-      .from("tally_bridge_commands")
-      .update({
-        status: "queued",
-        claimed_at: null,
-        error: "Requeued after the bridge claimed this command but did not report a result.",
-      })
-      .eq("connection_id", connection.id)
-      .eq("status", "claimed")
-      .lt("claimed_at", staleClaimedBefore)
-      .lt("attempts", 3);
-
-    if (staleClaimError) throw staleClaimError;
-
-    const { data: commandData, error: commandError } = await supabase
-      .from("tally_bridge_commands")
-      .select("*")
-      .eq("connection_id", connection.id)
-      .eq("status", "queued")
-      .lte("available_at", now)
-      .lt("attempts", 3)
-      .order("priority", { ascending: false })
-      .order("created_at", { ascending: true })
-      .limit(limit);
-
-    if (commandError) throw commandError;
-    if (!commandData?.length) {
-      return jsonWithCors(request, { command: null, commands: [] });
+    if (!connectorSupportsReliableActiveCompany(bridgeVersion)) {
+      return jsonWithCors(request, { error: "Install connector 0.1.58 or later and pair this PC again." }, { status: 426 });
     }
 
-    const claimedRows = await Promise.all(
-      (commandData as unknown as TallyBridgeCommandRow[]).map(async (command) => {
-        const { data: claimedData, error: claimError } = await supabase
-          .from("tally_bridge_commands")
-          .update({
-            status: "claimed",
-            claimed_at: now,
-            attempts: command.attempts + 1,
-            bridge_version: bridgeVersion,
-          })
-          .eq("id", command.id)
-          .eq("status", "queued")
-          .select("*")
-          .maybeSingle();
-
-        if (claimError) throw claimError;
-        return claimedData as unknown as TallyBridgeCommandRow | null;
-      })
-    );
-    const commands = claimedRows
-      .filter((command): command is TallyBridgeCommandRow => Boolean(command))
-      .map(serializeTallyBridgeCommand);
-
+    const { data: claimedRows, error: claimError } = await supabase.rpc("claim_tally_commands", {
+      p_connection_id: connection.id,
+      p_token_hash: hashSecret(token),
+      p_bridge_version: bridgeVersion,
+      p_limit: limit,
+    });
+    if (claimError) throw claimError;
+    const commands = ((claimedRows ?? []) as TallyBridgeCommandRow[]).map((row) => serializeTallyBridgeCommand(row, true));
     return jsonWithCors(request, {
       command: commands[0] ?? null,
       commands,

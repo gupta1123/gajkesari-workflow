@@ -21,15 +21,14 @@ function disconnectedUpdatePayload(disconnectedAt: string) {
     pairing_code_hash: null,
     pairing_code_expires_at: null,
     bridge_token_hash: null,
-    control_token_hash: null,
     paired_at: null,
     last_heartbeat_at: null,
     last_tested_at: null,
     last_tally_reachable: null,
     last_company_loaded: null,
     last_company_name: null,
-    revoked_at: disconnectedAt,
-    revoked_reason: "Disconnected by connector.",
+    revoked_at: null,
+    revoked_reason: null,
     last_error: "Disconnected by connector.",
   };
 }
@@ -84,6 +83,8 @@ export async function POST(request: Request) {
       .from("tally_connections")
       .update(disconnectedUpdatePayload(disconnectedAt))
       .eq("id", connection.id)
+      .eq("bridge_token_hash", hashSecret(token))
+      .eq("session_generation", connection.session_generation)
       .is("revoked_at", null)
       .select(TALLY_CONNECTION_SELECT)
       .single();
@@ -98,7 +99,7 @@ export async function POST(request: Request) {
         completed_at: disconnectedAt,
       })
       .eq("connection_id", connection.id)
-      .in("status", ["queued", "claimed"]);
+      .eq("status", "queued");
 
     if (cancelError) throw cancelError;
 

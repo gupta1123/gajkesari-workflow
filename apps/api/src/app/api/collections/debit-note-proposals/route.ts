@@ -1,3 +1,4 @@
+import { browserDatasetIds, resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -75,6 +76,7 @@ export async function GET(request: Request) {
       .from("debit_note_proposals")
       .select("*")
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .order("created_at", { ascending: false })
       .limit(100);
 
@@ -143,28 +145,15 @@ export async function POST(request: Request) {
 
     const companyName = toNullableText(body.companyName ?? body.company_name, 240) ?? connection.last_company_name;
     const linkedInvoiceNumber = toNullableText(body.linkedInvoiceNumber ?? body.linked_invoice_number, 120);
-    const compatibleConnectionIds = new Set([connectionId]);
-
-    if (connection.last_company_name) {
-      const { data: companyConnectionRows, error: companyConnectionError } = await supabase
-        .from("tally_connections")
-        .select("id")
-        .eq("owner_user_id", user.id)
-        .eq("last_company_name", connection.last_company_name)
-        .limit(50);
-
-      if (companyConnectionError) throw companyConnectionError;
-      for (const row of companyConnectionRows ?? []) {
-        if (row.id) compatibleConnectionIds.add(String(row.id));
-      }
-    }
+    const target = await resolveTallyTarget(request, user.id, connectionId, companyName || "");
 
     if (linkedInvoiceNumber) {
       const { data: existingRows, error: existingError } = await supabase
         .from("debit_note_proposals")
         .select("*")
         .eq("owner_user_id", user.id)
-        .in("connection_id", Array.from(compatibleConnectionIds))
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+        .eq("company_dataset_id", target.companyDatasetId)
         .eq("party_ledger_name", partyLedgerName)
         .eq("linked_invoice_number", linkedInvoiceNumber)
         .eq("recoverable_amount", recoverableAmount)
@@ -205,6 +194,7 @@ export async function POST(request: Request) {
     const partyGstin = toNullableText(body.partyGstin ?? body.party_gstin, 32) ?? ledger?.gstin ?? null;
 
     const payload = {
+      company_dataset_id: target.companyDatasetId,
       owner_user_id: user.id,
       connection_id: connectionId,
       company_name: companyName,

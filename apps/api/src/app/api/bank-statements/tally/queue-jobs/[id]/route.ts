@@ -1,6 +1,7 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
 
 function serializeQueueJob(row: Record<string, unknown>) {
   return {
@@ -34,9 +35,10 @@ export async function GET(
     const supabase = createSupabaseAdminClient();
     const { data: job, error } = await supabase
       .from("bank_statement_tally_queue_jobs")
-      .select("*")
+      .select("id,status,total_count,processed_count,result,error,created_at,updated_at,completed_at")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .maybeSingle();
 
     if (error) throw error;

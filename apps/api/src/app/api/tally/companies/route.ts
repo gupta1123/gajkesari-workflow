@@ -401,6 +401,12 @@ export async function GET(request: Request) {
     if (error) throw error;
 
     const connections = (data ?? []) as unknown as TallyConnectionRow[];
+    const installationIds = connections.flatMap((connection) => connection.installation_ref ? [connection.installation_ref] : []);
+    const { data: datasets, error: datasetError } = installationIds.length ? await supabase.from("tally_company_datasets")
+      .select("id,installation_id,company_guid").eq("owner_user_id", user.id).in("installation_id", installationIds)
+      : { data: [], error: null };
+    if (datasetError) throw datasetError;
+    const datasetByGuid = new Map((datasets || []).map((dataset) => [`${dataset.installation_id}|${dataset.company_guid}`, dataset.id]));
     const connectionIds = connections.map((connection) => connection.id);
     const latestSyncByConnection = new Map<string, LatestSyncRow>();
     const latestHeartbeatByConnection = new Map<string, HeartbeatEventRow>();
@@ -418,8 +424,9 @@ export async function GET(request: Request) {
       if (syncError) throw syncError;
 
       for (const row of (syncRows ?? []) as unknown as LatestSyncRow[]) {
-        if (!latestSyncByConnection.has(row.connection_id)) {
-          latestSyncByConnection.set(row.connection_id, row);
+        const key = `${row.connection_id}|${row.company_name}`;
+        if (!latestSyncByConnection.has(key)) {
+          latestSyncByConnection.set(key, row);
         }
       }
 
@@ -454,7 +461,6 @@ export async function GET(request: Request) {
     }
 
     const companyEntries = connections.flatMap((connection) => {
-      const latestSync = latestSyncByConnection.get(connection.id) ?? null;
       const status = serializeTallyConnectionStatus(connection);
       const latestHeartbeat = latestHeartbeatByConnection.get(connection.id) ?? null;
       const heartbeatAt = timestampValue(connection.last_heartbeat_at);
@@ -477,7 +483,7 @@ export async function GET(request: Request) {
         company: serializeCompany(
           {
             ...connection,
-            latestSync,
+            latestSync: latestSyncByConnection.get(`${connection.id}|${metadata.companyName}`) ?? null,
           },
           metadata.companyName,
           metadata
@@ -493,14 +499,18 @@ export async function GET(request: Request) {
       if (activeDiff !== 0) return activeDiff;
       return timestampValue(b.updatedAt) - timestampValue(a.updatedAt);
     });
-    const companies = companyEntries.map((entry) =>
-      withLocalBankLedgers(entry.company, localTallyCompanies)
-    );
+    const companies = companyEntries.map((entry) => {
+      const connection = connections.find((connection) => connection.id === entry.company.connectionId);
+      const datasetId = datasetByGuid.get(`${connection?.installation_ref}|${String(entry.company.companyGuid || "").toLowerCase()}`);
+      return withLocalBankLedgers({ ...entry.company, id: datasetId || entry.company.id,
+        companyDatasetId: datasetId || null, installationId: connection?.installation_ref,
+        sessionGeneration: connection?.session_generation }, localTallyCompanies);
+    });
 
     return jsonWithCors(request, {
       companies,
       selectedCompanyId:
-        companyEntries.find((entry) => entry.company.isActive)?.company.id ??
+        companies.find((company) => company.isActive)?.id ??
         companies[0]?.id ??
         null,
     });

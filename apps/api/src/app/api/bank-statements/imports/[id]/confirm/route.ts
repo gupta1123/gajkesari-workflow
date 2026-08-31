@@ -1,3 +1,4 @@
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createHash } from "node:crypto";
 import { after } from "next/server";
@@ -412,6 +413,7 @@ export async function POST(
       .select("*")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .single();
 
     if (importError || !importRow) {
@@ -455,6 +457,7 @@ export async function POST(
         .select("*")
         .eq("id", accountId)
         .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
         .single();
       if (error || !data) {
         return jsonWithCors(request, { error: "Selected bank account was not found." }, { status: 404 });
@@ -484,6 +487,7 @@ export async function POST(
 
       const insertPayload = {
         owner_user_id: user.id,
+        company_dataset_id: importRow.company_dataset_id,
         bank_name: account.bankName || importRow.extracted_bank_name || null,
         account_number_normalized: accountKey,
         account_number_masked: normalizedAccountNumber ? maskAccountNumber(accountNumber) : "UNVERIFIED",
@@ -503,7 +507,9 @@ export async function POST(
           .from("bank_accounts")
           .select("*")
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .eq("account_number_normalized", accountKey)
+          .eq("company_dataset_id", importRow.company_dataset_id)
           .single();
         if (existingError || !existing) throw error;
         accountRow = existing;
@@ -516,6 +522,9 @@ export async function POST(
     if (!accountId || !accountRow) {
       return jsonWithCors(request, { error: "Bank account could not be resolved." }, { status: 400 });
     }
+    if (accountRow.company_dataset_id !== importRow.company_dataset_id) {
+      return jsonWithCors(request, { error: "The bank account belongs to a different Tally company." }, { status: 409 });
+    }
 
     const rowsByFingerprint = new Map(
       transactions.map((transaction) => {
@@ -524,6 +533,7 @@ export async function POST(
           fingerprint,
           {
             owner_user_id: user.id,
+            company_dataset_id: importRow.company_dataset_id,
             bank_account_id: accountId,
             statement_import_id: id,
             transaction_date: transaction.transactionDate,
@@ -568,6 +578,7 @@ export async function POST(
           .from("bank_transactions")
           .select("id, fingerprint, statement_import_id, tally_status")
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .eq("bank_account_id", accountId)
           .in("fingerprint", submittedFingerprints)
       : Promise.resolve({ data: [], error: null });
@@ -631,6 +642,7 @@ export async function POST(
 
     const rowsToInsert = snapshotRows.map((row) => ({
       owner_user_id: user.id,
+      company_dataset_id: importRow.company_dataset_id,
       bank_account_id: accountId,
       statement_import_id: id,
       transaction_date: row.transaction_date,
@@ -704,6 +716,7 @@ export async function POST(
           .update(accountUpdate)
           .eq("id", accountId)
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .select("*")
           .single()
       : supabase
@@ -711,6 +724,7 @@ export async function POST(
           .select("*")
           .eq("id", accountId)
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .single();
 
     const queueableTransactionsPromise = supabase
@@ -719,6 +733,7 @@ export async function POST(
         "id, transaction_date, value_date, description, reference_number, debit_amount, credit_amount, suggested_ledger_name, confirmed_ledger_name"
       )
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .eq("bank_account_id", accountId)
       .eq("statement_import_id", id)
       .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
@@ -769,6 +784,7 @@ export async function POST(
           })
           .eq("id", id)
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .select("*")
           .single(),
         queueableTransactionsPromise,
@@ -789,6 +805,7 @@ export async function POST(
           .from("bank_statement_imports")
           .select("id, storage_path")
           .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .eq("bank_account_id", accountId)
           .neq("id", id);
         if (olderImportsError) throw olderImportsError;
@@ -808,6 +825,7 @@ export async function POST(
             .from("bank_statement_imports")
             .delete()
             .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
             .eq("bank_account_id", accountId)
             .neq("id", id);
           if (deleteOlderImportsError) throw deleteOlderImportsError;

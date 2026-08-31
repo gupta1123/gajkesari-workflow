@@ -1,7 +1,8 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { hashSecret, TALLY_CONNECTION_SELECT, type TallyConnectionRow } from "@/lib/tally/connections";
+import { hashSecret, connectorSupportsReliableActiveCompany, TALLY_CONNECTION_SELECT, type TallyConnectionRow } from "@/lib/tally/connections";
+import { browserOwnsConnection, resolveTallyTarget } from "@/lib/tally/browser-scope";
 
 function bearerToken(request: Request) {
   return request.headers.get("x-bridge-token") ??
@@ -26,16 +27,22 @@ export async function POST(request: Request) {
     if (role === "browser") {
       const user = await requireRequestUser(request);
       if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+      if (!await browserOwnsConnection(request, user.id, connectionId)) {
+        return jsonWithCors(request, { error: "Pair this browser with its own Tally connector." }, { status: 403 });
+      }
       const { data, error } = await supabase
         .from("tally_connections")
-        .select("id, owner_user_id, revoked_at")
+        .select("id, owner_user_id, revoked_at, installation_ref, session_generation, bridge_version")
         .eq("id", connectionId)
         .eq("owner_user_id", user.id)
         .is("revoked_at", null)
         .maybeSingle();
       if (error) throw error;
       if (!data) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
-      return jsonWithCors(request, { authenticated: true, ownerUserId: user.id, connectionId });
+      if (!connectorSupportsReliableActiveCompany(data.bridge_version)) return jsonWithCors(request, { error: "Connector update required: install version 0.1.58 or later and re-pair this PC." }, { status: 426 });
+      const target = body.companyName ? await resolveTallyTarget(request, user.id, connectionId, String(body.companyName)) : null;
+      return jsonWithCors(request, { authenticated: true, ownerUserId: user.id, connectionId,
+        installationId: data.installation_ref, sessionGeneration: data.session_generation, bridgeVersion: data.bridge_version, target });
     }
 
     const token = bearerToken(request);
@@ -53,10 +60,14 @@ export async function POST(request: Request) {
     if (!connection.bridge_token_hash || hashSecret(token) !== connection.bridge_token_hash) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
+    if (!connectorSupportsReliableActiveCompany(connection.bridge_version)) return jsonWithCors(request, { error: "Connector update required: version 0.1.58 or later." }, { status: 426 });
     return jsonWithCors(request, {
       authenticated: true,
       ownerUserId: connection.owner_user_id,
       connectionId: connection.id,
+      installationId: connection.installation_ref,
+      sessionGeneration: connection.session_generation,
+      bridgeVersion: connection.bridge_version,
     });
   } catch (error) {
     console.error("Error in POST /api/tally/live/session:", error);

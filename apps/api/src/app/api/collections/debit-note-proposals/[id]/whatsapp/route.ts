@@ -1,3 +1,4 @@
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { getNativeTallyPdfEvidence, serializeDebitNoteProposal, toNullableText, type DebitNoteProposalRow } from "@/lib/collections";
@@ -52,6 +53,7 @@ export async function POST(
       .select("*")
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .maybeSingle();
 
     if (proposalError) throw proposalError;
@@ -192,6 +194,7 @@ export async function POST(
       })
       .eq("id", proposal.id)
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .select("*")
       .single();
 

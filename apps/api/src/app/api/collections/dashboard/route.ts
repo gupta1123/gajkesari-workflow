@@ -1,3 +1,4 @@
+import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { createHash } from "node:crypto";
 
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
@@ -667,39 +668,8 @@ export async function GET(request: Request) {
         { status: 409 }
       );
     }
-    // A connector ID is a pairing instance, not a company identity. The same
-    // Tally company can be paired again many times, so collect every connector
-    // that has ever synced the selected company rather than trusting the latest
-    // heartbeat from the currently paired connector.
-    const compatibleConnectionIds = new Set([connectionId]);
-    const [
-      { data: companyConnectionRows, error: companyConnectionError },
-      { data: companySyncRows, error: companySyncError },
-    ] = await Promise.all([
-      supabase
-        .from("tally_connections")
-        .select("id")
-        .eq("owner_user_id", user.id)
-        .eq("last_company_name", companyName)
-        .limit(200),
-      supabase
-        .from("tally_master_sync_runs")
-        .select("connection_id")
-        .eq("owner_user_id", user.id)
-        .eq("company_name", companyName)
-        .limit(500),
-    ]);
-
-    if (companyConnectionError) throw companyConnectionError;
-    if (companySyncError) throw companySyncError;
-    for (const row of companyConnectionRows ?? []) {
-      if (row.id) compatibleConnectionIds.add(String(row.id));
-    }
-    for (const row of companySyncRows ?? []) {
-      if (row.connection_id) compatibleConnectionIds.add(String(row.connection_id));
-    }
-
-    const connectionIds = Array.from(compatibleConnectionIds);
+    const target = await resolveTallyTarget(request, user.id, connectionId, companyName);
+    const connectionIds = [connectionId];
     const [
       { data: proposalRows, error: proposalError },
       { data: ledgerRows, error: ledgerError },
@@ -710,6 +680,7 @@ export async function GET(request: Request) {
         .from("debit_note_proposals")
         .select("*")
         .eq("owner_user_id", user.id)
+      .eq("company_dataset_id", target.companyDatasetId)
         .eq("company_name", companyName)
         .eq("status", "created_in_tally")
         .order("created_at", { ascending: false })
@@ -718,7 +689,7 @@ export async function GET(request: Request) {
         .from("tally_masters")
         .select("tally_name, parent_name, gstin, raw_payload")
         .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+      .eq("company_dataset_id", target.companyDatasetId)
         .eq("master_type", "ledger")
         .eq("is_active", true)
         .limit(5000),
@@ -726,7 +697,7 @@ export async function GET(request: Request) {
         .from("tally_bridge_commands")
         .select("id, connection_id, owner_user_id, payload, result, completed_at, created_at")
         .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+      .eq("company_dataset_id", target.companyDatasetId)
         .eq("command_type", "fetch_customer_open_bills")
         .eq("status", "succeeded")
         .order("completed_at", { ascending: false })
@@ -735,7 +706,7 @@ export async function GET(request: Request) {
         .from("tally_bridge_commands")
         .select("id, connection_id, owner_user_id, payload, result, completed_at, created_at")
         .eq("owner_user_id", user.id)
-        .in("connection_id", connectionIds)
+      .eq("company_dataset_id", target.companyDatasetId)
         .eq("command_type", "create_debit_note")
         .eq("status", "succeeded")
         .order("completed_at", { ascending: false })
@@ -758,14 +729,9 @@ export async function GET(request: Request) {
       .map((command) => debitNoteRowFromSucceededCommand(command, { last_company_name: connection.last_company_name }))
       .filter((row): row is NonNullable<typeof row> => Boolean(row));
 
-    if (missingCreatedRows.length > 0) {
-      const { data: insertedRows, error: insertMissingError } = await supabase
-        .from("debit_note_proposals")
-        .insert(missingCreatedRows)
-        .select("*");
-      if (insertMissingError) throw insertMissingError;
-      allProposalRows = [...(insertedRows as unknown as DebitNoteProposalRow[]), ...allProposalRows];
-    }
+    // Recovery evidence is displayed without mutating history during a GET.
+    // Persisted recovery belongs to the command-result transaction.
+    allProposalRows = [...missingCreatedRows.map((row) => ({ ...row, id: row.tally_command_id } as unknown as DebitNoteProposalRow)), ...allProposalRows];
 
     const ledgerByName = new Map(
       ((ledgerRows ?? []) as unknown as TallyLedgerRow[]).map((ledger) => [normalizeLedgerName(ledger.tally_name), ledger])

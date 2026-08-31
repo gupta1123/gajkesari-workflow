@@ -1,3 +1,4 @@
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { serializeAccount } from "@/lib/bank-statements";
@@ -23,6 +24,7 @@ export async function GET(request: Request) {
       .from("bank_accounts")
       .select("*")
       .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .order("updated_at", { ascending: false })
       .limit(50);
 

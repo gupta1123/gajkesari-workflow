@@ -23,14 +23,16 @@ function closeWithError(socket, message, code = 1008) {
   socket.close(code, message.slice(0, 120));
 }
 
-async function apiRequest(path, { accessToken, bridgeToken, body }) {
+async function apiRequest(path, { accessToken, bridgeToken, browserBinding, body }) {
   const headers = { "Content-Type": "application/json" };
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   if (bridgeToken) headers["X-Bridge-Token"] = bridgeToken;
+  if (browserBinding) headers["X-Tally-Browser-Binding"] = browserBinding;
   const response = await fetch(`${apiBaseUrl}${path}`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(AUTH_TIMEOUT_MS),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -53,6 +55,9 @@ function clearPending(requestId) {
 function failPending(requestId, error) {
   const item = clearPending(requestId);
   if (!item) return;
+  if (item.operation !== "create_debit_note") {
+    send(item.connector, { type: "cancel", requestId });
+  }
   console.error(
     `[cash-discount-live] request failed operation=${item.operation} connection=${item.connectionId} request=${requestId} durationMs=${Date.now() - item.startedAt} error=${error instanceof Error ? error.message : String(error)}`
   );
@@ -64,15 +69,17 @@ function failPending(requestId, error) {
   });
 }
 
-function startPending({ requestId, browser, connector, connectionId, ownerUserId, accessToken, operation, proposal, payload }) {
-  const timeout = setTimeout(() => failPending(requestId, new Error("The live Tally request timed out.")), REQUEST_TIMEOUT_MS);
+function startPending({ requestId, browser, connector, connectionId, ownerUserId, accessToken, browserBinding, operation, proposal, payload, deadlineAt }) {
+  const timeout = setTimeout(() => failPending(requestId, new Error("The live Tally request timed out.")), Math.max(1, deadlineAt - Date.now()));
   const item = {
+    requestId,
     requestId,
     browser,
     connector,
     connectionId,
     ownerUserId,
     accessToken,
+    browserBinding,
     operation,
     proposal,
     payload,
@@ -89,6 +96,7 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
       ? `${connectionId}|${String(proposal?.partyLedgerName ?? "").trim().toLowerCase()}|${String(proposal?.linkedInvoiceNumber ?? "").trim().toLowerCase()}`
       : null,
     timeout,
+    deadlineAt,
   };
   pending.set(requestId, item);
   console.log(
@@ -107,6 +115,7 @@ async function authenticate(socket, message) {
   const session = await apiRequest("/api/tally/live/session", {
     accessToken: role === "browser" ? token : null,
     bridgeToken: role === "connector" ? token : null,
+    browserBinding: role === "browser" ? String(message.browserBinding || "") : null,
     body: {
       role,
       connectionId,
@@ -115,6 +124,10 @@ async function authenticate(socket, message) {
   });
   const meta = {
     authenticated: true,
+    browserBinding: role === "browser" ? String(message.browserBinding || "") : null,
+    installationId: session.installationId,
+    sessionGeneration: session.sessionGeneration,
+    bridgeVersion: session.bridgeVersion,
     role,
     connectionId,
     ownerUserId: session.ownerUserId,
@@ -140,7 +153,11 @@ async function authenticate(socket, message) {
 async function handleBrowserRequest(socket, message, meta) {
   const requestId = String(message.requestId || randomUUID());
   const operation = String(message.operation ?? "");
-  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'verify_bank_transaction', 'match_bank_statement', 'fetch_customer_open_bills', 'scan', 'create_debit_note'].includes(operation)) {
+  if (operation === "create_debit_note") {
+    send(socket, { type: "result", requestId, success: false, error: "Use the durable approval queue for financial writes." });
+    return;
+  }
+  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'verify_bank_transaction', 'match_bank_statement', 'fetch_customer_open_bills', 'scan'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
   }
@@ -161,6 +178,28 @@ async function handleBrowserRequest(socket, message, meta) {
   }
 
   const proposal = message.proposal && typeof message.proposal === "object" ? message.proposal : null;
+  meta.authorizingRequests ??= new Set();
+  meta.cancelledRequests ??= new Set();
+  meta.authorizingRequests.add(requestId);
+  const authorized = await apiRequest("/api/tally/live/session", {
+    accessToken: meta.accessToken, browserBinding: meta.browserBinding,
+    body: { role: "browser", connectionId: meta.connectionId,
+      companyName: operation === "company_check" ? "" : String(message.companyName || "") },
+  });
+  meta.authorizingRequests.delete(requestId);
+  if (meta.cancelledRequests.delete(requestId) || socket.readyState !== WebSocket.OPEN) return;
+  if (authorized.sessionGeneration !== connectorMeta.sessionGeneration || authorized.installationId !== connectorMeta.installationId) {
+    send(socket, { type: "result", requestId, success: false, error: "The connector session changed. Reconnect and refresh companies." });
+    return;
+  }
+  if (pending.has(requestId)) {
+    send(socket, { type: "result", requestId, success: false, error: "This request is already running." });
+    return;
+  }
+  if (message.companyDatasetId && authorized.target?.companyDatasetId !== message.companyDatasetId && operation !== "company_check") {
+    send(socket, { type: "result", requestId, success: false, error: "The selected company identity changed. Refresh and select it again." });
+    return;
+  }
   const debitNoteKey = operation === "create_debit_note"
     ? `${meta.connectionId}|${String(proposal?.partyLedgerName ?? "").trim().toLowerCase()}|${String(proposal?.linkedInvoiceNumber ?? "").trim().toLowerCase()}`
     : null;
@@ -176,16 +215,21 @@ async function handleBrowserRequest(socket, message, meta) {
     connectionId: meta.connectionId,
     ownerUserId: meta.ownerUserId,
     accessToken: meta.accessToken,
+    browserBinding: meta.browserBinding,
     operation,
     proposal,
-    payload: message.payload && typeof message.payload === "object" ? message.payload : undefined,
+    payload: message.payload && typeof message.payload === "object" ? { ...message.payload, companyName: authorized.target?.companyName || message.companyName, tallyUrl: undefined } : undefined,
+    deadlineAt: Math.min(Date.now() + (operation === "company_check" ? 15_000 : REQUEST_TIMEOUT_MS), Number(message.deadlineAt) || Infinity),
   });
+  send(socket, { type: "accepted", requestId, message: "Connected. Waiting for Tally..." });
   if (item.debitNoteKey) activeDebitNotes.add(item.debitNoteKey);
   const requestedCompanyName = String(message.companyName ?? "").trim();
   const companyKey = requestedCompanyName.toLowerCase().replace(/\s+/g, " ");
   send(connector, {
     type: "operation",
     requestId,
+    deadlineAt: item.deadlineAt,
+    target: authorized.target,
       operation: operation === "company_check"
         ? "company_check"
         : operation === "bank_ledgers"
@@ -241,6 +285,7 @@ async function handleConnectorResult(socket, message, meta) {
     try {
       const dashboard = await apiRequest("/api/collections/live/analyse", {
         accessToken: item.accessToken,
+        browserBinding: item.browserBinding,
         body: {
           connectionId: item.connectionId,
           companyName: message.companyName,
@@ -333,15 +378,27 @@ export function startCashDiscountGateway(options = {}) {
       const meta = metadata.get(socket);
       if (!meta?.authenticated) {
         if (message.type !== "authenticate") throw new Error("Authenticate before using the live channel.");
+        if (meta?.authenticating) throw new Error("Authentication already in progress.");
+        meta.authenticating = true;
         await authenticate(socket, message);
         clearTimeout(authTimer);
         return;
       }
       if (message.type === "request" && meta.role === "browser") {
-        await handleBrowserRequest(socket, message, meta);
+        try { await handleBrowserRequest(socket, message, meta); }
+        catch (error) { send(socket, { type: "result", requestId: message.requestId, success: false, error: error.message || "Could not authorize this request." }); }
+      } else if (message.type === "cancel" && meta.role === "browser") {
+        if (meta.authorizingRequests?.has(String(message.requestId ?? ""))) {
+          meta.cancelledRequests.add(String(message.requestId));
+        }
+        const item = pending.get(String(message.requestId ?? ""));
+        // Financial writes remain tracked even when the browser stops waiting.
+        if (item?.browser === socket && item.operation !== "create_debit_note") {
+          failPending(item.requestId, new Error("The live Tally request was cancelled."));
+        }
       } else if (message.type === "operation_result" && meta.role === "connector") {
         await handleConnectorResult(socket, message, meta);
-      } else if (message.type === "progress" && meta.role === "connector") {
+      } else if (["progress", "partial_result"].includes(message.type) && meta.role === "connector") {
         const item = pending.get(String(message.requestId ?? ""));
         if (item?.connector === socket) send(item.browser, message);
       }
@@ -357,7 +414,7 @@ export function startCashDiscountGateway(options = {}) {
     const meta = metadata.get(socket);
     if (meta?.role === "connector" && connectors.get(meta.connectionId) === socket) connectors.delete(meta.connectionId);
     for (const [requestId, item] of pending) {
-      if (item.browser === socket) clearPending(requestId);
+      if (item.browser === socket && item.operation !== "create_debit_note") failPending(requestId, new Error("Browser disconnected."));
       else if (item.connector === socket) failPending(requestId, new Error("The Tally connector disconnected during the live request."));
     }
   });

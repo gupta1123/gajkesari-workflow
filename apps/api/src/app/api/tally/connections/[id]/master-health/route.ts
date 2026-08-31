@@ -1,5 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { TallyMasterRow } from "@/lib/tally/masters";
 
@@ -294,7 +295,7 @@ export async function GET(
 
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id")
+      .select("id, owner_user_id, last_company_name")
       .eq("id", id)
       .eq("owner_user_id", user.id)
       .maybeSingle();
@@ -307,10 +308,11 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
+    const target = await resolveTallyTarget(request, user.id, id, new URL(request.url).searchParams.get("companyName") || connection.last_company_name || "");
     const { data, error } = await supabase
       .from("tally_masters")
       .select("*")
-      .eq("connection_id", id)
+      .eq("company_dataset_id", target.companyDatasetId)
       .eq("owner_user_id", user.id)
       .eq("is_active", true)
       .in("master_type", ["ledger", "gst_ledger"])

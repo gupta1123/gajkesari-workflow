@@ -6,6 +6,7 @@ import {
   listLocalTallyConnections,
 } from "@/lib/local/tally-store";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { browserOwnsConnection } from "@/lib/tally/browser-scope";
 import {
   createBridgeToken,
   createPairingCode,
@@ -124,10 +125,13 @@ export async function GET(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const binding = request.headers.get("x-tally-browser-binding") || "";
+    if (!binding) return jsonWithCors(request, { connections: [] });
     const { data, error } = await supabase
       .from("tally_connections")
       .select(TALLY_CONNECTION_SELECT)
       .eq("owner_user_id", user.id)
+      .eq("control_token_hash", hashSecret(binding))
       .is("revoked_at", null)
       .order("updated_at", { ascending: false });
 
@@ -135,37 +139,10 @@ export async function GET(request: Request) {
       throw error;
     }
 
-    const rows = (data ?? []) as unknown as TallyConnectionRow[];
-    const now = new Date();
-    const expiredPendingIds = rows
-      .filter(
-        (row) =>
-          !row.bridge_token_hash &&
-          (!row.pairing_code_expires_at ||
-            new Date(row.pairing_code_expires_at).getTime() <= now.getTime())
-      )
-      .map((row) => row.id);
-
-    if (expiredPendingIds.length > 0) {
-      const retiredAt = now.toISOString();
-      const { error: cleanupError } = await supabase
-        .from("tally_connections")
-        .update({
-          revoked_at: retiredAt,
-          revoked_reason: "Expired connector pairing attempt.",
-          pairing_code_hash: null,
-          pairing_code_expires_at: null,
-          last_error: "Pairing attempt expired. Start a new connection when ready.",
-          updated_at: retiredAt,
-        })
-        .in("id", expiredPendingIds)
-        .eq("owner_user_id", user.id)
-        .is("revoked_at", null);
-
-      if (cleanupError) {
-        console.warn("Could not retire expired Tally pairing attempts:", cleanupError);
-      }
-    }
+    const candidateRows = (data ?? []) as unknown as TallyConnectionRow[];
+    const allowed = await Promise.all(candidateRows.map((row) => browserOwnsConnection(request, user.id, row.id)));
+    const rows = candidateRows.filter((_row, index) => allowed[index]);
+    // Listing is read-only. Paused installations are not expired challenges.
 
     return jsonWithCors(request, {
       connections: pickRelevantConnections(rows),
@@ -222,17 +199,27 @@ export async function POST(request: Request) {
         .maybeSingle();
       if (existingError) throw existingError;
       if (existing) {
+        const prior = existing as unknown as TallyConnectionRow;
+        if (!prior.control_token_hash || hashSecret(String(body.controlToken || "")) !== prior.control_token_hash) {
+          return jsonWithCors(request, { error: "Reconnect from the browser paired to this computer." }, { status: 403 });
+        }
         const { data: resumed, error: resumeError } = await supabase
           .from("tally_connections")
           .update({
             status: "waiting_for_bridge",
+            tally_url: normalizeTallyUrl(body.tallyUrl),
+            display_name: normalizeDisplayName(body.displayName),
             pairing_code_hash: hashSecret(pairingCode),
             pairing_code_expires_at: createPairingExpiry(),
             control_token_hash: hashSecret(controlToken),
+            paired_at: null,
             last_error: null,
             updated_at: new Date().toISOString(),
           })
           .eq("id", reuseConnectionId)
+          .eq("control_token_hash", prior.control_token_hash)
+          .is("bridge_token_hash", null)
+          .is("revoked_at", null)
           .select(TALLY_CONNECTION_SELECT)
           .single();
         if (resumeError) throw resumeError;
@@ -251,24 +238,7 @@ export async function POST(request: Request) {
         });
       }
     }
-    const retiredAt = new Date().toISOString();
-    const { error: retirePendingError } = await supabase
-      .from("tally_connections")
-      .update({
-        revoked_at: retiredAt,
-        revoked_reason: "Superseded by a newer connector pairing attempt.",
-        pairing_code_hash: null,
-        pairing_code_expires_at: null,
-        last_error: "Superseded by a newer connection attempt.",
-        updated_at: retiredAt,
-      })
-      .eq("owner_user_id", user.id)
-      .is("revoked_at", null)
-      .is("bridge_token_hash", null);
-
-    if (retirePendingError) {
-      throw retirePendingError;
-    }
+    // Another browser's pending pairing belongs to that PC; never retire it here.
 
     const { data, error } = await supabase
       .from("tally_connections")
@@ -278,6 +248,7 @@ export async function POST(request: Request) {
         status: "waiting_for_bridge",
         tally_url: normalizeTallyUrl(body.tallyUrl),
         pairing_code_hash: hashSecret(pairingCode),
+        control_token_hash: hashSecret(controlToken),
         pairing_code_expires_at: createPairingExpiry(),
         last_error: null,
       })

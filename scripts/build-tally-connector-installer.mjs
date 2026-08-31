@@ -90,6 +90,12 @@ function validateSources() {
 }
 
 function resetDir(dir) {
+  const resolved = path.resolve(dir);
+  const allowed = [payloadDir, stagingDir].map((candidate) => path.resolve(candidate));
+  if (!allowed.includes(resolved)) throw new Error("Refusing to reset an unexpected installer directory: " + resolved);
+  if (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink()) {
+    throw new Error("Refusing to reset a linked installer directory: " + resolved);
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -271,7 +277,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.57",
+      version: "0.1.58",
       private: true,
       type: "module",
     },

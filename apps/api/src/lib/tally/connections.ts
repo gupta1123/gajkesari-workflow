@@ -27,6 +27,8 @@ export type TallyConnectionRow = {
   revoked_at: string | null;
   revoked_reason: string | null;
   session_generation: number;
+  installation_ref?: string | null;
+  active_company_guid?: string | null;
   last_heartbeat_at: string | null;
   last_tested_at: string | null;
   last_tally_reachable: boolean | null;
@@ -60,6 +62,8 @@ export const TALLY_CONNECTION_SELECT = [
   "revoked_at",
   "revoked_reason",
   "session_generation",
+  "installation_ref",
+  "active_company_guid",
   "last_heartbeat_at",
   "last_tested_at",
   "last_tally_reachable",
@@ -77,7 +81,7 @@ export function connectorSupportsReliableActiveCompany(value: string | null | un
   const major = Number(match[1]);
   const minor = Number(match[2]);
   const patch = Number(match[3]);
-  return major > 0 || minor > 1 || (minor === 1 && patch >= 32);
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 58);
 }
 
 export function isReliableInstallationId(value: string | null | undefined) {
@@ -118,6 +122,8 @@ export function serializeTallyConnection(row: TallyConnectionRow) {
     revokedAt: row.revoked_at,
     revokedReason: row.revoked_reason,
     sessionGeneration: row.session_generation,
+    installationRef: row.installation_ref ?? null,
+    activeCompanyGuid: row.active_company_guid ?? null,
     lastHeartbeatAt: row.last_heartbeat_at,
     lastTestedAt: row.last_tested_at,
     lastTallyReachable: row.last_tally_reachable,
