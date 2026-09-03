@@ -26,6 +26,7 @@ import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
+import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
 import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
@@ -3148,6 +3149,13 @@ function formatFileSize(size: number | null | undefined) {
 export function BankStatementsPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedPreviewFileRef = useRef<File | null>(null);
+  const previewSelectionRef = useRef(0);
+  const pdfPreviewRequests = useRef(createPdfPreviewRequestGate());
+  useEffect(() => {
+    const requests = pdfPreviewRequests.current;
+    return () => { previewSelectionRef.current += 1; requests.cancel(); };
+  }, []);
   const [file, setFile] = useState<File | null>(null);
   const [documentPreview, setDocumentPreview] = useState<DocumentPreviewState | null>(null);
   const [documentPreviewLoading, setDocumentPreviewLoading] = useState(false);
@@ -3156,6 +3164,9 @@ export function BankStatementsPage() {
   const [statementPasswordError, setStatementPasswordError] = useState<string | null>(null);
   const [statementPasswordChecking, setStatementPasswordChecking] = useState(false);
   const [statementPasswordVerified, setStatementPasswordVerified] = useState(false);
+  const pdfNotice = pdfPreviewNotice({ checking: statementPasswordChecking,
+    required: statementPasswordRequired, verified: statementPasswordVerified,
+    error: statementPasswordError });
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
@@ -5059,6 +5070,9 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: setupErrorMessage || "Complete the Tally company setup before upload." });
       return;
     }
+    const selection = ++previewSelectionRef.current;
+    selectedPreviewFileRef.current = nextFile;
+    pdfPreviewRequests.current.cancel();
     setDocumentPreviewLoading(true);
     setBanner(null);
     setStatementDoneSummary(null);
@@ -5071,17 +5085,22 @@ export function BankStatementsPage() {
     setFile(nextFile);
     try {
       const nextPreview = await buildDocumentPreview(nextFile);
+      if (selection !== previewSelectionRef.current) {
+        if (nextPreview.objectUrl) URL.revokeObjectURL(nextPreview.objectUrl);
+        return;
+      }
       setDocumentPreview(nextPreview);
       if (nextPreview.kind === "pdf" && !nextPreview.error) {
         await unlockStatementPdfPreview(nextFile, "");
       }
     } finally {
-      setDocumentPreviewLoading(false);
+      if (selection === previewSelectionRef.current) setDocumentPreviewLoading(false);
     }
   }
 
   async function unlockStatementPdfPreview(nextFile = file, password = statementPassword) {
-    if (!nextFile || !isPdfFile(nextFile)) return false;
+    if (!nextFile || !isPdfFile(nextFile) || selectedPreviewFileRef.current !== nextFile) return false;
+    const request = pdfPreviewRequests.current.begin();
 
     setStatementPasswordChecking(true);
     setStatementPasswordError(null);
@@ -5097,10 +5116,13 @@ export function BankStatementsPage() {
       const response = await apiFetch("/api/bank-statements/pdf-preview", {
         method: "POST",
         body: formData,
+        signal: request.signal,
       });
+      if (!request.isCurrent()) return false;
 
       if (!response.ok) {
         const payload = await readApiErrorPayload(response);
+        if (!request.isCurrent()) return false;
         const isPasswordIssue =
           payload.code === "BANK_STATEMENT_PASSWORD_REQUIRED" ||
           payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT";
@@ -5123,14 +5145,17 @@ export function BankStatementsPage() {
         }
 
         const message = payload.error ?? "This PDF could not be prepared for preview.";
+        setStatementPasswordRequired(false);
         setStatementPasswordError(message);
         setBanner({ tone: "error", text: message });
         return false;
       }
 
-      const unlockedPdfUrl = URL.createObjectURL(await response.blob());
+      const pdfBlob = await response.blob();
+      if (!request.isCurrent()) return false;
+      const unlockedPdfUrl = URL.createObjectURL(pdfBlob);
       setDocumentPreview((current) => {
-        if (!current || current.fileName !== nextFile.name) {
+        if (!request.isCurrent() || !current || selectedPreviewFileRef.current !== nextFile) {
           URL.revokeObjectURL(unlockedPdfUrl);
           return current;
         }
@@ -5141,19 +5166,27 @@ export function BankStatementsPage() {
         setStatementPasswordRequired(true);
         setStatementPasswordVerified(true);
         setBanner({ tone: "success", text: "PDF unlocked. You can review and analyze it now." });
+      } else {
+        setStatementPasswordRequired(false);
+        setStatementPasswordVerified(false);
       }
       return true;
     } catch (error) {
+      if (!request.isCurrent()) return false;
       const message = error instanceof Error ? error.message : "This PDF could not be prepared for preview.";
+      setStatementPasswordRequired(false);
       setStatementPasswordError(message);
       setBanner({ tone: "error", text: message });
       return false;
     } finally {
-      setStatementPasswordChecking(false);
+      if (request.isCurrent()) setStatementPasswordChecking(false);
     }
   }
 
   function clearSelectedStatementFile() {
+    previewSelectionRef.current += 1;
+    selectedPreviewFileRef.current = null;
+    pdfPreviewRequests.current.cancel();
     setFile(null);
     setDocumentPreview(null);
     setDocumentPreviewLoading(false);
@@ -6982,8 +7015,21 @@ export function BankStatementsPage() {
                           </div>
                         </div>
                       </div>
+                      {documentPreview.kind === "pdf" && pdfNotice === "checking" ? (
+                        <div role="status" className="flex items-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3 py-3 text-xs font-semibold text-blue-800">
+                          <Loader2 className="h-4 w-4 animate-spin" /> Checking document
+                        </div>
+                      ) : null}
+                      {documentPreview.kind === "pdf" && pdfNotice === "error" ? (
+                        <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-3 text-xs font-semibold text-rose-800">
+                          <p>{statementPasswordError}</p>
+                          <button type="button" className="mt-2 underline" onClick={() => void unlockStatementPdfPreview(file, statementPassword)}>
+                            Retry document check
+                          </button>
+                        </div>
+                      ) : null}
                       {documentPreview.kind === "pdf" &&
-                      (statementPasswordRequired || statementPasswordError || statementPasswordChecking) ? (
+                      (pdfNotice === "password" || pdfNotice === "unlocked") ? (
                         <div
                           className={`rounded-xl border px-3 py-3 ${
                             statementPasswordVerified
