@@ -8741,7 +8741,9 @@ export function BankStatementsPage() {
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-1">
               <div className="contents text-[11px] font-bold">
                 <span className={`inline-flex h-6 items-center rounded-full border px-2.5 text-[11px] font-bold ${newReceiptCount > 0 && !statementCompletedCleanly ? "border-blue-200 bg-blue-50 text-blue-800" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
-                {matchingBills
+                {preview.requiresManualExtraction || preview.extractionDiagnostics?.coverageComplete === false
+                  ? "Posting blocked · Statement extraction is incomplete"
+                  : matchingBills
                   ? "Checking statement against Tally..."
                   : statementCompletedCleanly
                     ? tallyPostingStatus?.voucherTotal

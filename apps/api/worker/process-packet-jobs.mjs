@@ -20,7 +20,8 @@ import {
   correctRowsFromRunningBalance,
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
-import { reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
+import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
+import { recoverSourceCoverage } from "./bank-statement-source-coverage.mjs";
 import { readPnbPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
   addBankStatementPageProvenance,
@@ -1659,7 +1660,9 @@ async function extractBankStatementAdaptive({
         anydocResult.markdownText.trim() &&
         hasUsableBankStatementText(markdownPages)
       ) {
-        const combinedDecision = combinedLedgerCatalogueDecision(ledgerNames);
+        // Extraction must pass source coverage before any ledger matching runs.
+        // Keep the existing standalone ledger matcher, inputs and retry rules.
+        const combinedDecision = { ...combinedLedgerCatalogueDecision(ledgerNames), useCombined: false, reason: "verify_coverage_before_matching" };
         diagnostics.anydoc.combinedLedgerCatalogue = combinedDecision;
         const nextExtractionSource = combinedDecision.useCombined
           ? "anydoc_markdown_combined_ai"
@@ -1705,9 +1708,27 @@ async function extractBankStatementAdaptive({
         }
         parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
         diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
+        let coverageComplete = Boolean(physicalColumns);
+        if (!physicalColumns) {
+          const source = extractBankStatementMarkdownAmounts(anydocResult.markdownText, { includeSourceDetails: true });
+          const recovered = await recoverSourceCoverage({
+            parsed,
+            sourceRows: source.rows,
+            recover: async (markdown) => {
+              await updateBankJob(jobId, { progress: 65, stage: "Recovering missing statement rows" });
+              return extractBankStatementFromText(fileName, [{pageNumber:1,text:markdown}], bankAccountCandidates, markdownAiOptions);
+            },
+          });
+          diagnostics.anydoc.sourceCoverage = recovered.diagnostics;
+          // Unsupported layouts use the existing page-by-page extraction path;
+          // a non-empty AI response is not evidence of complete coverage.
+          if (!recovered.diagnostics.supported) throw new Error("Markdown source coverage is unavailable; use page recovery.");
+          parsed = recovered.parsed;
+          coverageComplete = recovered.diagnostics.complete;
+        }
         parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
         diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
-        if (parsed.transactions.length > 0) {
+        if (parsed.transactions.length > 0 || !coverageComplete) {
           parsed.transactions = addBankStatementPageProvenance(parsed.transactions, {
             startPage: 1,
             endPage: Math.max(1, Number(diagnostics.pageCount || 1)),
@@ -1715,8 +1736,8 @@ async function extractBankStatementAdaptive({
           });
           extractionSource = nextExtractionSource;
           diagnostics.pipeline = nextExtractionSource;
-          diagnostics.coverageComplete = true;
-          return { parsed, extractionSource, extractionError: null, diagnostics };
+          diagnostics.coverageComplete = coverageComplete;
+          return { parsed, extractionSource, extractionError: coverageComplete ? null : "Statement transaction coverage could not be verified after targeted recovery.", diagnostics };
         }
       }
     } catch (error) {
@@ -1745,7 +1766,9 @@ async function extractBankStatementAdaptive({
     }
   }
 
-  const canUseSingleShot = shouldAttemptBankStatementSingleShot({
+  // PDF fallback must retain per-page coverage/recovery. Do not route an
+  // unsupported Markdown layout into another non-empty-means-complete shortcut.
+  const canUseSingleShot = !isPdf && shouldAttemptBankStatementSingleShot({
     isPdf,
     pageCount: Number(textInfo.pageCount || 0),
     pages: textInfo.pages,
@@ -2316,12 +2339,16 @@ async function runBankStatementJob(job) {
     ...transaction,
     row_index: index + 1,
   }));
-  await updateBankJob(job.id, { progress: 82, stage: "Matching Tally ledgers" });
+  await updateBankJob(job.id, { progress: 82, stage: extractionIncomplete ? "Statement needs extraction review" : "Matching Tally ledgers" });
   let ledgerRecommendationError = null;
   let previewRows;
   const ledgerMatchingStartedAt = Date.now();
   try {
-    previewRows = extractionSource === "anydoc_markdown_combined_ai"
+    if (extractionIncomplete) {
+      ledgerRecommendationError = "Ledger matching was not started because statement extraction needs review.";
+      previewRows = markBankLedgerRecommendationsUnavailable(rows, ledgerRecommendationError);
+      extractionDiagnostics.ledgerMatchingSkipped = "incomplete_extraction";
+    } else previewRows = extractionSource === "anydoc_markdown_combined_ai"
       ? markCombinedLedgerRecommendationsCompleted(rows, ledgerNames)
       : await addBankLedgerRecommendations({
           rows,
@@ -2789,6 +2816,7 @@ if (launchedAsMainModule) {
 }
 
 export {
+  extractBankStatementFromText,
   extractBankStatementFromTextBatch,
   extractBankStatementPdfTextPages,
   mergeBankStatementResults,

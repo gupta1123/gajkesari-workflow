@@ -67,7 +67,7 @@ function extractOpeningBalance(markdown) {
   return null;
 }
 
-export function extractBankStatementMarkdownAmounts(markdown) {
+export function extractBankStatementMarkdownAmounts(markdown, { includeSourceDetails = false } = {}) {
   const lines = String(markdown ?? "").split(/\r?\n/);
   const rows = [];
 
@@ -82,6 +82,7 @@ export function extractBankStatementMarkdownAmounts(markdown) {
     const debitIndex = columnIndex(headers, [/^dr amount$/, /\bdebit\b/, /withdrawal/, /paid out/]);
     const creditIndex = columnIndex(headers, [/^cr amount$/, /\bcredit\b/, /deposit/, /paid in/]);
     const balanceIndex = columnIndex(headers, [/\bbalance\b/]);
+    const dateIndex = columnIndex(headers, [/^transaction date$/, /^txn date$/, /^date$/, /^posting date$/]);
     if (referenceIndex < 0 || balanceIndex < 0 || (debitIndex < 0 && creditIndex < 0)) continue;
 
     for (let rowIndex = lineIndex + 2; rowIndex < lines.length; rowIndex += 1) {
@@ -89,7 +90,7 @@ export function extractBankStatementMarkdownAmounts(markdown) {
       if (!cells || isSeparatorRow(cells)) break;
       if (cells.length < headerCells.length) break;
       const reference = normalizedReference(cells[referenceIndex]);
-      if (!reference) continue;
+      if (!reference && !includeSourceDetails) continue;
       const debitAmount = debitIndex >= 0 ? parseBankStatementMoney(cells[debitIndex]) : null;
       const creditAmount = creditIndex >= 0 ? parseBankStatementMoney(cells[creditIndex]) : null;
       const balanceAmount = parseBankStatementMoney(cells[balanceIndex]);
@@ -99,6 +100,11 @@ export function extractBankStatementMarkdownAmounts(markdown) {
         debitAmount: debitAmount === null ? null : Math.abs(debitAmount),
         creditAmount: creditAmount === null ? null : Math.abs(creditAmount),
         balanceAmount,
+        ...(includeSourceDetails ? {
+          sourceDate: dateIndex >= 0 ? cells[dateIndex] : null,
+          sourceLine: lines[rowIndex],
+          sourceHeader: `${lines[lineIndex]}\n${lines[lineIndex + 1]}`,
+        } : {}),
       });
     }
   }
