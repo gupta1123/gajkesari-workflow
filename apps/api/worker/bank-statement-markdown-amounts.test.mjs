@@ -14,6 +14,13 @@ test("parses Indian-grouped statement amounts without changing magnitude", () =>
   assert.equal(parseBankStatementMoney("9,750.00 DR"), -9750);
 });
 
+test('recognizes separate Dr/Cr and Txn No headings, but rejects merged debit headings',()=>{
+  const table='| Txn No. | Dr Amount | Cr Amount | Balance |\n|---|---|---|---|\n| T123456 | 100.00 | | 900.00 |';
+  assert.equal(extractBankStatementMarkdownAmounts(table).rows[0].debitAmount,100);
+  const merged=table.replace('Dr Amount','Cheque No. Dr Amount');
+  assert.equal(extractBankStatementMarkdownAmounts(merged).rows[0].debitAmount,null);
+});
+
 test("extracts opening balance and transaction amounts from Markdown tables", () => {
   const markdown = `
 | Opening balance (INR) | 5,00,00,000.00 | Page | 1 of 3 |

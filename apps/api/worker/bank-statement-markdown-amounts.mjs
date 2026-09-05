@@ -77,9 +77,10 @@ export function extractBankStatementMarkdownAmounts(markdown) {
     if (!headerCells || !isSeparatorRow(separatorCells) || separatorCells.length !== headerCells.length) continue;
 
     const headers = headerCells.map(normalizedHeader);
-    const referenceIndex = columnIndex(headers, [/^reference(?: no| number)?$/, /^ref(?: no| number)?$/, /\butr\b/, /cheque|check|chq/]);
-    const debitIndex = columnIndex(headers, [/\bdebit\b/, /withdrawal/, /paid out/]);
-    const creditIndex = columnIndex(headers, [/\bcredit\b/, /deposit/, /paid in/]);
+    const referenceIndex = columnIndex(headers, [/^reference(?: no| number)?$/, /^ref(?: no| number)?$/, /^txn no$/, /\butr\b/, /cheque|check|chq/]);
+    // Merged headings are not reliable amount columns (e.g. Cheque No. Dr Amount).
+    const debitIndex = columnIndex(headers, [/^dr amount$/, /\bdebit\b/, /withdrawal/, /paid out/]);
+    const creditIndex = columnIndex(headers, [/^cr amount$/, /\bcredit\b/, /deposit/, /paid in/]);
     const balanceIndex = columnIndex(headers, [/\bbalance\b/]);
     if (referenceIndex < 0 || balanceIndex < 0 || (debitIndex < 0 && creditIndex < 0)) continue;
 
@@ -111,8 +112,8 @@ function sameNullableMoney(left, right) {
   return Math.abs(Number(left) - Number(right)) < 0.01;
 }
 
-export function reconcileBankStatementMarkdownAmounts(parsed, markdown) {
-  const deterministic = extractBankStatementMarkdownAmounts(markdown);
+export function reconcileBankStatementMarkdownAmounts(parsed, markdown, physicalSource = null) {
+  const deterministic = physicalSource ?? extractBankStatementMarkdownAmounts(markdown);
   const rowsByReference = new Map();
   for (const row of deterministic.rows) {
     const values = rowsByReference.get(row.reference) ?? [];
@@ -141,6 +142,8 @@ export function reconcileBankStatementMarkdownAmounts(parsed, markdown) {
       debit_amount: nextDebit,
       credit_amount: nextCredit,
       balance_amount: nextBalance,
+      ...(hasOneAmount && (Number(nextDebit)>0)!==(Number(transaction.debit_amount)>0)
+        ? {category:Number(nextDebit)>0?'payment':'receipt'} : {}),
       raw_payload: {
         ...(transaction.raw_payload ?? {}),
         deterministicMarkdownAmounts: {
@@ -151,6 +154,7 @@ export function reconcileBankStatementMarkdownAmounts(parsed, markdown) {
           correctedDebitAmount: nextDebit ?? null,
           correctedCreditAmount: nextCredit ?? null,
           correctedBalanceAmount: nextBalance ?? null,
+          ...(physicalSource ? {source:'pdf_columns',page:source.page??null}:{}),
         },
       },
     };

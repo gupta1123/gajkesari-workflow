@@ -21,6 +21,7 @@ import {
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
 import { reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
+import { readPnbPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
   addBankStatementPageProvenance,
   shouldAttemptBankStatementSingleShot,
@@ -1692,7 +1693,17 @@ async function extractBankStatementAdaptive({
             );
         diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
         const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
-        parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText);
+        // PNB continuation pages omit headings and AnyDoc changes empty cells.
+        // Verify against physical PDF columns before saving or matching ledgers.
+        let physicalColumns=null;
+        if (/Txn No\./i.test(anydocResult.markdownText) && /Dr Amount/i.test(anydocResult.markdownText) && /Cr Amount/i.test(anydocResult.markdownText)) {
+          physicalColumns=await readPnbPhysicalColumns(bytes,PDFJS_WORKER_SRC,BANK_STATEMENT_MAX_TOTAL_PAGES);
+          const references=parsed.transactions.map(row=>String(row.reference_number||'').replace(/[^a-z0-9]/gi,'').toUpperCase());
+          if(!physicalColumns.detected||physicalColumns.rows.length!==references.length||new Set(references).size!==references.length||physicalColumns.rows.some(row=>!references.includes(row.reference))) {
+            throw new Error('PNB physical transaction coverage could not be verified; use PDF recovery.');
+          }
+        }
+        parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
         diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
         parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
         diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
