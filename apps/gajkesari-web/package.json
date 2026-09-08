@@ -16,5 +16,9 @@
   "devDependencies": {
     "@types/node": "20.17.6",
     "typescript": "5.8.2"
+  },
+  "dependencies": {
+    "jspdf": "4.2.1",
+    "jspdf-autotable": "5.0.8"
   }
 }

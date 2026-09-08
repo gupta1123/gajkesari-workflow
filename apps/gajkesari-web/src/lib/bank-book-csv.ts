@@ -13,6 +13,10 @@ export function buildBankBookCsv(bank: string, period: string, entries: BankBook
     const safe = /^[=+@\-\t\r]/.test(text) ? `'${text}` : text;
     return `"${safe.replace(/"/g, '""')}"`;
   };
+  return "\uFEFF" + buildBankBookRows(bank, period, entries, balances).map(row => row.map(escape).join(",")).join("\r\n") + "\r\n";
+}
+
+export function buildBankBookRows(bank: string, period: string, entries: BankBookRow[], balances?: { opening: number; closing: number }) {
   const money = (cents: number) => cents ? (cents / 100).toFixed(2) : "";
   const rows: (string | number)[][] = [
     [`${bank} Book`, "", "", "", "", "", "", "", ""],
@@ -37,5 +41,5 @@ export function buildBankBookCsv(bank: string, period: string, entries: BankBook
     rows.push(["", closing >= 0 ? "By" : "To", "Closing Balance", "", "", "", "", money(Math.max(-closing, 0)), money(Math.max(closing, 0))]);
     rows.push(["", "", "Grand Total", "", "", "", "", money(debit + Math.max(-closing, 0)), money(credit + Math.max(closing, 0))]);
   }
-  return "\uFEFF" + rows.map(row => row.map(escape).join(",")).join("\r\n") + "\r\n";
+  return rows;
 }

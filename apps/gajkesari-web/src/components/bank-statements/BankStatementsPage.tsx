@@ -3789,15 +3789,19 @@ export function BankStatementsPage() {
   const csvTransactions = validTransactions.filter(transaction =>
     postedTransactionIds.has(transaction.id) && tallyPresenceByTransactionId[transaction.id]?.status === "found"
   );
-  function downloadPostedBankBook() {
+  const [bankBookFormat, setBankBookFormat] = useState<"pdf" | "csv">("pdf");
+  const [downloadingBankBook, setDownloadingBankBook] = useState(false);
+  async function downloadPostedBankBook() {
     if (!preview || !csvTransactions.length) return;
+    setDownloadingBankBook(true);
+    try {
     const fullStatement = csvTransactions.length === validTransactions.length;
     const opening = tallyBalanceProof?.statementOpeningBalance;
     const closing = tallyBalanceProof?.statementClosingBalance;
     const balances = fullStatement && tallyBalanceProof?.statementSequenceValid === true &&
       typeof opening === "number" && Number.isFinite(opening) && typeof closing === "number" && Number.isFinite(closing)
       ? { opening, closing } : undefined;
-    const csv = buildBankBookCsv(bankLedgerName,
+    const exportArgs: Parameters<typeof buildBankBookCsv> = [bankLedgerName,
       `${preview.import.statementPeriodStart || ""} to ${preview.import.statementPeriodEnd || ""}${fullStatement ? "" : " (posted entries only)"}`,
       csvTransactions.map(transaction => ({
         date: transaction.transactionDate,
@@ -3805,15 +3809,23 @@ export function BankStatementsPage() {
         voucherNumber: tallyPresenceByTransactionId[transaction.id]?.voucherNumber || "",
         receipt: Number(transaction.creditAmount || 0),
         payment: Number(transaction.debitAmount || 0),
-      })), balances);
-    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      })), balances];
+    const blob = bankBookFormat === "pdf"
+      ? (await import("@/lib/bank-book-pdf")).buildBankBookPdf(...exportArgs)
+      : new Blob([buildBankBookCsv(...exportArgs)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${bankLedgerName.replace(/[^a-z0-9_-]+/gi, "-")}-posted-bank-book.csv`;
+    link.download = `${bankLedgerName.replace(/[^a-z0-9_-]+/gi, "-")}-posted-bank-book.${bankBookFormat}`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch {
+      showToast("error", "Could not create the download. Please try again.");
+    } finally {
+      setDownloadingBankBook(false);
+    }
   }
   const bankPostingCompleted = Boolean(
     statementCompletedCleanly &&
@@ -6650,9 +6662,15 @@ export function BankStatementsPage() {
               </div>
             </div>
             {csvTransactions.length > 0 && !tallyPostingInProgress ? (
-              <Button type="button" variant="outline" onClick={downloadPostedBankBook} className="h-8 shrink-0 rounded-lg px-3 text-[10px] font-bold">
-                <Download className="h-3.5 w-3.5" /> Download CSV
-              </Button>
+              <div className="flex shrink-0 items-center">
+                <Button type="button" variant="outline" disabled={downloadingBankBook} onClick={downloadPostedBankBook} className="h-8 rounded-l-lg rounded-r-none px-3 text-[10px] font-bold">
+                  {downloadingBankBook ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} Download {bankBookFormat.toUpperCase()}
+                </Button>
+                <select aria-label="Download format" value={bankBookFormat} disabled={downloadingBankBook} onChange={event => setBankBookFormat(event.target.value as "pdf" | "csv")} className="h-8 rounded-r-lg border border-l-0 border-[#e5ddd0] bg-white px-2 text-[10px] font-bold">
+                  <option value="pdf">PDF</option>
+                  <option value="csv">CSV</option>
+                </select>
+              </div>
             ) : null}
           </header>
 
