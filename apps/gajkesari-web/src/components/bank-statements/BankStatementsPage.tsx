@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   ArrowRight,
   CalendarDays,
+  Download,
   CheckCircle2,
   Filter,
   Info,
@@ -26,6 +27,7 @@ import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
+import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
 import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
@@ -3222,7 +3224,7 @@ export function BankStatementsPage() {
   const [outgoingVerificationsByTransactionId, setOutgoingVerificationsByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [postedTransactionIds, setPostedTransactionIds] = useState<Set<string>>(() => new Set());
-  const [, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
+  const [tallyBalanceProof, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [billAllocationSearch, setBillAllocationSearch] = useState("");
   const [confirmFullAdvance, setConfirmFullAdvance] = useState(false);
@@ -3784,6 +3786,35 @@ export function BankStatementsPage() {
       ? 0
       : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
+  const csvTransactions = validTransactions.filter(transaction =>
+    postedTransactionIds.has(transaction.id) && tallyPresenceByTransactionId[transaction.id]?.status === "found"
+  );
+  function downloadPostedBankBook() {
+    if (!preview || !csvTransactions.length) return;
+    const fullStatement = csvTransactions.length === validTransactions.length;
+    const opening = tallyBalanceProof?.statementOpeningBalance;
+    const closing = tallyBalanceProof?.statementClosingBalance;
+    const balances = fullStatement && tallyBalanceProof?.statementSequenceValid === true &&
+      typeof opening === "number" && Number.isFinite(opening) && typeof closing === "number" && Number.isFinite(closing)
+      ? { opening, closing } : undefined;
+    const csv = buildBankBookCsv(bankLedgerName,
+      `${preview.import.statementPeriodStart || ""} to ${preview.import.statementPeriodEnd || ""}${fullStatement ? "" : " (posted entries only)"}`,
+      csvTransactions.map(transaction => ({
+        date: transaction.transactionDate,
+        party: transaction.selectedLedgerName,
+        voucherNumber: tallyPresenceByTransactionId[transaction.id]?.voucherNumber || "",
+        receipt: Number(transaction.creditAmount || 0),
+        payment: Number(transaction.debitAmount || 0),
+      })), balances);
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${bankLedgerName.replace(/[^a-z0-9_-]+/gi, "-")}-posted-bank-book.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
   const bankPostingCompleted = Boolean(
     statementCompletedCleanly &&
       tallyPostingStatus?.finished &&
@@ -6618,6 +6649,11 @@ export function BankStatementsPage() {
                 ) : null}
               </div>
             </div>
+            {csvTransactions.length > 0 && !tallyPostingInProgress ? (
+              <Button type="button" variant="outline" onClick={downloadPostedBankBook} className="h-8 shrink-0 rounded-lg px-3 text-[10px] font-bold">
+                <Download className="h-3.5 w-3.5" /> Download CSV
+              </Button>
+            ) : null}
           </header>
 
           {!preview ? (

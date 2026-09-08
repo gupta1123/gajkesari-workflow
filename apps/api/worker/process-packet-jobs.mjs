@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { createClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
+import {extractMarkdownBatches} from './bank-statement-markdown-batches.mjs';
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
 import {
@@ -21,7 +22,7 @@ import {
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
 import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
-import { recoverSourceCoverage } from "./bank-statement-source-coverage.mjs";
+import { auditSourceCoverage, recoverSourceCoverage } from "./bank-statement-source-coverage.mjs";
 import { readPnbPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
   addBankStatementPageProvenance,
@@ -1643,6 +1644,7 @@ async function extractBankStatementAdaptive({
     }
   }
 
+  let authoritativeMarkdownRows = [];
   if (isPdf && BANK_STATEMENT_ANYDOC_ENABLED) {
     try {
       await updateBankJob(jobId, { progress: 32, stage: "Converting PDF to Markdown" });
@@ -1680,7 +1682,17 @@ async function extractBankStatementAdaptive({
           reasoningTokens: OPENROUTER_ANYDOC_REASONING_TOKENS,
           maxOutputTokens: OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS,
         };
-        parsed = combinedDecision.useCombined
+        const markdownSource = extractBankStatementMarkdownAmounts(anydocResult.markdownText, { includeSourceDetails: true });
+        if(auditSourceCoverage([],markdownSource.rows).supported) authoritativeMarkdownRows=markdownSource.rows;
+        if (markdownSource.rows.length > 25) {
+          const firstHeader=anydocResult.markdownText.indexOf(markdownSource.rows[0].sourceHeader.split('\n')[0]);
+          const context=firstHeader>=0?anydocResult.markdownText.slice(0,firstHeader):'';
+          const batched=await extractMarkdownBatches({sourceRows:markdownSource.rows,context,
+            onBatch:({index,total})=>updateBankJob(jobId,{progress:45+Math.floor(15*(index-1)/total),stage:`Extracting transactions: batch ${index} of ${total}`}),
+            extract:markdown=>extractBankStatementFromText(fileName,[{pageNumber:1,text:markdown}],bankAccountCandidates,markdownAiOptions)});
+          parsed=batched.parsed;
+          diagnostics.anydoc.rowBatches=batched.batches;
+        } else parsed = combinedDecision.useCombined
           ? await extractAndMatchBankStatementFromMarkdown(
               fileName,
               anydocResult.markdownText,
@@ -1723,6 +1735,7 @@ async function extractBankStatementAdaptive({
           // Unsupported layouts use the existing page-by-page extraction path;
           // a non-empty AI response is not evidence of complete coverage.
           if (!recovered.diagnostics.supported) throw new Error("Markdown source coverage is unavailable; use page recovery.");
+          if (!recovered.diagnostics.complete) throw new Error("Markdown extraction is incomplete; use PDF page recovery.");
           parsed = recovered.parsed;
           coverageComplete = recovered.diagnostics.complete;
         }
@@ -1742,12 +1755,11 @@ async function extractBankStatementAdaptive({
       }
     } catch (error) {
       diagnostics.anydoc = {
+        ...diagnostics.anydoc,
         success: false,
-        executionTimeMs: 0,
-        markdownChars: 0,
-        tableCount: 0,
         error: diagnosticError(error),
       };
+      parsed = null;
       console.warn(`[worker] AnyDoc extraction skipped for ${fileName}: ${diagnosticError(error)}`);
     }
   }
@@ -1903,6 +1915,14 @@ async function extractBankStatementAdaptive({
             ? `The statement has ${textInfo.pageCount} pages, but this worker is configured to analyze at most ${BANK_STATEMENT_MAX_TOTAL_PAGES}.`
             : null;
       diagnostics.coverageComplete = unresolvedPages.length === 0 && !textInfo.truncated;
+      if(authoritativeMarkdownRows.length) {
+        const coverage=auditSourceCoverage(parsed.transactions,authoritativeMarkdownRows);
+        diagnostics.fallbackSourceCoverage={complete:coverage.complete,missingRows:coverage.missing.length,unexpectedRows:coverage.unexpected.length};
+        if(!coverage.complete) {
+          diagnostics.coverageComplete=false;
+          extractionError='Recovered statement rows do not match the source. Review is required.';
+        }
+      }
       return { parsed, extractionSource, extractionError, diagnostics };
     }
   } catch (error) {
@@ -2400,7 +2420,7 @@ async function runBankStatementJob(job) {
   const completedAt = new Date().toISOString();
   extractionDiagnostics.totalWorkerMs = Date.now() - workerStartedAt;
   const analysisStage =
-    parsed.transactions.length > 0 ? "Statement analyzed" : "Extraction needs attention";
+    extractionIncomplete ? "Extraction incomplete — review required" : parsed.transactions.length > 0 ? "Statement analyzed" : "Extraction needs attention";
   const finalStatementPeriodStart = parsed.statementPeriodStart || importRow.statement_period_start || null;
   const finalStatementPeriodEnd = parsed.statementPeriodEnd || importRow.statement_period_end || null;
   const { error: importUpdateError } = await supabase
@@ -2450,7 +2470,7 @@ async function runBankStatementJob(job) {
   await updateBankJob(job.id, {
     status: "succeeded",
     progress: 100,
-    stage: extractionIncomplete ? "Completed with unresolved pages" : "Completed",
+    stage: extractionIncomplete ? "Extraction incomplete — review required" : "Completed",
     error: null,
     result: {
       importId: job.import_id,
