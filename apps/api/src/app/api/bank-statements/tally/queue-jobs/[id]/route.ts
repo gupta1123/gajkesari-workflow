@@ -48,7 +48,7 @@ export async function GET(
 
     return jsonWithCors(request, {
       job: serializeQueueJob(job as Record<string, unknown>),
-      result: job.status === "succeeded" ? job.result ?? null : null,
+      result: job.result ?? null,
     });
   } catch (error) {
     console.error("Error in GET /api/bank-statements/tally/queue-jobs/[id]:", error);

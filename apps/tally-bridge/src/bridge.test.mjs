@@ -10,6 +10,7 @@ import {
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   createExclusiveScheduler,
+  decodeTallyResponseBytes,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   getBankVoucherCommandBatchKey,
@@ -20,11 +21,36 @@ import {
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   reconcileBankTransactionsInTally,
+  resolveBankVoucherLedgerIdentities,
   strictBankTransactionCandidates,
   indexBankVouchersByDate,
   fetchAvailableCompanies,
   testTally,
 } from "./bridge.mjs";
+
+test("Tally response decoding preserves Unicode ledger punctuation", () => {
+  const xml = '<LEDGER NAME="Task Metcorp Global (Opc) Private Limited – Jalna"></LEDGER>';
+  assert.equal(decodeTallyResponseBytes(Buffer.from(xml, "utf8")), xml);
+  const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]);
+  assert.equal(decodeTallyResponseBytes(utf16), xml);
+});
+
+test("bank posting resolves a stale cached name by stable Tally GUID", () => {
+  const [resolved] = resolveBankVoucherLedgerIdentities([{
+    bankLedgerName: "HDFC Bank",
+    bankLedgerGuid: "bank-guid",
+    counterpartyLedgerName: "Task Metcorp Global (Opc) Private Limited ? Jalna",
+    counterpartyLedgerGuid: "party-guid",
+  }], [
+    { name: "HDFC Bank", guid: "BANK-GUID" },
+    { name: "Task Metcorp Global (Opc) Private Limited – Jalna", guid: "PARTY-GUID" },
+  ]);
+  assert.equal(resolved.counterpartyLedgerName, "Task Metcorp Global (Opc) Private Limited – Jalna");
+  assert.throws(() => resolveBankVoucherLedgerIdentities([{
+    bankLedgerName: "HDFC Bank", bankLedgerGuid: "bank-guid",
+    counterpartyLedgerName: "Missing", counterpartyLedgerGuid: "missing-guid",
+  }], [{ name: "HDFC Bank", guid: "bank-guid" }]), /not present in the active Tally company/);
+});
 
 test("direct receipt and payment XML contain no bill reference or Advance allocation", () => {
   for (const voucherType of ["Receipt", "Payment"]) {

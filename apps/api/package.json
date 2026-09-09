@@ -2,6 +2,7 @@
   "name": "@gajkesari/api",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "dependencies": {
     "@firecrawl/anydoc": "^0.1.9"
   },

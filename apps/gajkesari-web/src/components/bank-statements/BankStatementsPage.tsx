@@ -221,6 +221,14 @@ type TallyQueueJobResponse = {
 type TallyQueueResult = {
   queuedCount?: number;
   verificationCount?: number;
+  preparationComplete?: boolean;
+  postingComplete?: boolean;
+  postingSummary?: {
+    commandCount?: number;
+    terminalCount?: number;
+    succeededCount?: number;
+    failedCount?: number;
+  };
   commands?: TallyCommand[];
   diagnostics?: {
     expectedReceiptCount?: number;
@@ -316,6 +324,8 @@ type BankLedgerResolution = {
 };
 
 type PreviewResponse = {
+  duplicateUpload?: boolean;
+  message?: string;
   bankLedgerResolution?: BankLedgerResolution;
   import: BankStatementImport;
   account: {
@@ -4516,15 +4526,26 @@ export function BankStatementsPage() {
       if (job?.status === "succeeded") {
         return (payload.result ?? job.result ?? { queuedCount: 0, verificationCount: 0, commands: [] }) as TallyQueueResult;
       }
-      if (job?.status === "failed" || job?.status === "cancelled") {
+      if (job?.status === "failed") {
+        const result = payload.result ?? job.result;
+        if (result && Array.isArray(result.commands)) return result;
+        throw new Error(job.error || payload.error || "Tally queue job failed.");
+      }
+      if (job?.status === "cancelled") {
         throw new Error(job.error || payload.error || "Tally queue job failed.");
       }
 
       const processed = Number(job?.processedCount ?? 0);
       const total = Number(job?.totalCount ?? 0);
+      const queueResult = payload.result ?? job?.result;
+      const postingSummary = queueResult?.postingSummary;
       setBanner({
         tone: "info",
-        text: total > 0 ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s).` : "Preparing Tally queue.",
+        text: queueResult?.preparationComplete
+          ? `Tally is processing ${Number(postingSummary?.terminalCount ?? 0)} of ${Number(postingSummary?.commandCount ?? 0)} action(s). Keep the connector open.`
+          : total > 0
+            ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s).`
+            : "Preparing Tally queue.",
       });
       await wait(1500);
     }
@@ -5438,6 +5459,7 @@ export function BankStatementsPage() {
       }
 
       const payload = (await response.json()) as PreviewResponse;
+      const duplicateUploadMessage = payload.duplicateUpload ? payload.message : null;
       setStatementPassword("");
       setStatementPasswordRequired(false);
       setStatementPasswordError(null);
@@ -5457,7 +5479,9 @@ export function BankStatementsPage() {
         } else {
           const analyzedPayload = await loadImportPreviewWithPagedTransactions(payload.import.id);
           applyPreviewPayload(analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
-          setBanner(getAnalysisCompleteMessage(analyzedPayload));
+          setBanner(duplicateUploadMessage
+            ? { tone: "info", text: duplicateUploadMessage }
+            : getAnalysisCompleteMessage(analyzedPayload));
         }
       }
       setPostUploadSyncImportId(null);

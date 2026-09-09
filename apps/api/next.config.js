@@ -1,7 +1,8 @@
 /** @type {import('next').NextConfig} */
-// Next.js loads this configuration as CommonJS in production.
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const path = require("node:path");
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const nextConfig = {
   turbopack: {
@@ -9,4 +10,4 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig;
+export default nextConfig;

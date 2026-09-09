@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import {extractPnbPhysicalColumns} from './bank-statement-pdf-columns.mjs';
+import {extractBankStatementPhysicalColumns,extractPnbPhysicalColumns} from './bank-statement-pdf-columns.mjs';
 import {reconcileBankStatementMarkdownAmounts} from './bank-statement-markdown-amounts.mjs';
 import {buildBankVoucherXml} from '../../tally-bridge/src/bridge.mjs';
 const item=(str,x,y,width=40)=>({str,width,transform:[1,0,0,1,x,y]});
@@ -23,4 +23,23 @@ test('changed layout, duplicate references and ambiguous amounts fail verificati
  assert.throws(()=>extractPnbPhysicalColumns([first,{pageNumber:2,width:1000,items:row('T123456',600,'100.00',null,'1000.00')}]),/duplicated/);
  assert.throws(()=>extractPnbPhysicalColumns([{...first,items:[...headers,...row('T123456',600,'100.00','100.00','1000.00')]}]),/incomplete/);
  assert.equal(extractPnbPhysicalColumns([{pageNumber:1,width:1000,items:[]}]).detected,false);
+});
+test('PNB accepts the real S and U reference families',()=>{
+ const page={pageNumber:1,width:1000,items:[...headers,...row('S3692997',600,'400.00',null,'1000.00'),...row('U89691391',520,null,'500.00','1500.00')]};
+ assert.deepEqual(extractPnbPhysicalColumns([page]).rows.map(entry=>entry.reference),['S3692997','U89691391']);
+});
+test('Central Bank uses physical debit and credit columns even with blank cheque references',()=>{
+ const centralHeaders=[item('Post Date',50,700,60),item('Value',120,700,30),item('Transaction Description',300,700,120),item('Debit',530,700,35),item('Credit',620,700,35),item('Balance',710,700,45)];
+ const centralRow=(y,debit,credit,balance)=>[
+  item('05/09/2026',50,y,55),item('05/09/2026',120,y,55),item('Narration',300,y,100),
+  ...(debit?[item(debit,525,y,55)]:[]),...(credit?[item(credit,615,y,55)]:[]),item(balance,700,y,85),
+ ];
+ const physical=extractBankStatementPhysicalColumns([{pageNumber:1,width:842,items:[...centralHeaders,...centralRow(620,null,'783200.00','343974486.98 DR'),...centralRow(590,'100.00',null,'343974586.98 DR')]}]);
+ assert.equal(physical.layout,'central_bank');assert.equal(physical.matchByOrder,true);
+ assert.deepEqual(physical.rows.map(entry=>[entry.debitAmount,entry.creditAmount,entry.balanceAmount]),[[null,783200,-343974486.98],[100,null,-343974586.98]]);
+ const fixed=reconcileBankStatementMarkdownAmounts({transactions:[
+  {reference_number:null,debit_amount:783200,credit_amount:null,category:'payment'},
+  {reference_number:null,debit_amount:null,credit_amount:100,category:'receipt'},
+ ]},'',physical);
+ assert.deepEqual(fixed.transactions.map(entry=>[entry.debit_amount,entry.credit_amount,entry.category]),[[null,783200,'receipt'],[100,null,'payment']]);
 });

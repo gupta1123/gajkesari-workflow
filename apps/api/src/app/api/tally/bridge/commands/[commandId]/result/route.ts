@@ -1,4 +1,5 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { refreshBankStatementQueueJobStatus } from "@/lib/bank-statement-tally-queue-status";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { toNumber, type DebitNoteProposalRow } from "@/lib/collections";
 import { uploadNativeTallyDebitNotePdf } from "@/lib/debit-notes/pdf";
@@ -621,6 +622,14 @@ export async function POST(
         error: errorMessage,
       },
     });
+
+    const queueJobId = toNullableText(
+      (pendingCommandData as Record<string, unknown>).queue_job_id,
+      100
+    );
+    if (queueJobId) {
+      await refreshBankStatementQueueJobStatus(supabase, queueJobId);
+    }
 
     return jsonWithCors(request, {
       command: serializeTallyBridgeCommand(command),

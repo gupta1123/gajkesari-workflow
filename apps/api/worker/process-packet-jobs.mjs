@@ -23,7 +23,7 @@ import {
 } from "./bank-statement-running-balance.mjs";
 import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
 import { auditSourceCoverage, recoverSourceCoverage } from "./bank-statement-source-coverage.mjs";
-import { readPnbPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
+import { readBankStatementPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
   addBankStatementPageProvenance,
   shouldAttemptBankStatementSingleShot,
@@ -117,7 +117,7 @@ const OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS = Number(
   process.env.OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS ?? 20_000
 );
 const execFileAsync = promisify(execFile);
-const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
+const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 15 * 60_000);
 const PDF_IMAGE_RENDER_SCRIPT = String.raw`
 import sys
 from pathlib import Path
@@ -1709,14 +1709,25 @@ async function extractBankStatementAdaptive({
         diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
         const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
         // PNB continuation pages omit headings and AnyDoc changes empty cells.
-        // Verify against physical PDF columns before saving or matching ledgers.
+        // Central Bank tables commonly have an empty cheque/reference column.
+        // In both layouts the physical amount columns are authoritative.
         let physicalColumns=null;
-        if (/Txn No\./i.test(anydocResult.markdownText) && /Dr Amount/i.test(anydocResult.markdownText) && /Cr Amount/i.test(anydocResult.markdownText)) {
-          physicalColumns=await readPnbPhysicalColumns(bytes,PDFJS_WORKER_SRC,BANK_STATEMENT_MAX_TOTAL_PAGES);
+        const hasSupportedPhysicalLayout =
+          (/Txn No\.?/i.test(anydocResult.markdownText) && /Dr Amount/i.test(anydocResult.markdownText) && /Cr Amount/i.test(anydocResult.markdownText)) ||
+          (/Post Date/i.test(anydocResult.markdownText) && /Transaction Description/i.test(anydocResult.markdownText) && /\bDebit\b/i.test(anydocResult.markdownText) && /\bCredit\b/i.test(anydocResult.markdownText));
+        if (hasSupportedPhysicalLayout) {
+          physicalColumns=await readBankStatementPhysicalColumns(bytes,PDFJS_WORKER_SRC,BANK_STATEMENT_MAX_TOTAL_PAGES);
           const references=parsed.transactions.map(row=>String(row.reference_number||'').replace(/[^a-z0-9]/gi,'').toUpperCase());
-          if(!physicalColumns.detected||physicalColumns.rows.length!==references.length||new Set(references).size!==references.length||physicalColumns.rows.some(row=>!references.includes(row.reference))) {
-            throw new Error('PNB physical transaction coverage could not be verified; use PDF recovery.');
+          const referenceCoverageValid = physicalColumns.matchByOrder ||
+            (new Set(references).size===references.length && physicalColumns.rows.every(row=>references.includes(row.reference)));
+          if(!physicalColumns.detected||physicalColumns.rows.length!==references.length||!referenceCoverageValid) {
+            throw new Error(`${physicalColumns.layout === 'central_bank' ? 'Central Bank' : 'PNB'} physical transaction coverage could not be verified; use PDF recovery.`);
           }
+          diagnostics.anydoc.physicalColumns = {
+            layout: physicalColumns.layout,
+            rowCount: physicalColumns.rows.length,
+            matchByOrder: physicalColumns.matchByOrder,
+          };
         }
         parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
         diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
@@ -2697,6 +2708,7 @@ async function runTallyQueueJob(job) {
     const processed = Number(payload?.job?.processedCount ?? 0);
     const total = Number(payload?.job?.totalCount ?? 0);
     console.log(`[worker] Tally queue ${job.id}: ${processed}/${total} status=${status ?? "unknown"}`);
+    if (payload?.job?.result?.preparationComplete === true && status === "running") return;
     if (["succeeded", "failed", "cancelled"].includes(status)) {
       if (status !== "succeeded") throw new Error(payload?.job?.error || `Tally queue job ${status}`);
       return;

@@ -89,7 +89,9 @@ test("a page remains incomplete when visible row evidence exceeds usable AI rows
       expectedMinimumRowCount: 2,
     }],
   });
-  assert.equal(result.transactions.length, 0);
+  // Preserve the usable row for review while coverage remains blocked.
+  assert.equal(result.transactions.length, 1);
+  assert.equal(result.transactions[0].raw_payload.extractionProvenance.startPage, 3);
   assert.deepEqual(result.unresolvedPages, [3]);
   assert.equal(result.pageOutcomes[0].status, "incomplete");
 });

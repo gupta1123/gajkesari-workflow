@@ -1,5 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { refreshBankStatementQueueJobStatus } from "@/lib/bank-statement-tally-queue-status";
 import { POST as runTallyQueue } from "../../../queue/route";
 
 const QUEUE_JOB_BATCH_SIZE = Math.max(
@@ -143,7 +144,7 @@ export async function POST(
     if (terminal(job.status)) {
       return jsonWithCors(request, {
         job: serializeQueueJob(job as Record<string, unknown>),
-        result: job.status === "succeeded" ? job.result ?? null : null,
+        result: job.result ?? null,
       });
     }
 
@@ -168,21 +169,24 @@ export async function POST(
         };
 
     if (allTransactionIds.length && batchIds.length === 0) {
-      const completedAt = new Date().toISOString();
-      const { data: completedJob, error: completeError } = await supabase
+      const preparedAt = new Date().toISOString();
+      const preparedResult = { ...readResult(job.result), preparationComplete: true, preparedAt };
+      const { error: completeError } = await supabase
         .from("bank_statement_tally_queue_jobs")
         .update({
-          status: "succeeded",
+          status: "running",
           processed_count: totalCount,
-          completed_at: completedAt,
-          updated_at: completedAt,
+          result: preparedResult,
+          completed_at: null,
+          updated_at: preparedAt,
         })
         .eq("id", id)
         .eq("owner_user_id", user.id)
-        .select("*")
+        .select("id")
         .single();
 
       if (completeError) throw completeError;
+      const completedJob = await refreshBankStatementQueueJobStatus(supabase, id);
       return jsonWithCors(request, {
         job: serializeQueueJob(completedJob as Record<string, unknown>),
         result: completedJob.result ?? null,
@@ -245,15 +249,18 @@ export async function POST(
       : totalCount;
     const done = nextProcessedCount >= totalCount;
     const updatedAt = new Date().toISOString();
+    const resultWithPreparation = done
+      ? { ...nextResult, preparationComplete: true, preparedAt: updatedAt }
+      : nextResult;
     const { data: updatedJob, error: updateError } = await supabase
       .from("bank_statement_tally_queue_jobs")
       .update({
-        status: done ? "succeeded" : "running",
+        status: "running",
         processed_count: nextProcessedCount,
-        result: nextResult,
+        result: resultWithPreparation,
         error: null,
         updated_at: updatedAt,
-        completed_at: done ? updatedAt : null,
+        completed_at: null,
       })
       .eq("id", id)
       .eq("owner_user_id", user.id)
@@ -262,9 +269,12 @@ export async function POST(
 
     if (updateError) throw updateError;
 
+    const effectiveJob = done
+      ? await refreshBankStatementQueueJobStatus(supabase, id)
+      : updatedJob;
     return jsonWithCors(request, {
-      job: serializeQueueJob(updatedJob as Record<string, unknown>),
-      result: done ? nextResult : null,
+      job: serializeQueueJob(effectiveJob as Record<string, unknown>),
+      result: done ? effectiveJob.result ?? resultWithPreparation : null,
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/tally/queue-jobs/[id]/run:", error);

@@ -128,11 +128,17 @@ export function reconcileBankStatementMarkdownAmounts(parsed, markdown, physical
   }
 
   let correctedRowCount = 0;
-  const transactions = (parsed?.transactions ?? []).map((transaction) => {
+  const parsedTransactions = parsed?.transactions ?? [];
+  const matchByOrder = physicalSource?.matchByOrder === true && deterministic.rows.length === parsedTransactions.length;
+  const transactions = parsedTransactions.map((transaction, transactionIndex) => {
     const reference = normalizedReference(transaction.reference_number);
     const candidates = rowsByReference.get(reference) ?? [];
-    if (!reference || candidates.length !== 1) return transaction;
-    const source = candidates[0];
+    const source = matchByOrder
+      ? deterministic.rows[transactionIndex]
+      : reference && candidates.length === 1
+        ? candidates[0]
+        : null;
+    if (!source) return transaction;
     const hasOneAmount = Number(source.debitAmount > 0) + Number(source.creditAmount > 0) === 1;
     const nextDebit = hasOneAmount ? source.debitAmount : transaction.debit_amount;
     const nextCredit = hasOneAmount ? source.creditAmount : transaction.credit_amount;
@@ -160,7 +166,7 @@ export function reconcileBankStatementMarkdownAmounts(parsed, markdown, physical
           correctedDebitAmount: nextDebit ?? null,
           correctedCreditAmount: nextCredit ?? null,
           correctedBalanceAmount: nextBalance ?? null,
-          ...(physicalSource ? {source:'pdf_columns',page:source.page??null}:{}),
+          ...(physicalSource ? {source:'pdf_columns',layout:physicalSource.layout??null,page:source.page??null}:{}),
         },
       },
     };

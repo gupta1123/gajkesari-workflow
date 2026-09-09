@@ -124,12 +124,14 @@ export function validateBankStatementPageCoverage({
       declared.transactionCount > rows.length;
     const visibleRowsMissing =
       page.expectedMinimumRowCount !== null && rows.length < page.expectedMinimumRowCount;
-    if (rows.length > 0 && !declaredMoreRowsThanUsable && !visibleRowsMissing) {
+    if (rows.length > 0) {
       verifiedTransactions.push(...addBankStatementPageProvenance(rows, {
         startPage: page.pageNumber,
         endPage: page.pageNumber,
         method,
       }));
+    }
+    if (rows.length > 0 && !declaredMoreRowsThanUsable && !visibleRowsMissing) {
       return { page: page.pageNumber, status: "succeeded", rowCount: rows.length };
     }
     if (

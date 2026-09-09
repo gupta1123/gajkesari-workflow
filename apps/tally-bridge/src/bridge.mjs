@@ -14,7 +14,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.59";
+const BRIDGE_VERSION = "0.1.60";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -1855,6 +1855,8 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
 }
 
 async function postBankVoucher(tallyUrl, payload, companyName) {
+  const [resolvedPayload] = await resolveBankVoucherLedgerPayloads(tallyUrl, [payload], companyName);
+  payload = resolvedPayload;
   const voucherType = String(payload?.voucherType || "");
   const expectedDirection = payload?.expectedDirection || (/receipt/i.test(voucherType) ? "incoming" : "outgoing");
   const shouldCheckExisting =
@@ -1916,6 +1918,73 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
   return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
 }
 
+function normalizedGuid(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+export function resolveBankVoucherLedgerIdentities(payloads, liveMasters) {
+  const byGuid = new Map();
+  const byName = new Map();
+  for (const master of liveMasters || []) {
+    const guid = normalizedGuid(master?.guid);
+    const name = String(master?.name || "").trim();
+    if (guid) byGuid.set(guid, master);
+    if (name) byName.set(normalizeLooseName(name), master);
+  }
+  const resolve = (nameValue, guidValue, label) => {
+    const name = String(nameValue || "").trim();
+    const guid = normalizedGuid(guidValue);
+    const master = guid ? byGuid.get(guid) : byName.get(normalizeLooseName(name));
+    if (!master) {
+      throw new Error(`${label} '${name || guid || "unknown"}' is not present in the active Tally company. Refresh masters and review this row before posting.`);
+    }
+    return { name: master.name, guid: master.guid || guidValue || null };
+  };
+  return (payloads || []).map((payload) => {
+    const bank = resolve(payload?.bankLedgerName, payload?.bankLedgerGuid, "Bank ledger");
+    const counterparty = resolve(payload?.counterpartyLedgerName, payload?.counterpartyLedgerGuid, "Counterparty ledger");
+    return {
+      ...payload,
+      bankLedgerName: bank.name,
+      bankLedgerGuid: bank.guid,
+      counterpartyLedgerName: counterparty.name,
+      counterpartyLedgerGuid: counterparty.guid,
+      matchedLedgerName: counterparty.name,
+      liveMasterValidation: {
+        checkedAt: new Date().toISOString(),
+        bankLedger: bank,
+        counterpartyLedger: counterparty,
+      },
+    };
+  });
+}
+
+async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName) {
+  const identities = (payloads || []).flatMap((payload) => [
+    { name: payload?.bankLedgerName, guid: payload?.bankLedgerGuid },
+    { name: payload?.counterpartyLedgerName, guid: payload?.counterpartyLedgerGuid },
+  ]).filter((identity) => identity.name || identity.guid);
+  const names = identities.map((identity) => identity.name).filter(Boolean);
+  const guids = identities.map((identity) => String(identity.guid || "").trim()).filter(Boolean);
+  const nameFormula = buildRequestedLedgerFormula(names, ["$Name"]);
+  const guidFormula = guids
+    .map((guid) => `($$IsEqual:$GUID:${tallyFormulaString(guid)})`)
+    .join(" OR ");
+  const formula = [nameFormula, guidFormula].filter(Boolean).map((part) => `(${part})`).join(" OR ");
+  const filterName = "GajkesariBankVoucherLedgerIdentity";
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Gajkesari Bank Voucher Ledger Identity",
+    tallyType: "Ledger",
+    fetchFields: "Name,GUID,Parent,IsBillWiseOn",
+    companyName,
+    formulae: [{ name: filterName, formula }],
+    filterNames: [filterName],
+    timeoutMs: 20_000,
+    maxResponseBytes: 1024 * 1024,
+  });
+  return resolveBankVoucherLedgerIdentities(payloads, parseBankStatementMasterCollection(xml, "LEDGER"));
+}
+
 export function getBankVoucherCommandBatchKey(payload = {}, fallbackCompanyName = null) {
   return [
     normalizeLooseName(payload.companyName || fallbackCompanyName),
@@ -1939,7 +2008,34 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     groups.set(key, group);
   }
 
-  for (const group of groups.values()) {
+  for (const unresolvedGroup of groups.values()) {
+    let group;
+    try {
+      const companyName = unresolvedGroup[0]?.payload?.companyName || config.companyName || null;
+      const resolvedPayloads = await resolveBankVoucherLedgerPayloads(
+        config.tallyUrl,
+        unresolvedGroup.map((command) => command.payload || {}),
+        companyName
+      );
+      group = unresolvedGroup.map((command, index) => ({ ...command, payload: resolvedPayloads[index] }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await sendCommandResults(config, unresolvedGroup.map((command) => ({
+        command,
+        outcome: {
+          success: false,
+          error: message,
+          result: {
+            transactionId: command.payload?.transactionId,
+            sourceBankTransactionId: command.payload?.transactionId,
+            beforeExecution: true,
+            liveMasterValidationFailed: true,
+          },
+        },
+      })));
+      console.log(`Bank voucher batch blocked before import: ${message}`);
+      continue;
+    }
     let preflightByTransactionId = null;
     try {
       const targets = new Set(group.map((command) => JSON.stringify(command.payload?.target)));
@@ -2165,6 +2261,48 @@ async function postDebitNote(tallyUrl, payload, companyName) {
   return { outcome, xml };
 }
 
+export function decodeTallyResponseBytes(bytes, contentType = "") {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return new TextDecoder("utf-16le").decode(buffer.subarray(2));
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return new TextDecoder("utf-16be").decode(buffer.subarray(2));
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return new TextDecoder("utf-8").decode(buffer.subarray(3));
+  }
+  const declared = `${contentType} ${buffer.subarray(0, 256).toString("latin1")}`
+    .match(/(?:charset\s*=\s*|encoding\s*=\s*["'])([A-Za-z0-9._-]+)/i)?.[1]
+    ?.toLowerCase();
+  const encoding = declared === "utf16" || declared === "utf-16" ? "utf-16le"
+    : declared === "windows-1252" || declared === "cp1252" ? "windows-1252"
+      : "utf-8";
+  return new TextDecoder(encoding).decode(buffer);
+}
+
+async function readTallyResponse(response, maxResponseBytes = 0, label = "Tally response", controller = null) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let byteCount = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteCount += value.byteLength;
+      if (maxResponseBytes > 0 && byteCount > maxResponseBytes) {
+        controller?.abort();
+        throw new Error(`${label} exceeded the safe response size. Narrow the statement period or review this ledger separately.`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return decodeTallyResponseBytes(Buffer.concat(chunks, byteCount), response.headers.get("content-type") || "");
+}
+
 async function invokeTallyXml(tallyUrl, xml) {
   const execution = commandExecutionContext.getStore();
   if (execution) await assertCommandTarget(execution.config, execution.command);
@@ -2177,7 +2315,7 @@ async function invokeTallyXml(tallyUrl, xml) {
       fetch(tallyUrl, {
         method: "POST",
         headers: {
-          "Content-Type": "text/xml",
+          "Content-Type": "text/xml; charset=utf-8",
         },
         body: xml,
         signal: controller.signal,
@@ -2192,7 +2330,7 @@ async function invokeTallyXml(tallyUrl, xml) {
       }),
     ]);
 
-    const text = await response.text();
+    const text = await readTallyResponse(response);
     const parsed = parseTallyImportResult(text, response.status);
     if (execution && /<IMPORTRESULT|<CREATED|<ERRORS|<LINEERROR/i.test(text)) execution.writeOutcomeUnknown = false;
     return parsed;
@@ -2223,37 +2361,16 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", options = {
     const response = await fetch(tallyUrl, {
       method: "POST",
       headers: {
-        "Content-Type": "text/xml",
+        "Content-Type": "text/xml; charset=utf-8",
       },
       body: xml,
       signal: liveReadContext.getStore()?.signal
         ? AbortSignal.any([controller.signal, liveReadContext.getStore().signal]) : controller.signal,
     });
 
-    let text;
-    if (options.maxResponseBytes && response.body) {
-      // Bound memory before collecting/parsing XML on low-memory client PCs.
-      const reader = response.body.getReader();
-      const chunks = [];
-      let bytes = 0;
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          bytes += value.byteLength;
-          if (bytes > options.maxResponseBytes) {
-            controller.abort();
-            throw new Error(`${label} exceeded the safe response size. Narrow the statement period or review this ledger separately.`);
-          }
-          chunks.push(Buffer.from(value));
-        }
-        text = Buffer.concat(chunks, bytes).toString("utf8");
-      } finally {
-        reader.releaseLock();
-      }
-    } else {
-      text = await response.text();
-    }
+    // Decode from bytes so Tally's UTF-8/UTF-16 declaration is respected and
+    // ledger punctuation is never silently changed before identity checks.
+    const text = await readTallyResponse(response, options.maxResponseBytes || 0, label, controller);
     const result = parseExportResult(text, response.status);
     if (!result.success) {
       throw new Error(

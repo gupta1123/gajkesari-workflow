@@ -1,50 +1,185 @@
-// Recover the PNB transaction grid from physical PDF columns, never from the
-// changing number of empty Markdown cells. Other layouts retain their pipeline.
+// Recover debit, credit and balance from physical PDF columns. These values are
+// authoritative because Markdown conversion and AI can collapse empty cells.
+function normalizedText(value) {
+  return String(value ?? "").trim().replace(/\s+/g, " ");
+}
+
+function center(item) {
+  return Number(item.x) + Number(item.width) / 2;
+}
+
 function money(parts) {
-  const value=parts.sort((a,b)=>b.y-a.y||a.x-b.x).map(p=>p.text).join('').replace(/\s/g,'');
-  if(!value||value==='-')return null;
-  if(!/^\d[\d,]*\.\d{2}(?:Dr\.?|Cr\.?)?$/i.test(value))throw new Error('Uncertain PDF amount cell');
-  return Number(value.replace(/,/g,'').replace(/(?:Dr\.?|Cr\.?)$/i,''))*(/Dr\.?$/i.test(value)?-1:1);
-}
-export function extractPnbPhysicalColumns(pages) {
-  let layout=null;const rows=[];let detected=false;
-  for(const page of pages){
-    const items=page.items.filter(i=>i.str?.trim()).map(i=>({text:i.str.trim(),x:i.transform[4],y:i.transform[5],width:i.width}));
-    const header=text=>items.find(i=>i.text.toLowerCase()===text);
-    const debit=header('dr amount'),credit=header('cr amount'),reference=header('txn no.'),date=header('txn date'),balance=header('balance');
-    if(debit&&credit&&reference&&date&&balance){
-      const center=i=>i.x+i.width/2;
-      if(Math.max(...[debit,credit,reference,date,balance].map(i=>i.y))-Math.min(...[debit,credit,reference,date,balance].map(i=>i.y))>20)continue;
-      const gap=center(credit)-center(debit);
-      if(gap<30||Math.abs(center(balance)-center(credit)-gap)>gap*.2)continue;
-      layout={debit:center(debit),credit:center(credit),balance:center(balance),ref:center(reference),date:center(date),gap,width:page.width};detected=true;
-    }
-    if(!layout)continue;
-    if(Math.abs(page.width-layout.width)>1)throw new Error('PNB continuation page width changed');
-    const refs=items.filter(i=>/^T\d{5,}$/.test(i.text)&&Math.abs(i.x+i.width/2-layout.ref)<25).sort((a,b)=>b.y-a.y);
-    if(!refs.length)continue;
-    for(let index=0;index<refs.length;index++){
-      const ref=refs[index];
-      if(!items.some(i=>/^\d{2}-\d{2}-\d{4}$/.test(i.text)&&Math.abs(i.y-ref.y)<3&&Math.abs(i.x+i.width/2-layout.date)<25))throw new Error('PNB transaction/date alignment is uncertain');
-      const above=index?(refs[index-1].y-ref.y)/2:40;
-      const below=index+1<refs.length?(ref.y-refs[index+1].y)/2:40;
-      const cell=x=>items.filter(i=>i.y<ref.y+above&&i.y>ref.y-below&&i.x>=x-layout.gap/2&&i.x+i.width<=x+layout.gap/2+1);
-      const debitAmount=money(cell(layout.debit)),creditAmount=money(cell(layout.credit)),balanceAmount=money(cell(layout.balance));
-      if(Number(debitAmount>0)+Number(creditAmount>0)!==1||balanceAmount===null)throw new Error('PNB transaction columns are incomplete');
-      rows.push({reference:ref.text,debitAmount,creditAmount,balanceAmount,page:page.pageNumber});
-    }
+  const value = parts
+    .sort((left, right) => right.y - left.y || left.x - right.x)
+    .map((part) => part.text)
+    .join("")
+    .replace(/\s/g, "");
+  if (!value || value === "-") return null;
+  if (!/^\d[\d,]*\.\d{2}(?:Dr\.?|Cr\.?)?$/i.test(value)) {
+    throw new Error("Uncertain PDF amount cell");
   }
-  if(detected&&(!rows.length||new Set(rows.map(r=>r.reference)).size!==rows.length))throw new Error('PNB transaction references are incomplete or duplicated');
-  return {detected,rows,openingBalance:null};
+  return Number(value.replace(/,/g, "").replace(/(?:Dr\.?|Cr\.?)$/i, "")) *
+    (/Dr\.?$/i.test(value) ? -1 : 1);
 }
-export async function readPnbPhysicalColumns(bytes,workerSrc,maxPages=300) {
-  const pdfjs=await import('pdfjs-dist/legacy/build/pdf.mjs');
-  if(workerSrc)pdfjs.GlobalWorkerOptions.workerSrc=workerSrc;
-  const pdf=await pdfjs.getDocument({data:new Uint8Array(bytes),useSystemFonts:true,verbosity:0}).promise;
-  try{
-    if(pdf.numPages>maxPages)throw new Error('PDF page limit exceeded');
-    const pages=[];
-    for(let n=1;n<=pdf.numPages;n++){const page=await pdf.getPage(n);const text=await page.getTextContent();pages.push({pageNumber:n,width:page.view[2]-page.view[0],items:text.items});page.cleanup();}
-    return extractPnbPhysicalColumns(pages);
-  }finally{await pdf.destroy();}
+
+function header(items, ...names) {
+  const allowed = new Set(names.map((name) => name.toLowerCase()));
+  return items.find((item) => allowed.has(item.text.toLowerCase()));
 }
+
+function rowBounds(anchors, index) {
+  const distances = anchors
+    .slice(0, -1)
+    .map((anchor, anchorIndex) => anchor.y - anchors[anchorIndex + 1].y)
+    .filter((value) => value > 2)
+    .sort((left, right) => left - right);
+  const typical = distances.length ? distances[Math.floor(distances.length / 2)] : 72;
+  const current = anchors[index];
+  const previous = anchors[index - 1];
+  const next = anchors[index + 1];
+  return {
+    top: previous ? (previous.y + current.y) / 2 : current.y + Math.max(16, typical / 2),
+    bottom: next ? (current.y + next.y) / 2 : current.y - Math.max(48, typical * 1.15),
+  };
+}
+
+function columnCell(items, target, left, right, bounds) {
+  return items.filter((item) => {
+    const itemCenter = center(item);
+    return item.y < bounds.top && item.y > bounds.bottom && itemCenter >= left && itemCenter < right &&
+      Math.abs(itemCenter - target) <= Math.max(target - left, right - target);
+  });
+}
+
+function detectPnbLayout(items, page) {
+  const debit = header(items, "dr amount");
+  const credit = header(items, "cr amount");
+  const reference = header(items, "txn no.", "txn no");
+  const date = header(items, "txn date");
+  const balance = header(items, "balance");
+  if (!debit || !credit || !reference || !date || !balance) return null;
+  const headerY = [debit, credit, reference, date, balance].map((item) => item.y);
+  if (Math.max(...headerY) - Math.min(...headerY) > 20) return null;
+  const gap = center(credit) - center(debit);
+  if (gap < 30 || Math.abs(center(balance) - center(credit) - gap) > gap * 0.2) return null;
+  return {
+    type: "pnb",
+    debit: center(debit),
+    credit: center(credit),
+    balance: center(balance),
+    reference: center(reference),
+    date: center(date),
+    gap,
+    width: page.width,
+  };
+}
+
+function detectCentralBankLayout(items, page) {
+  const postDate = header(items, "post date", "posting date");
+  const debit = header(items, "debit");
+  const credit = header(items, "credit");
+  const balance = header(items, "balance");
+  const description = header(items, "transaction description", "description");
+  if (!postDate || !debit || !credit || !balance || !description) return null;
+  const headerY = [postDate, debit, credit, balance, description].map((item) => item.y);
+  if (Math.max(...headerY) - Math.min(...headerY) > 20) return null;
+  if (!(center(debit) < center(credit) && center(credit) < center(balance))) return null;
+  return {
+    type: "central_bank",
+    postDate: center(postDate),
+    debit: center(debit),
+    credit: center(credit),
+    balance: center(balance),
+    width: page.width,
+  };
+}
+
+function extractPnbRows(items, page, layout) {
+  const references = items
+    .filter((item) => /^[A-Z][A-Z0-9]{5,}$/i.test(item.text) && Math.abs(center(item) - layout.reference) < 28)
+    .sort((left, right) => right.y - left.y);
+  const rows = [];
+  for (let index = 0; index < references.length; index += 1) {
+    const reference = references[index];
+    if (!items.some((item) => /^\d{2}-\d{2}-\d{4}$/.test(item.text) && Math.abs(item.y - reference.y) < 4 && Math.abs(center(item) - layout.date) < 28)) {
+      throw new Error("PNB transaction/date alignment is uncertain");
+    }
+    const bounds = rowBounds(references, index);
+    const debitAmount = money(columnCell(items, layout.debit, layout.debit - layout.gap / 2, layout.debit + layout.gap / 2, bounds));
+    const creditAmount = money(columnCell(items, layout.credit, layout.credit - layout.gap / 2, layout.credit + layout.gap / 2, bounds));
+    const balanceAmount = money(columnCell(items, layout.balance, layout.balance - layout.gap / 2, layout.balance + layout.gap / 2, bounds));
+    if (Number(debitAmount > 0) + Number(creditAmount > 0) !== 1 || balanceAmount === null) {
+      throw new Error("PNB transaction columns are incomplete");
+    }
+    rows.push({ reference: reference.text.toUpperCase(), debitAmount, creditAmount, balanceAmount, page: page.pageNumber });
+  }
+  return rows;
+}
+
+function extractCentralBankRows(items, page, layout) {
+  const dates = items
+    .filter((item) => /^\d{2}\/\d{2}\/\d{4}$/.test(item.text) && Math.abs(center(item) - layout.postDate) < 28)
+    .sort((left, right) => right.y - left.y);
+  const debitCreditBoundary = (layout.debit + layout.credit) / 2;
+  const creditBalanceBoundary = (layout.credit + layout.balance) / 2;
+  const rows = [];
+  for (let index = 0; index < dates.length; index += 1) {
+    const bounds = rowBounds(dates, index);
+    const debitAmount = money(columnCell(items, layout.debit, layout.debit - (layout.credit - layout.debit) / 2, debitCreditBoundary, bounds));
+    const creditAmount = money(columnCell(items, layout.credit, debitCreditBoundary, creditBalanceBoundary, bounds));
+    const balanceAmount = money(columnCell(items, layout.balance, creditBalanceBoundary, page.width + 1, bounds));
+    if (Number(debitAmount > 0) + Number(creditAmount > 0) !== 1 || balanceAmount === null) {
+      throw new Error("Central Bank transaction columns are incomplete");
+    }
+    rows.push({ reference: `PAGE${page.pageNumber}ROW${index + 1}`, debitAmount, creditAmount, balanceAmount, page: page.pageNumber });
+  }
+  return rows;
+}
+
+export function extractBankStatementPhysicalColumns(pages) {
+  let layout = null;
+  let detected = false;
+  const rows = [];
+  for (const page of pages) {
+    const items = page.items
+      .filter((item) => item.str?.trim())
+      .map((item) => ({ text: normalizedText(item.str), x: item.transform[4], y: item.transform[5], width: item.width }));
+    const detectedLayout = detectPnbLayout(items, page) || detectCentralBankLayout(items, page);
+    if (detectedLayout) {
+      if (layout && layout.type !== detectedLayout.type) throw new Error("Bank statement layout changed between pages");
+      layout = detectedLayout;
+      detected = true;
+    }
+    if (!layout) continue;
+    if (Math.abs(page.width - layout.width) > 1) throw new Error(`${layout.type === "pnb" ? "PNB" : "Central Bank"} continuation page width changed`);
+    rows.push(...(layout.type === "pnb" ? extractPnbRows(items, page, layout) : extractCentralBankRows(items, page, layout)));
+  }
+  if (detected && rows.length === 0) throw new Error("Physical transaction columns were detected but no complete rows were found");
+  if (detected && layout?.type === "pnb" && new Set(rows.map((row) => row.reference)).size !== rows.length) {
+    throw new Error("PNB transaction references are incomplete or duplicated");
+  }
+  return { detected, layout: layout?.type ?? null, matchByOrder: layout?.type === "central_bank", rows, openingBalance: null };
+}
+
+export const extractPnbPhysicalColumns = extractBankStatementPhysicalColumns;
+
+export async function readBankStatementPhysicalColumns(bytes, workerSrc, maxPages = 300) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  if (workerSrc) pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
+  const pdf = await pdfjs.getDocument({ data: new Uint8Array(bytes), useSystemFonts: true, verbosity: 0 }).promise;
+  try {
+    if (pdf.numPages > maxPages) throw new Error("PDF page limit exceeded");
+    const pages = [];
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const text = await page.getTextContent();
+      pages.push({ pageNumber, width: page.view[2] - page.view[0], items: text.items });
+      page.cleanup();
+    }
+    return extractBankStatementPhysicalColumns(pages);
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+export const readPnbPhysicalColumns = readBankStatementPhysicalColumns;

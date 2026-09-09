@@ -89,6 +89,7 @@ function serializeImport(row: Record<string, unknown>) {
     statementPeriodEnd: row.statement_period_end ? String(row.statement_period_end) : null,
     importedTransactionCount: Number(row.imported_transaction_count ?? 0),
     duplicateTransactionCount: Number(row.duplicate_transaction_count ?? 0),
+    sourceSha256: row.source_sha256 ? String(row.source_sha256) : null,
     createdAt: String(row.created_at ?? ""),
   };
 }
@@ -138,7 +139,7 @@ export async function GET(request: Request) {
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("bank_statement_imports")
-      .select("id,bank_account_id,original_file_name,status,extracted_bank_name,extracted_account_number,extracted_account_holder_name,extracted_ifsc_code,statement_period_start,statement_period_end,imported_transaction_count,duplicate_transaction_count,created_at")
+      .select("id,bank_account_id,original_file_name,status,extracted_bank_name,extracted_account_number,extracted_account_holder_name,extracted_ifsc_code,statement_period_start,statement_period_end,imported_transaction_count,duplicate_transaction_count,source_sha256,created_at")
       .eq("owner_user_id", user.id)
       .in("company_dataset_id", await browserDatasetIds(request, user.id))
       .order("created_at", { ascending: false })
@@ -197,8 +198,26 @@ export async function POST(request: Request) {
     const target = await resolveTallyTarget(request, user.id, connectionId, companyName);
     const bytes = new Uint8Array(await file.arrayBuffer());
     const uploadBytes = isPdfUpload(file) ? await unlockPdfIfNeeded(bytes, statementPassword) : bytes;
-    const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
     const supabase = createSupabaseAdminClient();
+    const sourceSha256 = createHash("sha256").update(uploadBytes).digest("hex");
+
+    const { data: existingImport, error: existingImportError } = await supabase
+      .from("bank_statement_imports")
+      .select("*")
+      .eq("owner_user_id", user.id)
+      .eq("company_dataset_id", target.companyDatasetId)
+      .eq("source_sha256", sourceSha256)
+      .maybeSingle();
+    if (existingImportError) throw existingImportError;
+    if (existingImport) {
+      return jsonWithCors(request, {
+        ...serializePreviewFromMeta(existingImport as Record<string, unknown>),
+        duplicateUpload: true,
+        message: "This statement was already uploaded. The existing analysis has been opened.",
+      });
+    }
+
+    const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
 
     const catalogue = { ledgerNames: liveTallyLedgerNames, bankAccountCandidates: liveTallyBankAccountCandidates };
     const checksum = createHash("sha256").update(JSON.stringify(catalogue)).digest("hex");
@@ -226,6 +245,7 @@ export async function POST(request: Request) {
       storage_path: storagePath,
       mime_type: file.type || null,
       size_bytes: file.size,
+      source_sha256: sourceSha256,
       status: "processing",
       statement_period_start: null,
       statement_period_end: null,
@@ -263,7 +283,25 @@ export async function POST(request: Request) {
       .select("*")
       .single();
 
-    if (insertError) throw insertError;
+    if (insertError) {
+      await supabase.storage.from(BANK_STATEMENT_BUCKET).remove([storagePath]).catch(() => undefined);
+      if (insertError.code === "23505") {
+        const { data: racedImport, error: racedImportError } = await supabase
+          .from("bank_statement_imports")
+          .select("*")
+          .eq("owner_user_id", user.id)
+          .eq("company_dataset_id", target.companyDatasetId)
+          .eq("source_sha256", sourceSha256)
+          .single();
+        if (racedImportError) throw racedImportError;
+        return jsonWithCors(request, {
+          ...serializePreviewFromMeta(racedImport as Record<string, unknown>),
+          duplicateUpload: true,
+          message: "This statement was already uploaded. The existing analysis has been opened.",
+        });
+      }
+      throw insertError;
+    }
 
     const { error: jobInsertError } = await supabase.from("bank_statement_extraction_jobs").insert({
       import_id: createdImport.id,
@@ -274,7 +312,11 @@ export async function POST(request: Request) {
       result: createBankStatementJobResult(),
     });
 
-    if (jobInsertError) throw jobInsertError;
+    if (jobInsertError) {
+      await supabase.from("bank_statement_imports").delete().eq("id", createdImport.id);
+      await supabase.storage.from(BANK_STATEMENT_BUCKET).remove([storagePath]);
+      throw jobInsertError;
+    }
 
     return jsonWithCors(request, serializePreviewFromMeta(createdImport as Record<string, unknown>));
   } catch (error) {

@@ -29,6 +29,7 @@ type QueuePayload = {
   counterpartyLedgerName?: string;
   liveLedgerContext?: Array<{
     name?: string;
+    guid?: string | null;
     parent?: string | null;
     billWiseEnabled?: boolean | null;
     ledgerType?: string | null;
@@ -101,6 +102,7 @@ type TransactionStatusSummaryRow = {
 
 type TallyLedgerRow = {
   tally_name: string;
+  tally_guid?: string | null;
   parent_name: string | null;
   raw_payload: Record<string, unknown> | null;
   ledger_type?: string | null;
@@ -286,6 +288,7 @@ function readLiveLedgerContext(value: unknown): TallyLedgerRow[] {
     const billWiseEnabled = typeof row.billWiseEnabled === "boolean" ? row.billWiseEnabled : null;
     return [{
       tally_name: name,
+      tally_guid: toText(row.guid, 500) || null,
       parent_name: toText(row.parent, 240) || null,
       ledger_type: toText(row.ledgerType, 80) || null,
       raw_payload: { billWiseEnabled },
@@ -660,7 +663,7 @@ export async function POST(request: Request) {
     const ledgerQueries = chunkValues(Array.from(requestedLedgerNames)).map((names) =>
       supabase
         .from("tally_masters")
-        .select("tally_name, parent_name, raw_payload")
+        .select("tally_name, tally_guid, parent_name, raw_payload")
         .eq("owner_user_id", user.id)
         .eq("company_dataset_id", target.companyDatasetId)
         .eq("master_type", "ledger")
@@ -671,7 +674,7 @@ export async function POST(request: Request) {
       Promise.all(ledgerQueries),
       supabase
         .from("tally_masters")
-        .select("tally_name, parent_name, raw_payload")
+        .select("tally_name, tally_guid, parent_name, raw_payload")
         .eq("owner_user_id", user.id)
         .eq("company_dataset_id", target.companyDatasetId)
         .eq("master_type", "ledger")
@@ -759,6 +762,9 @@ export async function POST(request: Request) {
     );
     const ledgerTypeByName = new Map(
       activeLedgers.map((ledger) => [normalizeName(ledger.tally_name), normalizeName(ledger.ledger_type || "")])
+    );
+    const ledgerGuidByName = new Map(
+      activeLedgers.map((ledger) => [normalizeName(ledger.tally_name), toText(ledger.tally_guid, 500) || null])
     );
 
     function ledgerExists(ledgerName: string) {
@@ -977,7 +983,11 @@ export async function POST(request: Request) {
             voucherType: counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
             voucherDate,
             bankLedgerName,
+            bankLedgerGuid: ledgerGuidByName.get(normalizeName(bankLedgerName)) || null,
             counterpartyLedgerName,
+            counterpartyLedgerGuid: shouldCreateCounterpartyLedger
+              ? null
+              : ledgerGuidByName.get(normalizeName(counterpartyLedgerName)) || null,
             matchedLedgerName: counterpartyLedgerName,
             counterpartyIsPartyLedger,
             postingFallbackReason: isSuspenseLedger(counterpartyLedgerName) ? "unresolved_counterparty" : null,
@@ -1099,10 +1109,11 @@ export async function POST(request: Request) {
       if (mappingError) throw mappingError;
     }
 
+    const queueJobId = request.headers.get("x-tally-queue-job-id")?.trim() || null;
     const { data: createdCommands, error: commandError } = await supabase.rpc("enqueue_bank_tally_commands", {
       p_owner: user.id, p_connection: connectionId, p_dataset: target.companyDatasetId,
       p_generation: target.sessionGeneration,
-      p_commands: commands.map((command) => ({ ...command, payload: { ...command.payload, target } })),
+      p_commands: commands.map((command) => ({ ...command, queue_job_id: queueJobId, payload: { ...command.payload, target } })),
     });
     if (commandError) throw commandError;
     const queuedTransactionIds = voucherCommands.map((command) => command.payload.transactionId);
