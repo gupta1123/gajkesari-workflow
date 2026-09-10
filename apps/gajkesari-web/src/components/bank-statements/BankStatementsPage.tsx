@@ -293,6 +293,18 @@ type LedgerRecommendation = {
   reason: string | null;
 };
 
+type PostedBankBookTransaction = {
+  id: string;
+  transactionDate?: string | null;
+  description?: string | null;
+  referenceNumber?: string | null;
+  debitAmount?: string | number | null;
+  creditAmount?: string | number | null;
+  ledgerName?: string | null;
+  voucherNumber?: string | null;
+  postedAt?: string | null;
+};
+
 type ReviewTransaction = {
   id: string;
   transactionDate: string;
@@ -338,6 +350,7 @@ type PreviewResponse = {
   };
   candidates: BankAccount[];
   transactions: PreviewTransaction[];
+  postedTransactions?: PostedBankBookTransaction[];
   transactionsPage?: number;
   transactionsPageSize?: number;
   transactionsTotal?: number;
@@ -3234,6 +3247,7 @@ export function BankStatementsPage() {
   const [outgoingVerificationsByTransactionId, setOutgoingVerificationsByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [postedTransactionIds, setPostedTransactionIds] = useState<Set<string>>(() => new Set());
+  const [persistedPostedTransactions, setPersistedPostedTransactions] = useState<PostedBankBookTransaction[]>([]);
   const [tallyBalanceProof, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [billAllocationSearch, setBillAllocationSearch] = useState("");
@@ -3796,16 +3810,29 @@ export function BankStatementsPage() {
       ? 0
       : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
-  const csvTransactions = validTransactions.filter(transaction =>
+  const sessionPostedTransactions = validTransactions.filter(transaction =>
     postedTransactionIds.has(transaction.id) && tallyPresenceByTransactionId[transaction.id]?.status === "found"
   );
+  const bankBookTransactions = persistedPostedTransactions.length > 0
+    ? persistedPostedTransactions.map((transaction) => ({
+        id: transaction.id,
+        transactionDate: transaction.transactionDate || "",
+        selectedLedgerName: transaction.ledgerName || "",
+        debitAmount: String(transaction.debitAmount ?? ""),
+        creditAmount: String(transaction.creditAmount ?? ""),
+        voucherNumber: transaction.voucherNumber || "",
+      }))
+    : sessionPostedTransactions.map((transaction) => ({
+        ...transaction,
+        voucherNumber: tallyPresenceByTransactionId[transaction.id]?.voucherNumber || "",
+      }));
   const [bankBookFormat, setBankBookFormat] = useState<"pdf" | "csv">("pdf");
   const [downloadingBankBook, setDownloadingBankBook] = useState(false);
   async function downloadPostedBankBook() {
-    if (!preview || !csvTransactions.length) return;
+    if (!preview || !bankBookTransactions.length) return;
     setDownloadingBankBook(true);
     try {
-    const fullStatement = csvTransactions.length === validTransactions.length;
+    const fullStatement = bankBookTransactions.length === validTransactions.length;
     const opening = tallyBalanceProof?.statementOpeningBalance;
     const closing = tallyBalanceProof?.statementClosingBalance;
     const balances = fullStatement && tallyBalanceProof?.statementSequenceValid === true &&
@@ -3813,10 +3840,10 @@ export function BankStatementsPage() {
       ? { opening, closing } : undefined;
     const exportArgs: Parameters<typeof buildBankBookCsv> = [bankLedgerName,
       `${preview.import.statementPeriodStart || ""} to ${preview.import.statementPeriodEnd || ""}${fullStatement ? "" : " (posted entries only)"}`,
-      csvTransactions.map(transaction => ({
+      bankBookTransactions.map(transaction => ({
         date: transaction.transactionDate,
         party: transaction.selectedLedgerName,
-        voucherNumber: tallyPresenceByTransactionId[transaction.id]?.voucherNumber || "",
+        voucherNumber: transaction.voucherNumber,
         receipt: Number(transaction.creditAmount || 0),
         payment: Number(transaction.debitAmount || 0),
       })), balances];
@@ -4460,6 +4487,7 @@ export function BankStatementsPage() {
     setOutgoingVerificationsByTransactionId({});
     setTallyPresenceByTransactionId({});
     setPostedTransactionIds(new Set());
+    setPersistedPostedTransactions([]);
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
     setBillMatchingRequested(false);
@@ -5100,6 +5128,7 @@ export function BankStatementsPage() {
     setOutgoingVerificationsByTransactionId({});
     setTallyPresenceByTransactionId({});
     setPostedTransactionIds(new Set());
+    setPersistedPostedTransactions(payload.postedTransactions ?? []);
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
     setBillMatchingRequested(false);
@@ -6443,7 +6472,10 @@ export function BankStatementsPage() {
         });
         void pollTallyPostingStatus(postingConnectionId, commandIds)
           .then(async (finalStatus) => {
-            if (!finalStatus?.finished || finalStatus.failed > 0 || finalStatus.canceled > 0 || !commandConnection) return;
+            if (!finalStatus?.finished) return;
+            const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
+            setPersistedPostedTransactions(refreshedImport.postedTransactions ?? []);
+            if (finalStatus.failed > 0 || finalStatus.canceled > 0 || !commandConnection) return;
             setBanner({ tone: "info", text: "Tally actions completed. Verifying the statement against live Tally..." });
             const { drafts, balanceProof } = await verifyBankStatementPresence(commandConnection, validTransactions);
             const selectedIds = new Set(selectedTallyWorkTransactions.map((transaction) => transaction.id));
@@ -6649,7 +6681,19 @@ export function BankStatementsPage() {
                 </button>
               </h1>
             </div>
-            <div className="inline-flex items-center gap-3 rounded-xl border border-[#e5ddd0] bg-white px-3.5 py-2 shadow-sm">
+            <div className="flex min-w-0 items-center gap-2">
+            {bankBookTransactions.length > 0 && !tallyPostingInProgress ? (
+              <div className="flex shrink-0 items-center">
+                <Button type="button" variant="outline" disabled={downloadingBankBook} onClick={downloadPostedBankBook} className="h-8 rounded-l-lg rounded-r-none px-3 text-[10px] font-bold">
+                  {downloadingBankBook ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} Download {bankBookFormat.toUpperCase()}
+                </Button>
+                <select aria-label="Download format" value={bankBookFormat} disabled={downloadingBankBook} onChange={event => setBankBookFormat(event.target.value as "pdf" | "csv")} className="h-8 rounded-r-lg border border-l-0 border-[#e5ddd0] bg-white px-2 text-[10px] font-bold">
+                  <option value="pdf">PDF</option>
+                  <option value="csv">CSV</option>
+                </select>
+              </div>
+            ) : null}
+            <div className="inline-flex min-w-0 items-center gap-3 rounded-xl border border-[#e5ddd0] bg-white px-3.5 py-2 shadow-sm">
               <div className="flex min-w-0 items-center gap-2">
                 {tallyConnected ? (
                   <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
@@ -6705,17 +6749,7 @@ export function BankStatementsPage() {
                 ) : null}
               </div>
             </div>
-            {csvTransactions.length > 0 && !tallyPostingInProgress ? (
-              <div className="flex shrink-0 items-center">
-                <Button type="button" variant="outline" disabled={downloadingBankBook} onClick={downloadPostedBankBook} className="h-8 rounded-l-lg rounded-r-none px-3 text-[10px] font-bold">
-                  {downloadingBankBook ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} Download {bankBookFormat.toUpperCase()}
-                </Button>
-                <select aria-label="Download format" value={bankBookFormat} disabled={downloadingBankBook} onChange={event => setBankBookFormat(event.target.value as "pdf" | "csv")} className="h-8 rounded-r-lg border border-l-0 border-[#e5ddd0] bg-white px-2 text-[10px] font-bold">
-                  <option value="pdf">PDF</option>
-                  <option value="csv">CSV</option>
-                </select>
-              </div>
-            ) : null}
+            </div>
           </header>
 
           {!preview ? (
