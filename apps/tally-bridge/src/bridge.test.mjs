@@ -611,6 +611,30 @@ test("strict bank presence marks same-date amount evidence insufficient for Susp
   assert.equal(result.identityInsufficient, true);
 });
 
+test("a repeated strong reference is ambiguous and a cross-date reference is still found", () => {
+  const transaction = {
+    voucherDate: "2026-08-01",
+    amount: 1250,
+    expectedDirection: "incoming",
+    referenceNumber: "UTR-123456",
+    counterpartyLedgerName: "Customer A",
+  };
+  const first = bankVoucher({ reference: "UTR-123456" });
+  const otherDate = {
+    ...bankVoucher({ reference: "UTR-123456" }),
+    date: "20260731",
+    effectiveDate: "20260731",
+  };
+  const one = strictBankTransactionCandidates(
+    [otherDate], transaction, "ICICI Current Account", new Set()
+  );
+  assert.equal(one.candidates.length, 1);
+  const repeated = strictBankTransactionCandidates(
+    [first, otherDate], transaction, "ICICI Current Account", new Set()
+  );
+  assert.equal(repeated.candidates.length, 2);
+});
+
 test("statement reconciliation uses one bounded financial-year export when strong references match", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
