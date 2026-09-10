@@ -1,10 +1,8 @@
 import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createHash } from "node:crypto";
-import { after } from "next/server";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
-  BANK_STATEMENT_BUCKET,
   buildTransactionFingerprint,
   extractCounterpartyName,
   maskAccountNumber,
@@ -41,6 +39,7 @@ type QueueableTransactionRow = {
 
 type PostedLogRow = {
   fingerprint: string;
+  status: string;
   tally_voucher_id: string | null;
   tally_posted_at: string | null;
 };
@@ -419,6 +418,20 @@ export async function POST(
     if (importError || !importRow) {
       return jsonWithCors(request, { error: "Bank statement import was not found." }, { status: 404 });
     }
+    const ambiguousAmountRows = transactions.filter((transaction) =>
+      Number(Number(transaction.debitAmount ?? 0) > 0) +
+        Number(Number(transaction.creditAmount ?? 0) > 0) !== 1
+    );
+    if (ambiguousAmountRows.length > 0) {
+      return jsonWithCors(
+        request,
+        {
+          error: `${ambiguousAmountRows.length} transaction row(s) do not have exactly one Debit or Credit amount. Correct the extracted statement before confirming.`,
+          code: "BANK_STATEMENT_AMOUNT_DIRECTION_AMBIGUOUS",
+        },
+        { status: 409 }
+      );
+    }
 
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const importProcessingMeta = readRecord(importRow.processing_meta);
@@ -426,7 +439,7 @@ export async function POST(
     const extractionCoverageComplete = extractionDiagnostics.coverageComplete;
     if (
       ["processing", "manual_review_required", "failed"].includes(effectiveImportStatus) ||
-      extractionCoverageComplete === false
+      extractionCoverageComplete !== true
     ) {
       const unresolvedPages = Array.isArray(extractionDiagnostics.unresolvedPages)
         ? extractionDiagnostics.unresolvedPages.map(Number).filter(Number.isFinite)
@@ -457,7 +470,7 @@ export async function POST(
         .select("*")
         .eq("id", accountId)
         .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+        .eq("company_dataset_id", importRow.company_dataset_id)
         .single();
       if (error || !data) {
         return jsonWithCors(request, { error: "Selected bank account was not found." }, { status: 404 });
@@ -507,7 +520,6 @@ export async function POST(
           .from("bank_accounts")
           .select("*")
           .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
           .eq("account_number_normalized", accountKey)
           .eq("company_dataset_id", importRow.company_dataset_id)
           .single();
@@ -561,6 +573,31 @@ export async function POST(
       })
     );
     const rows = Array.from(rowsByFingerprint.values());
+    const previousReview = readRecord(readRecord(importRow.processing_meta).review);
+    const reviewRevision = Math.max(0, Number(previousReview.revision ?? 0) || 0) + 1;
+    const reviewDigest = createHash("sha256").update(JSON.stringify({
+      version: 2,
+      sourceSha256: importRow.source_sha256 ?? null,
+      companyDatasetId: importRow.company_dataset_id,
+      bankAccountId: accountId,
+      rows: rows.map((row) => ({
+        fingerprint: row.fingerprint,
+        transactionDate: row.transaction_date,
+        valueDate: row.value_date,
+        description: row.description,
+        referenceNumber: row.reference_number,
+        debitAmount: row.debit_amount,
+        creditAmount: row.credit_amount,
+        balanceAmount: row.balance_amount,
+        confirmedLedgerName: row.confirmed_ledger_name,
+      })),
+    })).digest("hex");
+    for (const row of rows) {
+      row.raw_payload = {
+        ...readRecord(row.raw_payload),
+        review: { version: 2, revision: reviewRevision, digest: reviewDigest },
+      };
+    }
     const lastImportedTransactionDate = checkpointDate(accountRow.last_imported_transaction_at);
     const lastImportedTransactionMarker = readTransactionCheckpointMarker(
       accountRow.last_imported_transaction_marker
@@ -578,37 +615,27 @@ export async function POST(
           .from("bank_transactions")
           .select("id, fingerprint, statement_import_id, tally_status")
           .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+          .eq("company_dataset_id", importRow.company_dataset_id)
           .eq("bank_account_id", accountId)
           .in("fingerprint", submittedFingerprints)
       : Promise.resolve({ data: [], error: null });
-    const postingLogPromise = !reconcileAgainstLiveTally && submittedFingerprints.length
+    const postingLogPromise = submittedFingerprints.length
       ? supabase
           .from("bank_transaction_posting_log")
-          .select("fingerprint, tally_voucher_id, tally_posted_at")
+          .select("fingerprint, status, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
-          .eq("status", "posted")
+          .in("status", ["posted", "verified", "needs_tally_review", "queued"])
           .in("fingerprint", submittedFingerprints)
       : Promise.resolve({ data: [], error: null });
-    const stalePostingLogPromise = reconcileAgainstLiveTally && submittedFingerprints.length
-      ? supabase
-          .from("bank_transaction_posting_log")
-          .delete()
-          .eq("owner_user_id", user.id)
-          .eq("bank_account_id", accountId)
-          .in("fingerprint", submittedFingerprints)
-      : Promise.resolve({ error: null });
 
     const [
       { data: existingTransactionData, error: existingTransactionReadError },
       { data: postedLogData, error: postedLogReadError },
-      { error: stalePostingLogError },
-    ] = await Promise.all([existingTransactionsPromise, postingLogPromise, stalePostingLogPromise]);
+    ] = await Promise.all([existingTransactionsPromise, postingLogPromise]);
 
     if (existingTransactionReadError) throw existingTransactionReadError;
     if (postedLogReadError) throw postedLogReadError;
-    if (stalePostingLogError) throw stalePostingLogError;
 
     const existingFingerprints = new Set(
       ((existingTransactionData ?? []) as ExistingTransactionRow[]).flatMap((row) =>
@@ -620,7 +647,7 @@ export async function POST(
         row.id &&
         row.fingerprint &&
         (reconcileAgainstLiveTally || row.statement_import_id === id) &&
-        (reconcileAgainstLiveTally || ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || ""))
+        ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
     const postedByFingerprint = new Map(
@@ -633,7 +660,12 @@ export async function POST(
       return [
         {
           ...row,
-          tally_status: "posted",
+          tally_status:
+            postedLog.status === "verified"
+              ? "verified"
+              : postedLog.status === "posted"
+                ? "posted"
+                : "needs_tally_review",
           tally_posted_at: postedLog.tally_posted_at,
           tally_voucher_id: postedLog.tally_voucher_id,
         },
@@ -684,10 +716,9 @@ export async function POST(
           id: existingRow.id,
           ...matchingRow,
           statement_import_id: id,
-          tally_status: reconcileAgainstLiveTally ? "pending" : existingRow.tally_status,
-          ...(reconcileAgainstLiveTally
-            ? { tally_voucher_id: null, tally_posted_at: null }
-            : {}),
+          // A re-analysis may refresh source fields, but it must never erase a
+          // posting checkpoint or make an uncertain/posted transaction retryable.
+          tally_status: existingRow.tally_status,
         }];
       });
       if (refreshRows.length > 0) {
@@ -716,7 +747,7 @@ export async function POST(
           .update(accountUpdate)
           .eq("id", accountId)
           .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+          .eq("company_dataset_id", importRow.company_dataset_id)
           .select("*")
           .single()
       : supabase
@@ -724,7 +755,7 @@ export async function POST(
           .select("*")
           .eq("id", accountId)
           .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+          .eq("company_dataset_id", importRow.company_dataset_id)
           .single();
 
     const queueableTransactionsPromise = supabase
@@ -733,7 +764,7 @@ export async function POST(
         "id, transaction_date, value_date, description, reference_number, debit_amount, credit_amount, suggested_ledger_name, confirmed_ledger_name"
       )
       .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+      .eq("company_dataset_id", importRow.company_dataset_id)
       .eq("bank_account_id", accountId)
       .eq("statement_import_id", id)
       .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
@@ -771,6 +802,12 @@ export async function POST(
               appendCompletedAt: new Date().toISOString(),
               alreadyPostedTransactionCount: postedByFingerprint.size,
               reconciledAgainstLiveTally: reconcileAgainstLiveTally,
+              review: {
+                version: 2,
+                revision: reviewRevision,
+                digest: reviewDigest,
+                sourceSha256: importRow.source_sha256 ?? null,
+              },
               bankLedgerSelection: {
                 ledgerName: String(submittedAccount.tallyLedgerName ?? "").trim() || null,
                 mode: normalizeAccountNumber(
@@ -784,7 +821,7 @@ export async function POST(
           })
           .eq("id", id)
           .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+          .eq("company_dataset_id", importRow.company_dataset_id)
           .select("*")
           .single(),
         queueableTransactionsPromise,
@@ -797,43 +834,6 @@ export async function POST(
     const queueableTransactions = ((queueableTransactionData ?? []) as QueueableTransactionRow[])
       .filter(hasPostingAmount)
       .map(serializeQueueableTransaction);
-
-    // Retention cleanup is useful, but it must not delay confirmation or Tally posting.
-    after(async () => {
-      try {
-        const { data: olderImports, error: olderImportsError } = await supabase
-          .from("bank_statement_imports")
-          .select("id, storage_path")
-          .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
-          .eq("bank_account_id", accountId)
-          .neq("id", id);
-        if (olderImportsError) throw olderImportsError;
-
-        const olderStoragePaths = (olderImports ?? [])
-          .map((row) => (typeof row.storage_path === "string" ? row.storage_path : ""))
-          .filter(Boolean);
-        if (olderStoragePaths.length > 0) {
-          const { error: storageCleanupError } = await supabase.storage
-            .from(BANK_STATEMENT_BUCKET)
-            .remove(olderStoragePaths);
-          if (storageCleanupError) throw storageCleanupError;
-        }
-
-        if ((olderImports ?? []).length > 0) {
-          const { error: deleteOlderImportsError } = await supabase
-            .from("bank_statement_imports")
-            .delete()
-            .eq("owner_user_id", user.id)
-      .in("company_dataset_id", await browserDatasetIds(request, user.id))
-            .eq("bank_account_id", accountId)
-            .neq("id", id);
-          if (deleteOlderImportsError) throw deleteOlderImportsError;
-        }
-      } catch (cleanupError) {
-        console.error("Deferred bank statement import cleanup failed:", cleanupError);
-      }
-    });
 
     return jsonWithCors(request, {
       account: serializeAccount(updatedAccount),

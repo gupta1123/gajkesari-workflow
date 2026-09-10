@@ -12,6 +12,15 @@ test("preserves explicit columns when no opening balance was extracted", () => {
   assert.equal(correctRowsFromRunningBalance([original])[0], original);
 });
 
+test("reports unavailable instead of verified when no balance transition can be checked", () => {
+  const validation = validateRunningBalanceContinuity([
+    { debit_amount: 100, credit_amount: null, balance_amount: null },
+  ]);
+  assert.equal(validation.status, "unavailable");
+  assert.equal(validation.valid, false);
+  assert.equal(validation.checkedTransitions, 0);
+});
+
 test("detects a forward chronological SBI-style statement", () => {
   const rows = [
     { debit_amount: 100, credit_amount: null, balance_amount: 900 },

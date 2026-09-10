@@ -34,10 +34,22 @@ test("extracts opening balance and transaction amounts from Markdown tables", ()
   assert.deepEqual(extractBankStatementMarkdownAmounts(markdown), {
     openingBalance: 50000000,
     rows: [
-      { reference: "GKOB1S01", debitAmount: null, creditAmount: 20000, balanceAmount: 50020000 },
-      { reference: "GKOB1S02", debitAmount: null, creditAmount: 120000, balanceAmount: 50140000 },
+      { reference: "GKOB1S01", sourceDate: "2026-08-24", narration: "First receipt", debitAmount: null, creditAmount: 20000, balanceAmount: 50020000 },
+      { reference: "GKOB1S02", sourceDate: "2026-08-24", narration: "Second receipt", debitAmount: null, creditAmount: 120000, balanceAmount: 50140000 },
     ],
   });
+});
+
+test("extracts verifiable rows when a statement has no reference or balance column", () => {
+  const markdown = `| Date | Particulars | Debit | Credit |\n|---|---|---|---|\n| 05-Sep-2026 | Customer receipt | | 1,250.00 |`;
+  assert.deepEqual(extractBankStatementMarkdownAmounts(markdown).rows, [{
+    reference: "",
+    sourceDate: "05-Sep-2026",
+    narration: "Customer receipt",
+    debitAmount: null,
+    creditAmount: 1250,
+    balanceAmount: null,
+  }]);
 });
 
 test("reconciles AI magnitude errors using exact source references", () => {

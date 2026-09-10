@@ -62,7 +62,15 @@ export function validateRunningBalanceContinuity(transactions, openingBalance = 
   const analysis = analyzeRunningBalanceOrder(transactions, openingBalance);
   const selected = analysis.selected;
   return {
-    valid: selected.breaks.length === 0,
+    status:
+      selected.checkedTransitions === 0
+        ? "unavailable"
+        : selected.breaks.length === 0
+          ? "verified"
+          : "failed",
+    // Keep `valid` for callers, but never certify a sequence when no balance
+    // transition was actually checked.
+    valid: selected.checkedTransitions > 0 && selected.breaks.length === 0,
     orientation: analysis.orientation,
     checkedTransitions: selected.checkedTransitions,
     matchingTransitions: selected.matchingTransitions,

@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { browserDatasetIds, resolveTallyTarget } from "@/lib/tally/browser-scope";
 
 export const runtime = "nodejs";
+const BANK_STATEMENT_EXTRACTION_VERSION = 2;
 const BANK_STATEMENT_MAX_UPLOAD_BYTES = Math.max(
   1,
   Number(process.env.BANK_STATEMENT_MAX_UPLOAD_BYTES ?? 50 * 1024 * 1024)
@@ -210,6 +211,65 @@ export async function POST(request: Request) {
       .maybeSingle();
     if (existingImportError) throw existingImportError;
     if (existingImport) {
+      const existingMeta = readRecord(existingImport.processing_meta);
+      const existingVersion = Number(existingMeta.extractionVersion ?? 0) || 0;
+      const effectiveStatus = getEffectiveImportStatus(existingImport as Record<string, unknown>);
+      if (
+        existingVersion < BANK_STATEMENT_EXTRACTION_VERSION &&
+        ["failed", "manual_review_required"].includes(effectiveStatus)
+      ) {
+        const now = new Date().toISOString();
+        await supabase
+          .from("bank_statement_import_preview_transactions")
+          .delete()
+          .eq("import_id", existingImport.id)
+          .eq("owner_user_id", user.id);
+        await supabase
+          .from("bank_statement_extraction_jobs")
+          .delete()
+          .eq("import_id", existingImport.id)
+          .eq("owner_user_id", user.id)
+          .in("status", ["succeeded", "failed", "cancelled"]);
+        const { data: refreshedImport, error: refreshError } = await supabase
+          .from("bank_statement_imports")
+          .update({
+            status: "processing",
+            processing_meta: {
+              ...existingMeta,
+              extractionVersion: BANK_STATEMENT_EXTRACTION_VERSION,
+              analysis: {
+                ...readRecord(existingMeta.analysis),
+                status: "queued",
+                progress: 5,
+                stage: "Reanalysing with the updated extractor",
+                error: null,
+                startedAt: now,
+                updatedAt: now,
+              },
+            },
+          })
+          .eq("id", existingImport.id)
+          .eq("owner_user_id", user.id)
+          .eq("company_dataset_id", target.companyDatasetId)
+          .select("*")
+          .single();
+        if (refreshError) throw refreshError;
+        const { error: retryJobError } = await supabase.from("bank_statement_extraction_jobs").insert({
+          import_id: existingImport.id,
+          owner_user_id: user.id,
+          status: "queued",
+          progress: 5,
+          stage: "Reanalysing with the updated extractor",
+          result: createBankStatementJobResult(),
+        });
+        if (retryJobError) throw retryJobError;
+        return jsonWithCors(request, {
+          ...serializePreviewFromMeta(refreshedImport as Record<string, unknown>),
+          duplicateUpload: true,
+          reanalysisStarted: true,
+          message: "This statement is being reanalysed with the updated extractor.",
+        });
+      }
       return jsonWithCors(request, {
         ...serializePreviewFromMeta(existingImport as Record<string, unknown>),
         duplicateUpload: true,
@@ -219,7 +279,22 @@ export async function POST(request: Request) {
 
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
 
-    const catalogue = { ledgerNames: liveTallyLedgerNames, bankAccountCandidates: liveTallyBankAccountCandidates };
+    // Snapshots retain catalogue identity and the small bank-account context.
+    // The authoritative ledger catalogue already lives in tally_masters; copying
+    // all 10k-50k names into every workflow snapshot wastes storage and makes
+    // every import heavier to read.
+    const ledgerChecksum = createHash("sha256")
+      .update(JSON.stringify(liveTallyLedgerNames.map((name) => name.toLocaleLowerCase()).sort()))
+      .digest("hex");
+    const catalogue = {
+      schemaVersion: 2,
+      ledgerCount: liveTallyLedgerNames.length,
+      ledgerChecksum,
+      bankAccountCandidates: liveTallyBankAccountCandidates,
+      connectionId,
+      companyName,
+      financialYear,
+    };
     const checksum = createHash("sha256").update(JSON.stringify(catalogue)).digest("hex");
     const { error: snapshotInsertError } = await supabase.from("tally_catalogue_snapshots").upsert({
       owner_user_id: user.id, company_dataset_id: target.companyDatasetId, checksum, catalogue,
@@ -251,6 +326,7 @@ export async function POST(request: Request) {
       statement_period_end: null,
       processing_meta: {
         source: "bank_statement_upload",
+        extractionVersion: BANK_STATEMENT_EXTRACTION_VERSION,
         tallyLedgerName: bankLedgerName,
         selectedContext: {
           target,

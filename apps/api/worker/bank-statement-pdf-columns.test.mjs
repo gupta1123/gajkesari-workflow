@@ -30,16 +30,27 @@ test('PNB accepts the real S and U reference families',()=>{
 });
 test('Central Bank uses physical debit and credit columns even with blank cheque references',()=>{
  const centralHeaders=[item('Post Date',50,700,60),item('Value',120,700,30),item('Transaction Description',300,700,120),item('Debit',530,700,35),item('Credit',620,700,35),item('Balance',710,700,45)];
- const centralRow=(y,debit,credit,balance)=>[
-  item('05/09/2026',50,y,55),item('05/09/2026',120,y,55),item('Narration',300,y,100),
+ const centralRow=(y,narration,debit,credit,balance)=>[
+  item('05/09/2026',50,y,55),item('05/09/2026',120,y,55),item(narration,300,y,100),
   ...(debit?[item(debit,525,y,55)]:[]),...(credit?[item(credit,615,y,55)]:[]),item(balance,700,y,85),
  ];
- const physical=extractBankStatementPhysicalColumns([{pageNumber:1,width:842,items:[...centralHeaders,...centralRow(620,null,'783200.00','343974486.98 DR'),...centralRow(590,'100.00',null,'343974586.98 DR')]}]);
- assert.equal(physical.layout,'central_bank');assert.equal(physical.matchByOrder,true);
+ const physical=extractBankStatementPhysicalColumns([{pageNumber:1,width:842,items:[...centralHeaders,...centralRow(620,'First narration',null,'783200.00','343974486.98 DR'),...centralRow(590,'Second narration','100.00',null,'343974586.98 DR')]}]);
+ assert.equal(physical.layout,'central_bank');assert.equal(physical.matchByOrder,false);
+ assert.deepEqual(physical.rows.map(entry=>[entry.sourceDate,entry.narration]),[['05/09/2026','First narration'],['05/09/2026','Second narration']]);
  assert.deepEqual(physical.rows.map(entry=>[entry.debitAmount,entry.creditAmount,entry.balanceAmount]),[[null,783200,-343974486.98],[100,null,-343974586.98]]);
  const fixed=reconcileBankStatementMarkdownAmounts({transactions:[
-  {reference_number:null,debit_amount:783200,credit_amount:null,category:'payment'},
-  {reference_number:null,debit_amount:null,credit_amount:100,category:'receipt'},
+  {reference_number:null,transaction_date:'2026-09-05',description:'First narration',debit_amount:783200,credit_amount:null,category:'payment'},
+  {reference_number:null,transaction_date:'2026-09-05',description:'Second narration',debit_amount:null,credit_amount:100,category:'receipt'},
  ]},'',physical);
  assert.deepEqual(fixed.transactions.map(entry=>[entry.debit_amount,entry.credit_amount,entry.category]),[[null,783200,'receipt'],[100,null,'payment']]);
+});
+test('generic statement headings get deterministic physical row evidence',()=>{
+ const genericHeaders=[item('Date',50,700,60),item('Particulars',260,700,100),item('Withdrawal',520,700,60),item('Deposit',620,700,50),item('Balance',710,700,45)];
+ const physical=extractBankStatementPhysicalColumns([{pageNumber:1,width:842,items:[
+  ...genericHeaders,item('05/09/2026',50,620,55),item('Customer receipt',260,620,120),item('1250.00',615,620,55),item('5000.00',700,620,70),
+ ]}]);
+ assert.equal(physical.layout,'generic_statement');
+ assert.deepEqual(physical.rows.map(row=>[row.sourceDate,row.narration,row.debitAmount,row.creditAmount,row.balanceAmount]),[
+  ['05/09/2026','Customer receipt',null,1250,5000],
+ ]);
 });

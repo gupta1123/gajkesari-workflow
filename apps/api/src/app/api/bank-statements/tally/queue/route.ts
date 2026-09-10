@@ -70,6 +70,7 @@ type BankTransactionRow = {
   suggestion_confidence: number | string | null;
   confirmed_ledger_name: string | null;
   fingerprint: string;
+  raw_payload?: Record<string, unknown> | null;
 };
 
 type BankAccountRow = {
@@ -212,13 +213,19 @@ function isSuspenseLedger(value?: string | null) {
 }
 
 function isValidTransactionDate(value: unknown) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? "").trim());
+  const text = String(value ?? "").trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() === Number(match[2]) - 1 &&
+    date.getUTCDate() === Number(match[3]);
 }
 
 function getVoucherDate(transaction: Pick<BankTransactionRow, "transaction_date" | "value_date">) {
-  return isValidTransactionDate(transaction.value_date)
-    ? String(transaction.value_date)
-    : transaction.transaction_date;
+  // The booked transaction date is the default accounting date. Value date is
+  // settlement metadata and must not silently move a voucher to another day.
+  return transaction.transaction_date;
 }
 
 function getVoucherType(transaction: BankTransactionRow) {
@@ -271,10 +278,8 @@ function getVoucherReferenceBankCode(value?: string | null) {
 }
 
 function buildVoucherReference(transaction: BankTransactionRow, bankCode: string) {
-  const hashNumber = Number.parseInt(transaction.fingerprint.slice(0, 8), 16);
-  const suffix = Number.isFinite(hashNumber)
-    ? String(hashNumber % 10_000).padStart(4, "0")
-    : transaction.id.replace(/[^0-9]/g, "").slice(0, 4).padStart(4, "0");
+  const fingerprint = transaction.fingerprint.replace(/[^a-fA-F0-9]/g, "").toUpperCase();
+  const suffix = (fingerprint || transaction.id.replace(/[^a-zA-Z0-9]/g, "").toUpperCase()).slice(0, 20);
   return `${getVoucherReferencePrefix(transaction)}-${bankCode}-${suffix}`;
 }
 
@@ -382,7 +387,6 @@ export async function POST(request: Request) {
     const supabase = createSupabaseAdminClient();
     const expectedCompanyName = toText(body.companyName, 240);
     const target = await resolveTallyTarget(request, user.id, submittedConnectionId, expectedCompanyName);
-    const datasetIds = [target.companyDatasetId];
     if (!expectedCompanyName) {
       return jsonWithCors(request, { error: "Select the Tally company before sending entries." }, { status: 400 });
     }
@@ -474,7 +478,7 @@ export async function POST(request: Request) {
       .from("bank_transactions")
       .select("*")
       .eq("owner_user_id", user.id)
-      .in("company_dataset_id", datasetIds)
+      .eq("company_dataset_id", target.companyDatasetId)
       .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
       .order("transaction_date", { ascending: true })
       .limit(100);
@@ -494,7 +498,7 @@ export async function POST(request: Request) {
         .from("bank_transactions")
         .select("tally_status")
         .eq("owner_user_id", user.id)
-      .in("company_dataset_id", datasetIds);
+      .eq("company_dataset_id", target.companyDatasetId);
 
       if (requestedTransactionIds.length) {
         summaryQuery = summaryQuery.in("id", requestedTransactionIds);
@@ -539,7 +543,7 @@ export async function POST(request: Request) {
       .from("bank_accounts")
       .select("id, bank_name, account_number_masked, account_holder_name, tally_ledger_name")
       .eq("owner_user_id", user.id)
-      .in("company_dataset_id", datasetIds)
+      .eq("company_dataset_id", target.companyDatasetId)
       .in("id", accountIds);
 
     if (accountError) throw accountError;
@@ -558,7 +562,7 @@ export async function POST(request: Request) {
           .from("bank_statement_imports")
           .select("id, extracted_bank_name")
           .eq("owner_user_id", user.id)
-      .in("company_dataset_id", datasetIds)
+      .eq("company_dataset_id", target.companyDatasetId)
           .in("id", importIds)
       : { data: [], error: null };
 
@@ -578,7 +582,7 @@ export async function POST(request: Request) {
       .eq("owner_user_id", user.id)
       .in("bank_account_id", accountIds)
       .in("fingerprint", fingerprints)
-      .in("status", ["queued", "posted", "verified"]);
+      .in("status", ["queued", "posted", "verified", "needs_tally_review"]);
 
     if (postingLogError) throw postingLogError;
 
@@ -602,7 +606,12 @@ export async function POST(request: Request) {
     );
     const blockedFingerprints = new Set(
       postingLogs
-        .filter((row) => row.status === "posted" || row.status === "verified" || (row.command_id && activeCommandIds.has(row.command_id)))
+        .filter((row) =>
+          row.status === "posted" ||
+          row.status === "verified" ||
+          row.status === "needs_tally_review" ||
+          (row.command_id && activeCommandIds.has(row.command_id))
+        )
         .map((row) => row.fingerprint)
     );
 
@@ -822,7 +831,9 @@ export async function POST(request: Request) {
         transaction,
         counterpartyLedgerName,
         createLedgerName,
-        createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
+        createLedgerParentName:
+          selectedLedger?.createLedgerParentName ||
+          (isIncomingReceipt(transaction) ? "Sundry Debtors" : "Sundry Creditors"),
       };
     });
 
@@ -873,6 +884,9 @@ export async function POST(request: Request) {
         );
         const referenceNumber =
           transaction.reference_number || buildVoucherReference(transaction, referenceBankCode);
+        const review = transaction.raw_payload?.review && typeof transaction.raw_payload.review === "object"
+          ? transaction.raw_payload.review as Record<string, unknown>
+          : {};
 
         if (outgoingPayment && outgoingAction === "verify") {
           const nextCommands: TallyCommandInsert[] = [];
@@ -979,6 +993,8 @@ export async function POST(request: Request) {
             transactionId: transaction.id,
             bankAccountId: account.id,
             fingerprint: transaction.fingerprint,
+            reviewedRevision: Number(review.revision ?? 0) || null,
+            reviewDigest: toText(review.digest, 128) || null,
             companyName: expectedCompanyName,
             voucherType: counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
             voucherDate,

@@ -376,7 +376,7 @@ export async function GET(
           accountNumber: account.accountNumber,
           accountHolderName: account.accountHolderName,
           ifscCode: account.ifscCode,
-        })
+        }, importRow.company_dataset_id)
       : [];
     const bankLedgerResolution = processing
       ? {

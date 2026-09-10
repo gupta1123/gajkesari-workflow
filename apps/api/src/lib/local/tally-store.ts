@@ -525,6 +525,7 @@ export async function disconnectLocalTallyConnectionFromBridge(
 export async function createLocalTallyCommand(input: {
   connectionId: string;
   ownerUserId?: string;
+  companyDatasetId?: string | null;
   commandType: TallyBridgeCommandType;
   payload: Record<string, unknown>;
   priority?: number;
@@ -535,6 +536,7 @@ export async function createLocalTallyCommand(input: {
     id: randomUUID(),
     connection_id: input.connectionId,
     owner_user_id: input.ownerUserId ?? LOCAL_USER_ID,
+    company_dataset_id: input.companyDatasetId ?? null,
     command_type: input.commandType,
     status: "queued",
     priority: input.priority ?? 10,

@@ -21,6 +21,7 @@ export type TallyBridgeCommandRow = {
   id: string;
   connection_id: string;
   owner_user_id: string;
+  company_dataset_id: string | null;
   command_type: TallyBridgeCommandType;
   status: TallyBridgeCommandStatus;
   priority: number;

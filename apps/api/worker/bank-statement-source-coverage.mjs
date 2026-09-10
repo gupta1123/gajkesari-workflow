@@ -1,6 +1,12 @@
 // Source coverage is independent of AI ledger suggestions. Never infer a missing
 // transaction from a balance delta: recovery receives only actual source rows.
 const ref = value => String(value ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+const narration = value => String(value ?? '')
+  .toUpperCase()
+  .replace(/&(?:AMP;)?/g, ' AND ')
+  .replace(/[^A-Z0-9]+/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
 const money = value => value == null || Number(value) === 0 ? 0
   : Number.isFinite(Number(value)) ? Math.round(Number(value) * 100) : null;
 export function sourceDate(value) {
@@ -18,17 +24,22 @@ export function sourceDate(value) {
   if (date.getUTCFullYear()!==Number(year)||date.getUTCMonth()+1!==Number(month)||date.getUTCDate()!==Number(day)) return null;
   return date.toISOString().slice(0,10);
 }
-const identity = (reference,date) => JSON.stringify([ref(reference),sourceDate(date)]);
-const sourceIdentity = row => identity(row.reference,row.sourceDate);
-const transactionIdentity = row => identity(row.reference_number,row.transaction_date);
-const signature = (id,debit,credit,balance) => JSON.stringify([id,money(debit),money(credit),balance == null ? null : money(balance)]);
-const sourceSignature = row => signature(sourceIdentity(row),row.debitAmount,row.creditAmount,row.balanceAmount);
-const transactionSignature = row => signature(transactionIdentity(row),row.debit_amount,row.credit_amount,row.balance_amount);
+const identity = (reference,date,description) => JSON.stringify([
+  ref(reference),sourceDate(date),narration(description)
+]);
+const sourceIdentity = row => identity(row.reference,row.sourceDate,row.narration);
+const transactionIdentity = row => identity(row.reference_number,row.transaction_date,row.description);
+const signature = (id,description,debit,credit,balance) => JSON.stringify([
+  id,narration(description),money(debit),money(credit),balance == null ? null : money(balance)
+]);
+const sourceSignature = row => signature(sourceIdentity(row),row.narration,row.debitAmount,row.creditAmount,row.balanceAmount);
+const transactionSignature = row => signature(transactionIdentity(row),row.description,row.debit_amount,row.credit_amount,row.balance_amount);
 
 export function auditSourceCoverage(transactions, sourceRows) {
   const supported = sourceRows.length > 0 && sourceRows.every(row =>
-    ref(row.reference) && sourceDate(row.sourceDate) && row.balanceAmount != null &&
-    money(row.balanceAmount) !== null && money(row.debitAmount) !== null && money(row.creditAmount) !== null &&
+    sourceDate(row.sourceDate) && narration(row.narration) &&
+    (row.balanceAmount == null || money(row.balanceAmount) !== null) &&
+    money(row.debitAmount) !== null && money(row.creditAmount) !== null &&
     Number(Number(row.debitAmount)>0)+Number(Number(row.creditAmount)>0)===1);
   if (!supported) return {supported:false,complete:false,missing:[],unexpected:[],matched:[]};
   const buckets = new Map();

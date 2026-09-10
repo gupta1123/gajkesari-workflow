@@ -364,6 +364,39 @@ function findCloseLedgerMatches(ledgers: TallyMasterRow[], candidateName?: strin
   return matches.sort((left, right) => right.score - left.score || left.ledgerName.localeCompare(right.ledgerName));
 }
 
+const BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION = Math.min(
+  100,
+  Math.max(10, Number(process.env.OPENROUTER_BANK_LEDGER_CANDIDATE_LIMIT ?? 40) || 40)
+);
+
+export function shortlistBankLedgersForTransaction(
+  ledgers: TallyMasterRow[],
+  transaction: MatchableTransaction,
+  counterpartyName?: string | null,
+  limit = BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION
+) {
+  const rawDescription = String(transaction.description ?? "").trim();
+  const normalizedDescription = normalizeName(rawDescription);
+  const queries = Array.from(new Set([
+    counterpartyName,
+    transaction.counterpartyName,
+    extractCounterpartyName(rawDescription),
+  ].map((value) => String(value ?? "").trim()).filter(Boolean)));
+  if (queries.length === 0) return [];
+
+  return ledgers
+    .map((ledger) => {
+      const normalizedLedger = normalizeName(ledger.tally_name);
+      const lexical = Math.max(...queries.map((query) => ledgerNameSimilarity(query, ledger.tally_name)));
+      const contained = normalizedLedger.length >= 5 && normalizedDescription.includes(normalizedLedger) ? 1 : 0;
+      return { ledger, score: Math.max(lexical, contained) };
+    })
+    .filter((entry) => entry.score >= 0.34)
+    .sort((left, right) => right.score - left.score || left.ledger.tally_name.localeCompare(right.ledger.tally_name))
+    .slice(0, Math.max(1, limit))
+    .map((entry) => entry.ledger);
+}
+
 function safeJsonParse<T>(raw: string, fallback: T): T {
   try {
     return JSON.parse(raw) as T;
@@ -458,13 +491,15 @@ async function aiMatchLedgersForTransactions(input: {
 }) {
   if (input.transactions.length === 0) return [];
 
-  // Every transaction must be evaluated against the complete active Tally
-  // ledger catalogue. De-duplicate the synced catalogue once, but do not
-  // locally rank, shortlist, or exclude ledgers before the AI decision.
+  const allowedLedgersByIndex = input.transactions.map(({ transaction, counterpartyName }) =>
+    shortlistBankLedgersForTransaction(input.ledgers, transaction, counterpartyName)
+  );
   const candidateLedgerByKey = new Map<string, TallyMasterRow>();
-  for (const ledger of input.ledgers) {
-    const key = normalizeName(ledger.tally_name);
-    if (key && !candidateLedgerByKey.has(key)) candidateLedgerByKey.set(key, ledger);
+  for (const ledgers of allowedLedgersByIndex) {
+    for (const ledger of ledgers) {
+      const key = normalizeName(ledger.tally_name);
+      if (key && !candidateLedgerByKey.has(key)) candidateLedgerByKey.set(key, ledger);
+    }
   }
   const candidateLedgers = Array.from(candidateLedgerByKey.values());
   if (candidateLedgers.length === 0) return input.transactions.map(() => null);
@@ -489,6 +524,7 @@ async function aiMatchLedgersForTransactions(input: {
             transactionType: transaction.transactionType ?? null,
             category: transaction.category,
             counterpartyName: counterpartyName ?? transaction.counterpartyName ?? null,
+            allowedLedgerNames: allowedLedgersByIndex[index].map((ledger) => ledger.tally_name),
           })),
           tallyLedgers: candidateLedgers.map((ledger) => ({
             name: ledger.tally_name,
@@ -528,7 +564,7 @@ async function aiMatchLedgersForTransactions(input: {
   return input.transactions.map((_, index) =>
     validateAiLedgerMatch(
       parsed.matches?.find((entry) => Number(entry?.index) === index),
-      candidateLedgers
+      allowedLedgersByIndex[index]
     )
   );
 }
@@ -618,7 +654,9 @@ async function fetchAllActiveTallyLedgers(input: {
   for (let from = 0; from < 20000; from += pageSize) {
     const { data, error } = await input.supabase
       .from("tally_masters")
-      .select("*")
+      .select(
+        "id, connection_id, owner_user_id, company_name, sync_run_id, master_type, master_key, tally_guid, tally_name, parent_name, gstin, hsn_code, unit_name, tax_rate, is_active, last_synced_at, created_at, updated_at"
+      )
       .eq("owner_user_id", input.ownerUserId)
       .eq("connection_id", input.connectionId)
       .eq("master_type", "ledger")

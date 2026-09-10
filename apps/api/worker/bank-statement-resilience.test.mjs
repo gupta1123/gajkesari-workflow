@@ -76,7 +76,7 @@ test("every page must either contain usable rows or explicitly confirm no transa
   assert.deepEqual(result.unresolvedPages, [2]);
 });
 
-test("a page remains incomplete when visible row evidence exceeds usable AI rows", () => {
+test("an advisory text-row estimate cannot block otherwise complete page evidence", () => {
   const result = validateBankStatementPageCoverage({
     transactions: [{
       description: "only extracted row",
@@ -89,11 +89,12 @@ test("a page remains incomplete when visible row evidence exceeds usable AI rows
       expectedMinimumRowCount: 2,
     }],
   });
-  // Preserve the usable row for review while coverage remains blocked.
+  // Preserve the usable row and leave authoritative coverage to source-row reconciliation.
   assert.equal(result.transactions.length, 1);
   assert.equal(result.transactions[0].raw_payload.extractionProvenance.startPage, 3);
-  assert.deepEqual(result.unresolvedPages, [3]);
-  assert.equal(result.pageOutcomes[0].status, "incomplete");
+  assert.deepEqual(result.unresolvedPages, []);
+  assert.equal(result.pageOutcomes[0].status, "succeeded");
+  assert.equal(result.pageOutcomes[0].visibleRowEstimateMismatch, true);
 });
 
 test("an unreadable text page cannot be certified empty without rendered-image recovery", () => {

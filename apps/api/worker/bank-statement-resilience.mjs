@@ -122,7 +122,12 @@ export function validateBankStatementPageCoverage({
       declared?.status === "transactions" &&
       declared.transactionCount !== null &&
       declared.transactionCount > rows.length;
-    const visibleRowsMissing =
+    // Text-derived row counts are advisory. PDF converters frequently emit a
+    // dated opening/closing balance or page total that looks like a transaction.
+    // A model-declared row count can prove that usable rows were lost; a regex
+    // estimate cannot. Source-row reconciliation performs the authoritative
+    // one-to-one coverage check later in the pipeline.
+    const visibleRowEstimateMismatch =
       page.expectedMinimumRowCount !== null && rows.length < page.expectedMinimumRowCount;
     if (rows.length > 0) {
       verifiedTransactions.push(...addBankStatementPageProvenance(rows, {
@@ -131,8 +136,14 @@ export function validateBankStatementPageCoverage({
         method,
       }));
     }
-    if (rows.length > 0 && !declaredMoreRowsThanUsable && !visibleRowsMissing) {
-      return { page: page.pageNumber, status: "succeeded", rowCount: rows.length };
+    if (rows.length > 0 && !declaredMoreRowsThanUsable) {
+      return {
+        page: page.pageNumber,
+        status: "succeeded",
+        rowCount: rows.length,
+        expectedMinimumRowCount: page.expectedMinimumRowCount,
+        visibleRowEstimateMismatch,
+      };
     }
     if (
       declared?.status === "no_transactions" &&
@@ -143,7 +154,7 @@ export function validateBankStatementPageCoverage({
     }
     return {
       page: page.pageNumber,
-      status: declaredMoreRowsThanUsable || visibleRowsMissing ? "incomplete" : "unverified",
+      status: declaredMoreRowsThanUsable ? "incomplete" : "unverified",
       rowCount: rows.length,
       expectedMinimumRowCount: page.expectedMinimumRowCount,
     };

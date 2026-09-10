@@ -87,7 +87,7 @@ export function formatAsMarkdownTable(text: string): { markdown: string; tableCo
   while (headers.length < maxCols) headers.push("");
 
   const headerLine = `| ${headers.join(" | ")} |`;
-  const separatorLine = `| ${headers.map(() => "---").join(" | ")} |`;
+  const separatorLine = `|${headers.map(() => "---").join("|")}|`;
 
   const dataLines = tableRows.slice(1).map((row) => {
     while (row.length < maxCols) row.push("");
@@ -127,12 +127,15 @@ export async function parseWithAnydoc(
         fs.rmSync(tmpDir, { recursive: true, force: true });
 
         if (markdownText && markdownText.trim()) {
-          const { tableCount } = formatAsMarkdownTable(markdownText);
+          const formatted = formatAsMarkdownTable(markdownText);
+          const normalizedMarkdown = /\|\s*:?-{2,}:?\s*\|/.test(markdownText)
+            ? markdownText.trim()
+            : formatted.markdown;
           return {
             success: true,
-            markdownText: markdownText.trim(),
-            hasMarkdownTables: markdownText.includes("|---") || markdownText.includes("| ---") || tableCount > 0,
-            tableCount: Math.max(1, tableCount),
+            markdownText: normalizedMarkdown,
+            hasMarkdownTables: normalizedMarkdown.includes("|---") || normalizedMarkdown.includes("| ---") || formatted.tableCount > 0,
+            tableCount: Math.max(1, formatted.tableCount),
             executionTimeMs: Date.now() - startTime,
             format: ext,
           };

@@ -75,18 +75,21 @@ function detectPnbLayout(items, page) {
 }
 
 function detectCentralBankLayout(items, page) {
-  const postDate = header(items, "post date", "posting date");
-  const debit = header(items, "debit");
-  const credit = header(items, "credit");
+  const postDate = header(items, "post date", "posting date", "transaction date", "txn date", "date");
+  const valueDate = header(items, "value", "value date");
+  const debit = header(items, "debit", "dr amount", "withdrawal", "paid out");
+  const credit = header(items, "credit", "cr amount", "deposit", "paid in");
   const balance = header(items, "balance");
-  const description = header(items, "transaction description", "description");
+  const description = header(items, "transaction description", "description", "particular", "particulars", "narration", "details");
   if (!postDate || !debit || !credit || !balance || !description) return null;
   const headerY = [postDate, debit, credit, balance, description].map((item) => item.y);
   if (Math.max(...headerY) - Math.min(...headerY) > 20) return null;
   if (!(center(debit) < center(credit) && center(credit) < center(balance))) return null;
   return {
-    type: "central_bank",
+    type: /^(?:post|posting) date$/i.test(postDate.text) ? "central_bank" : "generic_statement",
     postDate: center(postDate),
+    valueDate: valueDate ? center(valueDate) : null,
+    description: center(description),
     debit: center(debit),
     credit: center(credit),
     balance: center(balance),
@@ -128,10 +131,31 @@ function extractCentralBankRows(items, page, layout) {
     const debitAmount = money(columnCell(items, layout.debit, layout.debit - (layout.credit - layout.debit) / 2, debitCreditBoundary, bounds));
     const creditAmount = money(columnCell(items, layout.credit, debitCreditBoundary, creditBalanceBoundary, bounds));
     const balanceAmount = money(columnCell(items, layout.balance, creditBalanceBoundary, page.width + 1, bounds));
+    const narration = columnCell(
+      items,
+      layout.description,
+      layout.valueDate
+        ? (layout.valueDate + layout.description) / 2
+        : (layout.postDate + layout.description) / 2,
+      layout.debit - 20,
+      bounds
+    )
+      .sort((left, right) => right.y - left.y || left.x - right.x)
+      .map((item) => item.text)
+      .join(" ")
+      .trim();
     if (Number(debitAmount > 0) + Number(creditAmount > 0) !== 1 || balanceAmount === null) {
       throw new Error("Central Bank transaction columns are incomplete");
     }
-    rows.push({ reference: `PAGE${page.pageNumber}ROW${index + 1}`, debitAmount, creditAmount, balanceAmount, page: page.pageNumber });
+    rows.push({
+      reference: "",
+      sourceDate: dates[index].text,
+      narration,
+      debitAmount,
+      creditAmount,
+      balanceAmount,
+      page: page.pageNumber,
+    });
   }
   return rows;
 }
@@ -151,14 +175,14 @@ export function extractBankStatementPhysicalColumns(pages) {
       detected = true;
     }
     if (!layout) continue;
-    if (Math.abs(page.width - layout.width) > 1) throw new Error(`${layout.type === "pnb" ? "PNB" : "Central Bank"} continuation page width changed`);
+    if (Math.abs(page.width - layout.width) > 1) throw new Error(`${layout.type === "pnb" ? "PNB" : "bank statement"} continuation page width changed`);
     rows.push(...(layout.type === "pnb" ? extractPnbRows(items, page, layout) : extractCentralBankRows(items, page, layout)));
   }
   if (detected && rows.length === 0) throw new Error("Physical transaction columns were detected but no complete rows were found");
   if (detected && layout?.type === "pnb" && new Set(rows.map((row) => row.reference)).size !== rows.length) {
     throw new Error("PNB transaction references are incomplete or duplicated");
   }
-  return { detected, layout: layout?.type ?? null, matchByOrder: layout?.type === "central_bank", rows, openingBalance: null };
+  return { detected, layout: layout?.type ?? null, matchByOrder: false, rows, openingBalance: null };
 }
 
 export const extractPnbPhysicalColumns = extractBankStatementPhysicalColumns;

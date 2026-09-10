@@ -14,7 +14,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.60";
+const BRIDGE_VERSION = "0.1.61";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -1856,7 +1856,11 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
 
 async function postBankVoucher(tallyUrl, payload, companyName) {
   const [resolvedPayload] = await resolveBankVoucherLedgerPayloads(tallyUrl, [payload], companyName);
-  payload = resolvedPayload;
+  [payload] = await validateBankVoucherBillAllocationsLive(
+    { tallyUrl },
+    [resolvedPayload],
+    companyName
+  );
   const voucherType = String(payload?.voucherType || "");
   const expectedDirection = payload?.expectedDirection || (/receipt/i.test(voucherType) ? "incoming" : "outgoing");
   const shouldCheckExisting =
@@ -1914,8 +1918,68 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
     requireCreatedVoucher(await invokeTallyXml(tallyUrl, primaryXml)),
     payload
   );
+  if (!primaryOutcome.success) {
+    return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+  }
 
-  return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+  try {
+    const readback = await verifyBankTransactionInTally(
+      { tallyUrl, companyName },
+      { ...payload, expectedDirection }
+    );
+    const verification = readback.result || {};
+    if (verification.verificationStatus === "found") {
+      return {
+        outcome: {
+          success: true,
+          result: {
+            ...(primaryOutcome.result || {}),
+            verificationStatus: "verified",
+            duplicateCheck: verification,
+            voucherId: verification.voucherId || primaryOutcome.result?.lastVchId || null,
+            voucherNumber: verification.voucherNumber || payload.referenceNumber || null,
+          },
+        },
+        xml: primaryXml,
+        retriedWithLegacyHeader: false,
+      };
+    }
+    return {
+      outcome: {
+        success: false,
+        error: "Tally accepted the bank voucher import, but read-back could not verify the created voucher.",
+        result: {
+          ...(primaryOutcome.result || {}),
+          reconciliationRequired: true,
+          possibleDuplicateInTally: true,
+          voucherCreatedButVerificationFailed: true,
+          uncertaintyReason: verification.verificationStatus === "ambiguous"
+            ? "ambiguous_readback"
+            : "voucher_not_visible_after_import",
+          duplicateCheck: verification,
+        },
+      },
+      xml: primaryXml,
+      retriedWithLegacyHeader: false,
+    };
+  } catch (error) {
+    return {
+      outcome: {
+        success: false,
+        error: "Tally accepted the bank voucher import, but read-back was interrupted.",
+        result: {
+          ...(primaryOutcome.result || {}),
+          reconciliationRequired: true,
+          possibleDuplicateInTally: true,
+          voucherCreatedButVerificationFailed: true,
+          uncertaintyReason: "readback_interrupted",
+          readbackError: error instanceof Error ? error.message : String(error),
+        },
+      },
+      xml: primaryXml,
+      retriedWithLegacyHeader: false,
+    };
+  }
 }
 
 function normalizedGuid(value) {
@@ -1985,6 +2049,65 @@ async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName)
   return resolveBankVoucherLedgerIdentities(payloads, parseBankStatementMasterCollection(xml, "LEDGER"));
 }
 
+async function validateBankVoucherBillAllocationsLive(config, payloads, companyName) {
+  const allocatedPayloads = (payloads || []).filter((payload) =>
+    Array.isArray(payload?.billAllocations) && payload.billAllocations.length > 0
+  );
+  if (allocatedPayloads.length === 0) return payloads;
+  const ledgerNames = Array.from(new Set(
+    allocatedPayloads.map((payload) => String(payload.counterpartyLedgerName || "").trim()).filter(Boolean)
+  ));
+  const asOfDate = allocatedPayloads
+    .map((payload) => normalizeDateForCompare(payload.voucherDate))
+    .filter(Boolean)
+    .sort()
+    .at(-1) || null;
+  const outcome = await fetchCustomerOpenBillsFromTally(
+    config,
+    {
+      companyName,
+      ledgerNames,
+      asOfDate,
+      queryPurpose: "bank_statement_match",
+    }
+  );
+  const byLedger = outcome.result?.byLedger || {};
+  const consumed = new Map();
+  for (const payload of allocatedPayloads) {
+    const ledgerName = String(payload.counterpartyLedgerName || "").trim();
+    const bucket = byLedger[ledgerName];
+    if (!bucket || !Array.isArray(bucket.openBills)) {
+      throw new Error(`Open bills for '${ledgerName}' could not be verified immediately before posting.`);
+    }
+    const billByReference = new Map(
+      bucket.openBills.map((bill) => [normalizeExactReference(bill.referenceName || bill.voucherNumber), bill])
+    );
+    for (const allocation of payload.billAllocations) {
+      if (!/^agst\s+ref$/i.test(String(allocation?.referenceType || "").trim())) continue;
+      const referenceKey = normalizeExactReference(allocation?.referenceName);
+      const bill = billByReference.get(referenceKey);
+      if (!referenceKey || !bill) {
+        throw new Error(`Bill '${allocation?.referenceName || "unknown"}' is no longer open in '${ledgerName}'.`);
+      }
+      const amount = Math.abs(Number(allocation?.amount || 0));
+      const consumedKey = `${normalizeLooseName(ledgerName)}|${referenceKey}`;
+      const nextConsumed = Number(((consumed.get(consumedKey) || 0) + amount).toFixed(2));
+      const pendingAmount = Math.abs(Number(bill.pendingAmount ?? bill.amount ?? 0));
+      if (!(amount > 0) || nextConsumed - pendingAmount >= 0.005) {
+        throw new Error(`Bill '${allocation.referenceName}' changed in Tally. Refresh matching before posting.`);
+      }
+      consumed.set(consumedKey, nextConsumed);
+    }
+  }
+  const checkedAt = new Date().toISOString();
+  return (payloads || []).map((payload) => ({
+    ...payload,
+    liveBillValidation: Array.isArray(payload?.billAllocations) && payload.billAllocations.length > 0
+      ? { checkedAt, source: "live_tally_immediate_read" }
+      : null,
+  }));
+}
+
 export function getBankVoucherCommandBatchKey(payload = {}, fallbackCompanyName = null) {
   return [
     normalizeLooseName(payload.companyName || fallbackCompanyName),
@@ -2017,7 +2140,12 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         unresolvedGroup.map((command) => command.payload || {}),
         companyName
       );
-      group = unresolvedGroup.map((command, index) => ({ ...command, payload: resolvedPayloads[index] }));
+      const validatedPayloads = await validateBankVoucherBillAllocationsLive(
+        config,
+        resolvedPayloads,
+        companyName
+      );
+      group = unresolvedGroup.map((command, index) => ({ ...command, payload: validatedPayloads[index] }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await sendCommandResults(config, unresolvedGroup.map((command) => ({
@@ -2060,11 +2188,22 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
       );
     } catch (error) {
-      console.warn(
-        `Batch duplicate preflight was unavailable; falling back to independent checks: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      await sendCommandResults(config, group.map((command) => ({
+        command,
+        outcome: {
+          success: false,
+          error: `Duplicate check could not be completed. Nothing was posted. ${message}`,
+          result: {
+            transactionId: command.payload?.transactionId,
+            sourceBankTransactionId: command.payload?.transactionId,
+            beforeExecution: true,
+            duplicateCheckIncomplete: true,
+          },
+        },
+      })));
+      console.warn(`Bank voucher batch blocked because duplicate preflight was unavailable: ${message}`);
+      continue;
     }
 
     const pendingCommands = [];
@@ -2103,6 +2242,14 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
           continue;
         }
 
+        if (preflight?.verificationStatus !== "missing") {
+          await sendCommandResult(config, command, {
+            success: false,
+            error: "Duplicate check returned an incomplete result. Nothing was posted.",
+            result: { transactionId, beforeExecution: true, duplicateCheckIncomplete: true },
+          });
+          continue;
+        }
         pendingCommands.push(command);
       } catch (error) {
         console.error(
@@ -2136,40 +2283,8 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     }
 
     const batchElapsedMs = Date.now() - batchStartedAt;
-    const importedCount =
-      Number(batchOutcome.result?.created || 0) + Number(batchOutcome.result?.altered || 0);
-    if (batchOutcome.success && importedCount >= pendingCommands.length) {
-      await sendCommandResults(
-        config,
-        pendingCommands.map((command) => ({
-          command,
-          outcome: {
-            success: true,
-            result: {
-              created: 1,
-              altered: 0,
-              transactionId: command.payload?.transactionId,
-              sourceBankTransactionId: command.payload?.transactionId,
-              voucherId: command.payload?.referenceNumber || command.id,
-              voucherNumber: command.payload?.referenceNumber || null,
-              requestXml: previewXml(batchXml),
-              batchImport: true,
-              batchSize: pendingCommands.length,
-              batchElapsedMs,
-            },
-          },
-        }))
-      );
-      console.log(
-        `Posted ${pendingCommands.length} bank vouchers in one Tally request (${batchElapsedMs} ms).`
-      );
-      continue;
-    }
-
-    // A Tally batch may create its valid messages and report only the invalid
-    // ones as exceptions. Reconcile once after a mixed result so already-created
-    // rows are never retried as duplicates, then retry only confirmed-missing
-    // rows independently. One bad voucher therefore cannot block the others.
+    // Tally import counters acknowledge the envelope, not each voucher. Always
+    // read every target back, even when CREATED equals the requested batch size.
     let postflightByTransactionId = null;
     try {
       const postflight = await reconcileBankTransactionsInTally(config, {
@@ -2207,6 +2322,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             voucherId: postflight.voucherId || command.payload?.referenceNumber || command.id,
             voucherNumber: postflight.voucherNumber || command.payload?.referenceNumber || null,
             duplicateCheck: postflight,
+            verificationStatus: "verified",
             requestXml: batchXml ? previewXml(batchXml) : null,
             batchImport: true,
             batchSize: pendingCommands.length,
@@ -2216,11 +2332,19 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         continue;
       }
 
-      if (!postflight || postflight.verificationStatus !== "missing") {
+      // A successful import followed by a missing/failed read-back is uncertain,
+      // never proof that it is safe to create the voucher again.
+      if (batchOutcome.success || !postflight || postflight.verificationStatus !== "missing") {
         await sendCommandResult(config, command, {
           success: false,
           error: "The batch import outcome is uncertain. Read back Tally before retrying.",
-          result: { transactionId, reconciliationRequired: true, possibleDuplicateInTally: true },
+          result: {
+            transactionId,
+            reconciliationRequired: true,
+            possibleDuplicateInTally: true,
+            uncertaintyReason: !postflight ? "readback_unavailable" : "readback_did_not_confirm_import",
+            importSummary: batchOutcome.result || {},
+          },
         });
         continue;
       }
@@ -2986,7 +3110,7 @@ function normalizeExactReference(value) {
 
 function voucherHasExactReference(voucher, referenceNumber) {
   const expected = normalizeExactReference(referenceNumber);
-  if (expected.length < 5) return false;
+  if (!isStrongBankReference(expected)) return false;
   return [voucher.reference, ...(voucher.bankReferences || [])]
     .some((value) => normalizeExactReference(value) === expected);
 }
@@ -3062,6 +3186,21 @@ function indexBankVouchersByDate(vouchers) {
   return byDate;
 }
 
+function financialYearBounds(value) {
+  const normalized = normalizeDateForCompare(value);
+  if (!normalized) return null;
+  const [year, month] = normalized.split("-").map(Number);
+  const startYear = month >= 4 ? year : year - 1;
+  return { dateFrom: `${startYear}-04-01`, dateTo: `${startYear + 1}-03-31` };
+}
+
+function isStrongBankReference(value) {
+  const normalized = normalizeExactReference(value);
+  // Short words such as PAYMENT, CASH or CHARGES recur and are not transaction
+  // identities. Require a reasonably long alphanumeric bank/generated token.
+  return normalized.length >= 8 && /[a-z]/.test(normalized) && /\d/.test(normalized);
+}
+
 function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes = new Set(), byDate = null) {
   const voucherDate = normalizeDateForCompare(transaction.voucherDate);
   const amount = Number(transaction.amount || 0);
@@ -3092,15 +3231,25 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
     byDate
   );
 
-  const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
+  const hasUsableReference = isStrongBankReference(referenceNumber);
   const counterpartyKey = normalizeLooseName(counterpartyLedgerName);
   const hasUsableCounterparty = Boolean(counterpartyKey && !counterpartyKey.includes("suspense"));
   const identityInsufficient = !hasUsableReference && !hasUsableCounterparty;
   let candidates;
   if (hasUsableReference) {
-    // An exact usable bank reference is independent transaction identity. Party
-    // mismatch must not hide a voucher when the selected ledger was wrong.
-    candidates = baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber));
+    // A bank reference can reveal a duplicate posted on the wrong date. Search
+    // the bounded financial-year identity export as well as same-date rows, but
+    // still require bank ledger, amount and accounting direction.
+    candidates = vouchers.flatMap((voucher, index) => {
+      if (reservedVoucherIndexes.has(index) || !voucherHasExactReference(voucher, referenceNumber)) return [];
+      const bankEntry = getBankLedgerEntry(
+        voucher,
+        bankLedgerName,
+        Number(transaction.amount || 0),
+        transaction.expectedDirection
+      );
+      return bankEntry ? [{ voucher, index, bankEntry }] : [];
+    });
   } else if (hasUsableCounterparty) {
     // Without a bank reference, the exact selected counterparty is mandatory.
     // Same-date and same-amount vouchers belonging to another ledger are not a
@@ -3180,14 +3329,10 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       reservedVoucherIndexes,
       vouchersByDate
     );
-    // An exact bank reference is expected to identify one economic transaction.
-    // If Tally contains that same strict reference more than once, the statement
-    // row is unquestionably already posted; the extra vouchers are a Tally data
-    // quality issue, not a reason to post the bank row again.
     const duplicateInTally = hasUsableReference && candidates.length > 1;
     const verificationStatus = identityInsufficient && candidates.length > 0
       ? "ambiguous"
-      : candidates.length === 1 || duplicateInTally
+      : candidates.length === 1
       ? "found"
       : candidates.length > 1
         ? "ambiguous"
@@ -4163,43 +4308,100 @@ async function fetchBankReconciliationVouchers(
 ) {
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   const startedAt = Date.now();
+  const strongReferences = Array.from(new Set(
+    (transactions || [])
+      .map((transaction) => String(transaction.referenceNumber || "").trim())
+      .filter(isStrongBankReference)
+  ));
+  const needsSameDateScan = (transactions || []).some(
+    (transaction) => !isStrongBankReference(transaction.referenceNumber)
+  );
   // Secondary collection: gather this bank's vouchers directly, instead of
   // gathering all company vouchers and applying FilterCount afterwards.
   // Fetch bank-allocation references with the primary export
   // so a missing top-level Reference does not trigger another serial Tally
   // request for the same vouchers.
-  const leanXml = await exportCollection(tallyUrl, {
-    collectionName: "Gajkesari Bank Statement Reconciliation",
-    tallyType: "Vouchers : Ledger",
-    childOf: tallyFormulaString(bankLedgerName),
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
-    companyName,
-    dateFrom,
-    dateTo,
-    timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
-    maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
-  });
+  const leanXml = needsSameDateScan
+    ? await exportCollection(tallyUrl, {
+        collectionName: "Gajkesari Bank Statement Reconciliation",
+        tallyType: "Vouchers : Ledger",
+        childOf: tallyFormulaString(bankLedgerName),
+        fetchFields:
+          "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+        companyName,
+        dateFrom,
+        dateTo,
+        timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+        maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+      })
+    : "<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>";
   const leanCompletedAt = Date.now();
   if (!/<\/ENVELOPE\s*>/i.test(leanXml) ||
       !/<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(leanXml)) {
     throw new Error("Tally did not return a complete bank voucher collection. Duplicate checking could not be completed.");
   }
-  const vouchers = parseVoucherCollection(leanXml).filter(
+  const sameDateVouchers = parseVoucherCollection(leanXml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
   );
+  let crossDateVouchers = [];
+  let crossDateExportMs = 0;
+  const financialYear = financialYearBounds(dateFrom);
+  if (strongReferences.length > 0 && financialYear) {
+    const crossDateStartedAt = Date.now();
+    const filterName = "GajkesariBankReferenceIdentity";
+    const referenceFormula = strongReferences
+      .map((reference) => `($$IsEqual:$Reference:${tallyFormulaString(reference)})`)
+      .join(" OR ");
+    const crossDateXml = await exportCollection(tallyUrl, {
+      collectionName: "Gajkesari Bank Reference Identity",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(bankLedgerName),
+      fetchFields:
+        "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+      companyName,
+      dateFrom: financialYear.dateFrom,
+      dateTo: financialYear.dateTo,
+      formulae: [{ name: filterName, formula: referenceFormula }],
+      filterNames: [filterName],
+      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+    });
+    if (!/<\/ENVELOPE\s*>/i.test(crossDateXml)) {
+      throw new Error("Tally did not return a complete financial-year duplicate lookup.");
+    }
+    crossDateVouchers = parseVoucherCollection(crossDateXml).filter(
+      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+    );
+    crossDateExportMs = Date.now() - crossDateStartedAt;
+  }
+  const voucherByIdentity = new Map();
+  for (const voucher of [...sameDateVouchers, ...crossDateVouchers]) {
+    const key = [
+      voucher.masterId || "",
+      voucher.voucherNumber || "",
+      normalizeDateForCompare(voucher.effectiveDate || voucher.date) || "",
+      voucher.reference || "",
+    ].join("|");
+    if (!voucherByIdentity.has(key)) voucherByIdentity.set(key, voucher);
+  }
+  const vouchers = Array.from(voucherByIdentity.values());
 
   return {
     vouchers,
     diagnostics: {
       leanExportMs: leanCompletedAt - startedAt,
       referenceExportMs: 0,
+      crossDateExportMs,
       totalMs: Date.now() - startedAt,
       scannedVoucherCount: vouchers.length,
       detailedVoucherCount: 0,
       detailBatchCount: 0,
       primaryIncludesBankReferences: true,
-      queryMode: "bank_ledger_child_of",
+      queryMode: strongReferences.length > 0
+        ? needsSameDateScan
+          ? "bank_ledger_plus_financial_year_reference"
+          : "financial_year_reference"
+        : "bank_ledger_child_of",
     },
   };
 }

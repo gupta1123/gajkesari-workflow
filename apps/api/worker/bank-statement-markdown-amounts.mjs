@@ -16,6 +16,26 @@ function normalizedReference(value) {
   return cleanMarkdownCell(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
+function normalizedNarration(value) {
+  return cleanMarkdownCell(value).toUpperCase().replace(/[^A-Z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function normalizedDate(value) {
+  const text = cleanMarkdownCell(value);
+  let match = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  let year; let month; let day;
+  if (match) [, year, month, day] = match;
+  else {
+    match = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
+    if (!match) return null;
+    [, day, month, year] = match;
+    if (year.length === 2) year = `20${year}`;
+  }
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  if (date.getUTCFullYear() !== Number(year) || date.getUTCMonth() !== Number(month) - 1 || date.getUTCDate() !== Number(day)) return null;
+  return date.toISOString().slice(0, 10);
+}
+
 function markdownCells(line) {
   const text = String(line ?? "").trim();
   if (!text.includes("|")) return null;
@@ -83,25 +103,39 @@ export function extractBankStatementMarkdownAmounts(markdown, { includeSourceDet
     const creditIndex = columnIndex(headers, [/^cr amount$/, /\bcredit\b/, /deposit/, /paid in/]);
     const balanceIndex = columnIndex(headers, [/\bbalance\b/]);
     const dateIndex = columnIndex(headers, [/^transaction date$/, /^txn date$/, /^date$/, /^posting date$/]);
-    if (referenceIndex < 0 || balanceIndex < 0 || (debitIndex < 0 && creditIndex < 0)) continue;
+    const narrationIndex = columnIndex(headers, [
+      /^description$/,
+      /^transaction description$/,
+      /^particulars?$/,
+      /^narration$/,
+      /^details?$/,
+      /^remarks?$/,
+    ]);
+    // Parsing amounts is useful even for layouts that expose only a stable
+    // reference. Source-coverage verification applies the stricter
+    // date+narration requirements before any extracted statement can post.
+    if ((dateIndex < 0 && referenceIndex < 0) || (debitIndex < 0 && creditIndex < 0)) continue;
 
     for (let rowIndex = lineIndex + 2; rowIndex < lines.length; rowIndex += 1) {
       const cells = markdownCells(lines[rowIndex]);
       if (!cells || isSeparatorRow(cells)) break;
       if (cells.length < headerCells.length) break;
-      const reference = normalizedReference(cells[referenceIndex]);
-      if (!reference && !includeSourceDetails) continue;
+      const reference = referenceIndex >= 0 ? normalizedReference(cells[referenceIndex]) : "";
+      const sourceDate = dateIndex >= 0 ? cells[dateIndex] : null;
+      const sourceNarration = narrationIndex >= 0 ? cells[narrationIndex] : null;
+      if (!reference && !(sourceDate && sourceNarration)) continue;
       const debitAmount = debitIndex >= 0 ? parseBankStatementMoney(cells[debitIndex]) : null;
       const creditAmount = creditIndex >= 0 ? parseBankStatementMoney(cells[creditIndex]) : null;
-      const balanceAmount = parseBankStatementMoney(cells[balanceIndex]);
+      const balanceAmount = balanceIndex >= 0 ? parseBankStatementMoney(cells[balanceIndex]) : null;
       if (balanceAmount === null && debitAmount === null && creditAmount === null) continue;
       rows.push({
         reference,
+        sourceDate,
+        narration: sourceNarration,
         debitAmount: debitAmount === null ? null : Math.abs(debitAmount),
         creditAmount: creditAmount === null ? null : Math.abs(creditAmount),
         balanceAmount,
         ...(includeSourceDetails ? {
-          sourceDate: dateIndex >= 0 ? cells[dateIndex] : null,
           sourceLine: lines[rowIndex],
           sourceHeader: `${lines[lineIndex]}\n${lines[lineIndex + 1]}`,
         } : {}),
@@ -133,10 +167,16 @@ export function reconcileBankStatementMarkdownAmounts(parsed, markdown, physical
   const transactions = parsedTransactions.map((transaction, transactionIndex) => {
     const reference = normalizedReference(transaction.reference_number);
     const candidates = rowsByReference.get(reference) ?? [];
+    const identityCandidates = deterministic.rows.filter((row) =>
+      normalizedDate(row.sourceDate) === normalizedDate(transaction.transaction_date) &&
+      normalizedNarration(row.narration) === normalizedNarration(transaction.description)
+    );
     const source = matchByOrder
       ? deterministic.rows[transactionIndex]
       : reference && candidates.length === 1
         ? candidates[0]
+        : identityCandidates.length === 1
+          ? identityCandidates[0]
         : null;
     if (!source) return transaction;
     const hasOneAmount = Number(source.debitAmount > 0) + Number(source.creditAmount > 0) === 1;

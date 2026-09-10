@@ -245,14 +245,14 @@ export function parseDate(value: unknown) {
   const iso = raw.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
   if (iso) {
     const [, year, month, day] = iso;
-    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+    return validCalendarDate(year, month, day);
   }
 
   const indian = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
   if (indian) {
     const [, day, month, yearRaw] = indian;
     const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
-    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+    return validCalendarDate(year, month, day);
   }
 
   const monthName = raw.match(/^(\d{1,2})[\s-]+([a-zA-Z]{3,9})[\s,-]+(\d{2,4})/);
@@ -274,13 +274,23 @@ export function parseDate(value: unknown) {
     ].findIndex((month) => monthRaw.toLowerCase().startsWith(month));
     if (monthIndex >= 0) {
       const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
-      return `${year}-${String(monthIndex + 1).padStart(2, "0")}-${day.padStart(2, "0")}`;
+      return validCalendarDate(year, monthIndex + 1, day);
     }
   }
 
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+}
+
+function validCalendarDate(yearValue: unknown, monthValue: unknown, dayValue: unknown) {
+  const year = Number(yearValue);
+  const month = Number(monthValue);
+  const day = Number(dayValue);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
 function textCell(value: unknown) {
@@ -1511,16 +1521,18 @@ export function serializeAccount(row: BankAccountRow) {
 export async function findBankAccountCandidates(
   supabase: SupabaseClient,
   ownerUserId: string,
-  account: BankAccountInput
+  account: BankAccountInput,
+  companyDatasetId?: string | null
 ) {
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
   if (normalizedAccountNumber) {
-    const { data, error } = await supabase
+    let query = supabase
       .from("bank_accounts")
       .select("*")
       .eq("owner_user_id", ownerUserId)
-      .eq("account_number_normalized", normalizedAccountNumber)
-      .limit(5);
+      .eq("account_number_normalized", normalizedAccountNumber);
+    if (companyDatasetId) query = query.eq("company_dataset_id", companyDatasetId);
+    const { data, error } = await query.limit(5);
     if (error) throw error;
     if ((data ?? []).length > 0) return data as BankAccountRow[];
   }
@@ -1528,12 +1540,13 @@ export async function findBankAccountCandidates(
   const normalizedHolder = normalizeName(account.accountHolderName);
   if (!normalizedHolder) return [];
 
-  const { data, error } = await supabase
+  let holderQuery = supabase
     .from("bank_accounts")
     .select("*")
     .eq("owner_user_id", ownerUserId)
-    .ilike("account_holder_name", `%${normalizedHolder.split(" ").join("%")}%`)
-    .limit(10);
+    .ilike("account_holder_name", `%${normalizedHolder.split(" ").join("%")}%`);
+  if (companyDatasetId) holderQuery = holderQuery.eq("company_dataset_id", companyDatasetId);
+  const { data, error } = await holderQuery.limit(10);
 
   if (error) throw error;
   return (data ?? []) as BankAccountRow[];

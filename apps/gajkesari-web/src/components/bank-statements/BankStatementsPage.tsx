@@ -6159,12 +6159,10 @@ export function BankStatementsPage() {
         draft.allocations.some((allocation) => allocation.referenceType === "Agst Ref")
       );
     });
-    // The match action has just fetched these exact live bills. Reuse that
-    // result briefly so an immediate Post click does not make the user wait for
-    // the same Tally export twice. Older reviews still get the full revalidation.
-    const liveBillCheckIsFresh =
-      tallyCheckAttempted && Date.now() - lastLiveTallyCheckAtRef.current < 120_000;
-    if (billEligibleTransactions.length > 0 && !liveBillCheckIsFresh) {
+    // Open bills are financial authorization, not display cache. Re-read them
+    // immediately before queueing so a receipt or allocation entered directly
+    // in Tally cannot make a two-minute-old draft over-allocate a bill.
+    if (billEligibleTransactions.length > 0) {
       try {
         const ledgerNames = Array.from(new Set(
           billEligibleTransactions.map((transaction) => transaction.selectedLedgerName)

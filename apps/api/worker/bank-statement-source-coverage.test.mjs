@@ -14,7 +14,7 @@ const markdown=`|Transaction Date|Description|Reference No.|Debit Amount|Credit 
 const source=extractBankStatementMarkdownAmounts(markdown,{includeSourceDetails:true}).rows;
 const tx=row=>({reference_number:row.reference,transaction_date:sourceDate(row.sourceDate),
   debit_amount:row.debitAmount,credit_amount:row.creditAmount,balance_amount:row.balanceAmount,
-  description:'Source narration',category:row.debitAmount?'payment':'receipt'});
+  description:row.narration,category:row.debitAmount?'payment':'receipt'});
 const all=source.map(tx);
 const recover=async text=>({transactions:extractBankStatementMarkdownAmounts(text,{includeSourceDetails:true}).rows.map(tx)});
 
@@ -55,6 +55,9 @@ test('wrong date, fabricated extra or missing balance cannot pass',()=>{
   for(const bad of [{...all[1],transaction_date:'2026-09-04'},{...all[1],reference_number:'fake'},{...all[1],balance_amount:null}])
     assert.equal(auditSourceCoverage([all[0],bad,all[2]],source).complete,false);
 });
+test('wrong narration cannot pass even when every financial cell matches',()=>{
+  assert.equal(auditSourceCoverage([all[0],{...all[1],description:'Completely different party'},all[2]],source).complete,false);
+});
 test('failed, incomplete and excessive recovery stay blocked and retain original preview',async()=>{
   for(const callback of [async()=>{throw Error('Provider failure');},async()=>({transactions:[]}),async()=>({transactions:all})]) {
     const parsed={transactions:[all[0],all[2]]};
@@ -64,10 +67,10 @@ test('failed, incomplete and excessive recovery stay blocked and retain original
   const result=await recoverSourceCoverage({parsed:{transactions:[]},sourceRows:source,maxRecoveryRows:2,recover});
   assert.equal(result.diagnostics.recoveryCalls,0);
 });
-test('unsupported source dates and blank references require the fallback path',()=>{
+test('invalid dates require fallback while blank references can use date and narration identity',()=>{
   assert.equal(sourceDate('31-Feb-2026'),null);
   assert.equal(auditSourceCoverage(all,[{...source[0],sourceDate:null}]).supported,false);
-  assert.equal(auditSourceCoverage(all,[{...source[0],reference:''}]).supported,false);
+  assert.equal(auditSourceCoverage([{...all[0],reference_number:null}],[{...source[0],reference:''}]).supported,true);
 });
 test('null balance cannot stand in for zero and excess invalid duplicates are not dropped',async()=>{
   const zero={...source[0],balanceAmount:0};

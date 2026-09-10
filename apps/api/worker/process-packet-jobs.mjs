@@ -22,7 +22,7 @@ import {
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
 import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
-import { auditSourceCoverage, recoverSourceCoverage } from "./bank-statement-source-coverage.mjs";
+import { auditSourceCoverage, recoverSourceCoverage, sourceDate } from "./bank-statement-source-coverage.mjs";
 import { readBankStatementPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
   addBankStatementPageProvenance,
@@ -87,6 +87,7 @@ const BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION = Number(
   process.env.BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200
 );
 const BANK_STATEMENT_BUCKET = "bank-statement-files";
+const BANK_STATEMENT_EXTRACTION_VERSION = 2;
 const BANK_STATEMENT_PAGE_MANIFEST_INSTRUCTION =
   " Every transaction must include sourcePage with the visible PDF page number. Also return pageResults with exactly one entry for every supplied page: pageNumber, status (transactions or no_transactions), and transactionCount. Never omit a supplied page from pageResults.";
 const BANK_STATEMENT_SIGNED_BALANCE_INSTRUCTION =
@@ -357,6 +358,9 @@ function formatBankStatementTextForAi(pages) {
 function estimateVisibleTransactionRows(page) {
   const text = String(typeof page === "string" ? page : page?.text || "");
   return text.split(/\r?\n/).filter((line) => {
+    if (/\b(?:opening|closing)\s+balance\b|\bbalance\s+(?:brought|carried)\s+forward\b|\bpage\s+total\b|\btotal\s+(?:debits?|credits?)\b/i.test(line)) {
+      return false;
+    }
     const hasDate =
       /\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b/.test(line) ||
       /\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b/.test(line) ||
@@ -372,17 +376,27 @@ function parseDate(value) {
   const iso = raw.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
   if (iso) {
     const [, year, month, day] = iso;
-    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+    return validCalendarDate(year, month, day);
   }
   const indian = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
   if (indian) {
     const [, day, month, yearRaw] = indian;
     const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
-    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+    return validCalendarDate(year, month, day);
   }
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+}
+
+function validCalendarDate(yearValue, monthValue, dayValue) {
+  const year = Number(yearValue);
+  const month = Number(monthValue);
+  const day = Number(dayValue);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
 function parseAmount(value) {
@@ -734,7 +748,14 @@ function normalizeAiTransaction(value, rowNumber) {
   const balanceAmount = parseAmount(row.balanceAmount ?? row.balance ?? row.runningBalance ?? row.closingBalance);
   const hasDebit = typeof debitAmount === "number" && debitAmount > 0;
   const hasCredit = typeof creditAmount === "number" && creditAmount > 0;
-  if (hasDebit === hasCredit) return null;
+  // Retain ambiguous amount rows so source/balance recovery can repair them or
+  // the review can block them explicitly. Silently dropping the row makes an
+  // incomplete statement look complete.
+  const amountValidationIssue = hasDebit === hasCredit
+    ? hasDebit
+      ? "both_debit_and_credit"
+      : "missing_debit_and_credit"
+    : null;
   const transactionType = detectTransactionType(description);
   const category = detectCategory(description, debitAmount, creditAmount);
   const counterpartyName = extractCounterpartyName(description);
@@ -749,7 +770,7 @@ function normalizeAiTransaction(value, rowNumber) {
     credit_amount: creditAmount,
     balance_amount: balanceAmount,
     transaction_type: transactionType,
-    category,
+    category: amountValidationIssue ? "unknown" : category,
     counterparty_name: counterpartyName,
     suggested_ledger_name: textCell(row.suggestedLedgerName) || null,
     suggestion_confidence:
@@ -760,7 +781,12 @@ function normalizeAiTransaction(value, rowNumber) {
     confirmed_ledger_name: textCell(row.confirmedLedgerName) || null,
     additional_charges: transactionType === "bank_charge" ? [{ type: "bank_charge", amount: debitAmount }] : [],
     confidence: 0.9,
-    raw_payload: { rowNumber, source: "openrouter_bank_statement_v1", row },
+    raw_payload: {
+      rowNumber,
+      source: "openrouter_bank_statement_v1",
+      row,
+      ...(amountValidationIssue ? { amountValidationIssue } : {}),
+    },
   };
 }
 
@@ -1712,16 +1738,29 @@ async function extractBankStatementAdaptive({
         // Central Bank tables commonly have an empty cheque/reference column.
         // In both layouts the physical amount columns are authoritative.
         let physicalColumns=null;
-        const hasSupportedPhysicalLayout =
+        const hasStrictPhysicalLayout =
           (/Txn No\.?/i.test(anydocResult.markdownText) && /Dr Amount/i.test(anydocResult.markdownText) && /Cr Amount/i.test(anydocResult.markdownText)) ||
           (/Post Date/i.test(anydocResult.markdownText) && /Transaction Description/i.test(anydocResult.markdownText) && /\bDebit\b/i.test(anydocResult.markdownText) && /\bCredit\b/i.test(anydocResult.markdownText));
-        if (hasSupportedPhysicalLayout) {
-          physicalColumns=await readBankStatementPhysicalColumns(bytes,PDFJS_WORKER_SRC,BANK_STATEMENT_MAX_TOTAL_PAGES);
+        const hasGenericPhysicalLayout =
+          (/(?:Post(?:ing)?|Transaction|Txn)?\s*Date/i.test(anydocResult.markdownText) &&
+            /(?:Transaction Description|Description|Particulars?|Narration|Details?)/i.test(anydocResult.markdownText) &&
+            /(?:\bDebit\b|Dr Amount|Withdrawal|Paid Out)/i.test(anydocResult.markdownText) &&
+            /(?:\bCredit\b|Cr Amount|Deposit|Paid In)/i.test(anydocResult.markdownText));
+        if (hasStrictPhysicalLayout || hasGenericPhysicalLayout) {
+          const physicalCandidate=await readBankStatementPhysicalColumns(bytes,PDFJS_WORKER_SRC,BANK_STATEMENT_MAX_TOTAL_PAGES);
+          if (!physicalCandidate.detected && hasStrictPhysicalLayout) {
+            throw new Error('Known bank statement physical columns could not be read; use PDF recovery.');
+          }
+          if (physicalCandidate.detected) physicalColumns=physicalCandidate;
+        }
+        if (physicalColumns) {
           const references=parsed.transactions.map(row=>String(row.reference_number||'').replace(/[^a-z0-9]/gi,'').toUpperCase());
-          const referenceCoverageValid = physicalColumns.matchByOrder ||
-            (new Set(references).size===references.length && physicalColumns.rows.every(row=>references.includes(row.reference)));
-          if(!physicalColumns.detected||physicalColumns.rows.length!==references.length||!referenceCoverageValid) {
-            throw new Error(`${physicalColumns.layout === 'central_bank' ? 'Central Bank' : 'PNB'} physical transaction coverage could not be verified; use PDF recovery.`);
+          const referenceCoverageValid = physicalColumns.layout !== 'pnb'
+            ? physicalColumns.rows.every(row=>sourceDate(row.sourceDate) && String(row.narration||'').trim())
+            : physicalColumns.matchByOrder ||
+              (new Set(references).size===references.length && physicalColumns.rows.every(row=>references.includes(row.reference)));
+          if(physicalColumns.rows.length!==references.length||!referenceCoverageValid) {
+            throw new Error(`${physicalColumns.layout === 'pnb' ? 'PNB' : 'Bank statement'} physical transaction coverage could not be verified; use PDF recovery.`);
           }
           diagnostics.anydoc.physicalColumns = {
             layout: physicalColumns.layout,
@@ -1732,6 +1771,23 @@ async function extractBankStatementAdaptive({
         parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
         diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
         let coverageComplete = Boolean(physicalColumns);
+        if (physicalColumns && physicalColumns.layout !== 'pnb') {
+          const physicalCoverage = auditSourceCoverage(parsed.transactions, physicalColumns.rows);
+          diagnostics.anydoc.sourceCoverage = {
+            sourceRowCount: physicalColumns.rows.length,
+            extractedRowCount: parsed.transactions.length,
+            missingRowCount: physicalCoverage.missing.length,
+            unexpectedRowCount: physicalCoverage.unexpected.length,
+            complete: physicalCoverage.complete,
+            supported: physicalCoverage.supported,
+          };
+          if (!physicalCoverage.complete) {
+            throw new Error('Physical transaction coverage could not be verified; review is required.');
+          }
+          parsed.transactions = physicalCoverage.matched.map(
+            match => parsed.transactions[match.transactionIndex]
+          );
+        }
         if (!physicalColumns) {
           const source = extractBankStatementMarkdownAmounts(anydocResult.markdownText, { includeSourceDetails: true });
           const recovered = await recoverSourceCoverage({
@@ -1746,9 +1802,25 @@ async function extractBankStatementAdaptive({
           // Unsupported layouts use the existing page-by-page extraction path;
           // a non-empty AI response is not evidence of complete coverage.
           if (!recovered.diagnostics.supported) throw new Error("Markdown source coverage is unavailable; use page recovery.");
-          if (!recovered.diagnostics.complete) throw new Error("Markdown extraction is incomplete; use PDF page recovery.");
           parsed = recovered.parsed;
           coverageComplete = recovered.diagnostics.complete;
+          if (!coverageComplete) {
+            parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+            parsed.transactions = addBankStatementPageProvenance(parsed.transactions, {
+              startPage: 1,
+              endPage: Math.max(1, Number(diagnostics.pageCount || 1)),
+              method: "anydoc_markdown_v1",
+            });
+            extractionSource = nextExtractionSource;
+            diagnostics.pipeline = nextExtractionSource;
+            diagnostics.coverageComplete = false;
+            return {
+              parsed,
+              extractionSource,
+              extractionError: "Statement transaction coverage could not be verified after targeted recovery.",
+              diagnostics,
+            };
+          }
         }
         parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
         diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
@@ -2318,7 +2390,7 @@ async function runBankStatementJob(job) {
   extractionDiagnostics.extractionMs = Date.now() - workerStartedAt;
   const balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
   extractionDiagnostics.balanceValidation = balanceValidation;
-  if (!balanceValidation.valid) {
+  if (balanceValidation.status === "failed") {
     extractionDiagnostics.coverageComplete = false;
     const balancePages = balanceValidation.breaks
       .map((entry) => entry.page)
@@ -2350,6 +2422,7 @@ async function runBankStatementJob(job) {
         .from("bank_accounts")
         .select("id")
         .eq("owner_user_id", job.owner_user_id)
+        .eq("company_dataset_id", importRow.company_dataset_id)
         .eq("account_number_normalized", normalizedAccountNumber)
         .limit(5)
     : { data: [], error: null };
@@ -2447,6 +2520,7 @@ async function runBankStatementJob(job) {
       status: finalStatus,
       processing_meta: {
         ...processingMeta,
+        extractionVersion: BANK_STATEMENT_EXTRACTION_VERSION,
         parser: extractionSource === "anydoc_markdown_v1" ? "anydoc_markdown_v1" : "openrouter_bank_statement_v1",
         extractionSource,
         jobStatus: "completed",

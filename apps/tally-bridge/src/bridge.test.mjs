@@ -611,7 +611,7 @@ test("strict bank presence marks same-date amount evidence insufficient for Susp
   assert.equal(result.identityInsufficient, true);
 });
 
-test("statement reconciliation uses one complete export when top-level references match", async () => {
+test("statement reconciliation uses one bounded financial-year export when strong references match", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -642,11 +642,13 @@ test("statement reconciliation uses one complete export when top-level reference
   assert.match(calls[0].fetchFields, /BankAllocations/);
   assert.equal(calls[0].tallyType, "Vouchers : Ledger");
   assert.equal(calls[0].childOf, '"ICICI Current Account"');
-  assert.equal(calls[0].dateFrom, "2026-08-01");
-  assert.equal(calls[0].dateTo, "2026-08-01");
-  assert.equal(calls[0].formulae, undefined);
+  assert.equal(calls[0].dateFrom, "2026-04-01");
+  assert.equal(calls[0].dateTo, "2027-03-31");
+  assert.equal(calls[0].formulae.length, 1);
+  assert.match(calls[0].formulae[0].formula, /UTR-123456/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
+  assert.equal(outcome.result.queryDiagnostics.queryMode, "financial_year_reference");
 });
 
 test("statement reconciliation reads bank allocations from the primary export", async () => {

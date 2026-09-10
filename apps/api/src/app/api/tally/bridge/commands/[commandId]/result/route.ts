@@ -201,6 +201,60 @@ export async function POST(
 
     const command = commandData as unknown as TallyBridgeCommandRow;
 
+    if (command.command_type === "post_bank_voucher") {
+      const transactionId = toNullableText(commandPayload.transactionId, 80);
+      const duplicateCheck = result.duplicateCheck && typeof result.duplicateCheck === "object"
+        ? result.duplicateCheck as Record<string, unknown>
+        : {};
+      const verificationStatus =
+        toNullableText(result.verificationStatus, 80) ??
+        toNullableText(duplicateCheck.verificationStatus, 80);
+      const verified = success && ["verified", "found", "matched"].includes(verificationStatus ?? "");
+      const reconciliationRequired = Boolean(
+        result.reconciliationRequired ||
+        result.possibleDuplicateInTally ||
+        result.voucherCreatedButVerificationFailed ||
+        (success && !verified)
+      );
+      const nextStatus = verified
+        ? "verified"
+        : reconciliationRequired
+          ? "needs_tally_review"
+          : "failed";
+      const voucherId =
+        toNullableText(result.voucherId, 500) ??
+        toNullableText(duplicateCheck.voucherId, 500) ??
+        toNullableText(result.lastVchId, 500);
+
+      if (transactionId) {
+        const { error: transactionUpdateError } = await supabase
+          .from("bank_transactions")
+          .update({
+            tally_status: nextStatus,
+            tally_posted_at: verified ? now : null,
+            tally_voucher_id: verified ? voucherId : null,
+          })
+          .eq("id", transactionId)
+          .eq("owner_user_id", connection.owner_user_id)
+          .eq("company_dataset_id", command.company_dataset_id);
+        if (transactionUpdateError) throw transactionUpdateError;
+      }
+
+      const { error: postingLogUpdateError } = await supabase
+        .from("bank_transaction_posting_log")
+        .update({
+          status: nextStatus,
+          result,
+          error: verified ? null : errorMessage ?? "Tally voucher read-back was not verified.",
+          tally_posted_at: verified ? now : null,
+          tally_voucher_id: verified ? voucherId : null,
+        })
+        .eq("command_id", commandId)
+        .eq("owner_user_id", connection.owner_user_id)
+        .eq("company_dataset_id", command.company_dataset_id);
+      if (postingLogUpdateError) throw postingLogUpdateError;
+    }
+
     if (success && command.command_type === "alter_ledger") {
       const masterKey = toNullableText(commandPayload.masterKey, 500);
       const newName = toNullableText(commandPayload.newName, 500);
