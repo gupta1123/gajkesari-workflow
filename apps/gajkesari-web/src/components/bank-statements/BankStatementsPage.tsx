@@ -4243,16 +4243,38 @@ export function BankStatementsPage() {
     }
 
     const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
+    const liveCompanyName = selectedCompanyName || connectionCompany?.companyName || "";
+    // Bank-statement matching runs in the backend worker. Bootstrap the shared
+    // company catalogue once when this exact dataset has no persisted ledgers;
+    // subsequent analyses keep the fast live read without rewriting 12k rows.
+    let persistSnapshot = false;
+    try {
+      const storedResponse = await apiFetch(
+        `/api/tally/connections/${encodeURIComponent(connectionId)}/masters?type=ledger&limit=1&companyName=${encodeURIComponent(liveCompanyName)}`,
+        { cache: "no-store" }
+      );
+      if (storedResponse.ok) {
+        const storedPayload = (await storedResponse.json()) as { masterCount?: number };
+        persistSnapshot = Number(storedPayload.masterCount ?? 0) === 0;
+      } else {
+        persistSnapshot = true;
+      }
+    } catch {
+      // Prefer a one-time persistence attempt over completing extraction with
+      // no catalogue and silently losing every ledger recommendation.
+      persistSnapshot = true;
+    }
     const payload = await runCashDiscountLiveRequest<{
       ledgers?: TallyMaster[];
       groups?: TallyMaster[];
     }>({
       connectionId,
-      companyName: selectedCompanyName || connectionCompany?.companyName || "",
+      companyName: liveCompanyName,
       operation: "ledger_masters",
       payload: {
         requestedMasterTypes: ["ledger", "group"],
         fieldProfile: "bank_statement",
+        persistSnapshot,
       },
     });
     const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);

@@ -217,7 +217,7 @@ export async function POST(request: Request) {
       // incomplete result is not a cache entry: every deliberate re-upload
       // must get a fresh extraction attempt, even when the parser version did
       // not change.
-      if (["failed", "manual_review_required"].includes(effectiveStatus)) {
+      if (["failed", "manual_review_required", "ready_to_review"].includes(effectiveStatus)) {
         const now = new Date().toISOString();
         await supabase
           .from("bank_statement_import_preview_transactions")
