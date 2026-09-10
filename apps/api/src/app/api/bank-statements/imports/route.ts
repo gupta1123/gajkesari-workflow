@@ -212,12 +212,12 @@ export async function POST(request: Request) {
     if (existingImportError) throw existingImportError;
     if (existingImport) {
       const existingMeta = readRecord(existingImport.processing_meta);
-      const existingVersion = Number(existingMeta.extractionVersion ?? 0) || 0;
       const effectiveStatus = getEffectiveImportStatus(existingImport as Record<string, unknown>);
-      if (
-        existingVersion < BANK_STATEMENT_EXTRACTION_VERSION &&
-        ["failed", "manual_review_required"].includes(effectiveStatus)
-      ) {
+      // A duplicate successful statement is safe to reuse. A failed or
+      // incomplete result is not a cache entry: every deliberate re-upload
+      // must get a fresh extraction attempt, even when the parser version did
+      // not change.
+      if (["failed", "manual_review_required"].includes(effectiveStatus)) {
         const now = new Date().toISOString();
         await supabase
           .from("bank_statement_import_preview_transactions")
@@ -241,7 +241,7 @@ export async function POST(request: Request) {
                 ...readRecord(existingMeta.analysis),
                 status: "queued",
                 progress: 5,
-                stage: "Reanalysing with the updated extractor",
+                stage: "Reanalysing statement",
                 error: null,
                 startedAt: now,
                 updatedAt: now,
@@ -259,7 +259,7 @@ export async function POST(request: Request) {
           owner_user_id: user.id,
           status: "queued",
           progress: 5,
-          stage: "Reanalysing with the updated extractor",
+          stage: "Reanalysing statement",
           result: createBankStatementJobResult(),
         });
         if (retryJobError) throw retryJobError;
@@ -267,7 +267,7 @@ export async function POST(request: Request) {
           ...serializePreviewFromMeta(refreshedImport as Record<string, unknown>),
           duplicateUpload: true,
           reanalysisStarted: true,
-          message: "This statement is being reanalysed with the updated extractor.",
+          message: "The previous analysis was incomplete. This statement is being analysed again.",
         });
       }
       return jsonWithCors(request, {
