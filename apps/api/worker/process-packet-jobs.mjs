@@ -68,6 +68,10 @@ const BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT = Math.max(
   0,
   Number(process.env.BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT ?? 50)
 );
+// Temporarily disabled by product decision. AnyDoc/AI extraction continues,
+// and the independent running-balance validation still runs before posting.
+// Set this back to true to restore one-to-one source-row coverage verification.
+const BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED = false;
 const BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS = Number(process.env.BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS ?? 80_000);
 const BANK_STATEMENT_SINGLE_SHOT_MAX_INPUT_CHARS = Number(
   process.env.BANK_STATEMENT_SINGLE_SHOT_MAX_INPUT_CHARS ?? 36_000
@@ -1759,7 +1763,8 @@ async function extractBankStatementAdaptive({
             ? physicalColumns.rows.every(row=>sourceDate(row.sourceDate) && String(row.narration||'').trim())
             : physicalColumns.matchByOrder ||
               (new Set(references).size===references.length && physicalColumns.rows.every(row=>references.includes(row.reference)));
-          if(physicalColumns.rows.length!==references.length||!referenceCoverageValid) {
+          if(BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED &&
+            (physicalColumns.rows.length!==references.length||!referenceCoverageValid)) {
             throw new Error(`${physicalColumns.layout === 'pnb' ? 'PNB' : 'Bank statement'} physical transaction coverage could not be verified; use PDF recovery.`);
           }
           diagnostics.anydoc.physicalColumns = {
@@ -1771,7 +1776,7 @@ async function extractBankStatementAdaptive({
         parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
         diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
         let coverageComplete = Boolean(physicalColumns);
-        if (physicalColumns && physicalColumns.layout !== 'pnb') {
+        if (BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED && physicalColumns && physicalColumns.layout !== 'pnb') {
           const physicalCoverage = auditSourceCoverage(parsed.transactions, physicalColumns.rows);
           diagnostics.anydoc.sourceCoverage = {
             sourceRowCount: physicalColumns.rows.length,
@@ -1788,7 +1793,7 @@ async function extractBankStatementAdaptive({
             match => parsed.transactions[match.transactionIndex]
           );
         }
-        if (!physicalColumns) {
+        if (BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED && !physicalColumns) {
           const source = extractBankStatementMarkdownAmounts(anydocResult.markdownText, { includeSourceDetails: true });
           const recovered = await recoverSourceCoverage({
             parsed,
@@ -1821,6 +1826,16 @@ async function extractBankStatementAdaptive({
               diagnostics,
             };
           }
+        }
+        if (!BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED) {
+          coverageComplete = true;
+          diagnostics.anydoc.sourceCoverage = {
+            complete: true,
+            supported: false,
+            skipped: true,
+            reason: "source_coverage_verifier_disabled",
+            extractedRowCount: parsed.transactions.length,
+          };
         }
         parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
         diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);

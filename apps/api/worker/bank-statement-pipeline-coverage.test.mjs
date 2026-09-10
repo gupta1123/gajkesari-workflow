@@ -18,6 +18,7 @@ const tx=r=>({reference_number:r.reference,transaction_date:sourceDate(r.sourceD
 function setup(fail=false){
   const calls=[],stages=[];
   const scope={BANK_STATEMENT_BATCH_PAGE_SIZE:1,BANK_STATEMENT_BATCH_CONCURRENCY:4,BANK_STATEMENT_ANYDOC_ENABLED:true,
+    BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED:false,
     BANK_STATEMENT_MAX_TOTAL_PAGES:300,
     OPENROUTER_ANYDOC_MODEL:'fixture',OPENROUTER_ANYDOC_REASONING_TOKENS:0,OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS:1000,
     readBankStatementPdfPageCount:async()=>2,updateBankJob:async(_,s)=>stages.push(s.stage),
@@ -32,14 +33,16 @@ function setup(fail=false){
   };
   return {run:vm.runInNewContext(`(${code})`,scope),calls,stages};
 }
-test('actual adaptive Markdown path recovers before returning complete',async()=>{
+test('disabled source verifier accepts the AnyDoc extraction without recovery',async()=>{
   const s=setup();const r=await s.run({fileName:'test.pdf',isPdf:true,bytes:new Uint8Array(),jobId:'fixture'});
-  assert.equal(r.diagnostics.coverageComplete,true);assert.equal(r.parsed.transactions.length,2);
-  assert.equal(s.calls.length,2);assert.doesNotMatch(s.calls[1],/\|A\|/);
-  assert.ok(s.stages.includes('Recovering missing statement rows'));
+  assert.equal(r.diagnostics.coverageComplete,true);assert.equal(r.parsed.transactions.length,1);
+  assert.equal(s.calls.length,1);
+  assert.equal(r.diagnostics.anydoc.sourceCoverage.skipped,true);
+  assert.equal(r.diagnostics.anydoc.sourceCoverage.reason,'source_coverage_verifier_disabled');
+  assert.ok(!s.stages.includes('Recovering missing statement rows'));
 });
-test('failed targeted recovery returns an incomplete preview, not a whole-document retry',async()=>{
+test('disabled source verifier does not invoke targeted recovery',async()=>{
   const s=setup(true);const r=await s.run({fileName:'test.pdf',isPdf:true,bytes:new Uint8Array(),jobId:'fixture'});
-  assert.equal(r.diagnostics.coverageComplete,false);assert.equal(r.parsed.transactions.length,1);
-  assert.equal(s.calls.length,2);assert.match(r.extractionError,/coverage/);
+  assert.equal(r.diagnostics.coverageComplete,true);assert.equal(r.parsed.transactions.length,1);
+  assert.equal(s.calls.length,1);assert.equal(r.extractionError,null);
 });
