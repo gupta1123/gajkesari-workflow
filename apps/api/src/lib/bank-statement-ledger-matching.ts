@@ -53,8 +53,8 @@ type AiLedgerMatch = {
 type ValidatedAiLedgerMatch = Omit<BankLedgerSuggestion, "counterpartyName" | "mappingSource">;
 
 const BANK_LEDGER_AI_BATCH_SIZE = Math.min(
-  40,
-  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_SIZE ?? 40) || 40)
+  25,
+  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_SIZE ?? 10) || 10)
 );
 const BANK_LEDGER_AI_BATCH_CONCURRENCY = Math.min(
   10,
@@ -369,13 +369,6 @@ const BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION = Math.min(
   Math.max(10, Number(process.env.OPENROUTER_BANK_LEDGER_CANDIDATE_LIMIT ?? 40) || 40)
 );
 
-// Experimental mode: give the model the complete ledger catalogue (name/group
-// only) instead of locally generated candidates. Keep disabled unless it is
-// explicitly enabled so a large catalogue cannot unexpectedly exhaust context.
-const BANK_LEDGER_AI_FULL_CATALOGUE = /^(1|true|yes|on)$/i.test(
-  String(process.env.OPENROUTER_BANK_LEDGER_FULL_CATALOGUE ?? "false").trim()
-);
-
 const BANK_NARRATION_NOISE_TOKENS = new Set([
   "ach", "bank", "beneficiary", "by", "cash", "chq", "cr", "credit", "debit", "dr",
   "from", "ifsc", "imps", "nach", "neft", "nrtgs", "payment", "ref", "reference",
@@ -534,11 +527,9 @@ async function aiMatchLedgersForTransactions(input: {
 }) {
   if (input.transactions.length === 0) return [];
 
-  const allowedLedgersByIndex = BANK_LEDGER_AI_FULL_CATALOGUE
-    ? input.transactions.map(() => input.ledgers)
-    : input.transactions.map(({ transaction, counterpartyName }) =>
-        shortlistBankLedgersForTransaction(input.ledgers, transaction, counterpartyName)
-      );
+  const allowedLedgersByIndex = input.transactions.map(({ transaction, counterpartyName }) =>
+    shortlistBankLedgersForTransaction(input.ledgers, transaction, counterpartyName)
+  );
   const candidateLedgerByKey = new Map<string, TallyMasterRow>();
   for (const ledgers of allowedLedgersByIndex) {
     for (const ledger of ledgers) {
@@ -546,9 +537,7 @@ async function aiMatchLedgersForTransactions(input: {
       if (key && !candidateLedgerByKey.has(key)) candidateLedgerByKey.set(key, ledger);
     }
   }
-  const candidateLedgers = BANK_LEDGER_AI_FULL_CATALOGUE
-    ? input.ledgers
-    : Array.from(candidateLedgerByKey.values());
+  const candidateLedgers = Array.from(candidateLedgerByKey.values());
 
   const raw = await callOpenRouter(
     [
