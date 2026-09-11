@@ -2309,11 +2309,12 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       );
     }
 
+    const acknowledgementEntries = [];
     for (const command of pendingCommands) {
       const transactionId = String(command.payload?.transactionId || "");
       const postflight = postflightByTransactionId?.get(transactionId) || null;
       if (postflight?.verificationStatus === "found") {
-        await sendCommandResult(config, command, {
+        acknowledgementEntries.push({ command, outcome: {
           success: true,
           result: {
             created: 1,
@@ -2328,14 +2329,14 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             batchSize: pendingCommands.length,
             batchElapsedMs,
           },
-        });
+        }});
         continue;
       }
 
       // A successful import followed by a missing/failed read-back is uncertain,
       // never proof that it is safe to create the voucher again.
       if (batchOutcome.success || !postflight || postflight.verificationStatus !== "missing") {
-        await sendCommandResult(config, command, {
+        acknowledgementEntries.push({ command, outcome: {
           success: false,
           error: "The batch import outcome is uncertain. Read back Tally before retrying.",
           result: {
@@ -2345,7 +2346,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             uncertaintyReason: !postflight ? "readback_unavailable" : "readback_did_not_confirm_import",
             importSummary: batchOutcome.result || {},
           },
-        });
+        }});
         continue;
       }
       try {
@@ -2367,6 +2368,14 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
           }`
         );
       }
+    }
+
+    // The Tally import and postflight are already batch operations. Acknowledging
+    // each command one by one made a 50-row post spend roughly two minutes on
+    // avoidable API round trips. Keep per-command state, but report it in bounded
+    // concurrent groups so Supabase and the bridge remain protected.
+    if (acknowledgementEntries.length > 0) {
+      await sendCommandResults(config, acknowledgementEntries, 10);
     }
   }
 }

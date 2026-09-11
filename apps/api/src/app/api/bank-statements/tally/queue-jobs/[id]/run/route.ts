@@ -5,7 +5,7 @@ import { POST as runTallyQueue } from "../../../queue/route";
 
 const QUEUE_JOB_BATCH_SIZE = Math.max(
   1,
-  Math.min(10, Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 5))
+  Math.min(10, Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 10))
 );
 
 type QueueJobPayload = {
