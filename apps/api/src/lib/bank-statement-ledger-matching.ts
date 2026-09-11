@@ -57,8 +57,8 @@ const BANK_LEDGER_AI_BATCH_SIZE = Math.min(
   Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_SIZE ?? 10) || 10)
 );
 const BANK_LEDGER_AI_BATCH_CONCURRENCY = Math.min(
-  4,
-  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_CONCURRENCY ?? 4) || 4)
+  10,
+  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_CONCURRENCY ?? 10) || 10)
 );
 
 const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
