@@ -2,6 +2,14 @@ name: Build Gajkesari Tally Connector
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/tally-bridge/**"
+      - "installer/tally-bridge/**"
+      - "scripts/build-tally-connector-installer.mjs"
+      - ".github/workflows/build-tally-connector-installer.yml"
 
 permissions:
   contents: write
