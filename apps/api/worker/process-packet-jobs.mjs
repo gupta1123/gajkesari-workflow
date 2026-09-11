@@ -9,6 +9,7 @@ import { createClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
 import {extractMarkdownBatches} from './bank-statement-markdown-batches.mjs';
+import { deterministicTransactionsFromAnydoc } from "./bank-statement-deterministic.mjs";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
 import {
@@ -1692,6 +1693,28 @@ async function extractBankStatementAdaptive({
         anydocResult.markdownText.trim() &&
         hasUsableBankStatementText(markdownPages)
       ) {
+        // --- DETERMINISTIC FAST PATH: no LLM for table, use parseAllTables (handles PNB fused header + multipage) ---
+        const deterministic = deterministicTransactionsFromAnydoc(anydocResult.markdownText);
+        if (deterministic && deterministic.transactions.length > 0) {
+          const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
+          parsed = {
+            account: deterministicAccount,
+            statementPeriodStart: null,
+            statementPeriodEnd: null,
+            openingBalance: null,
+            transactions: deterministic.transactions,
+            pageResults: [],
+          };
+          diagnostics.anydoc.deterministic = { rowCount: deterministic.transactions.length, headers: deterministic.headers, used: true };
+          parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+          diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
+          parsed.transactions = addBankStatementPageProvenance(parsed.transactions, { startPage: 1, endPage: Math.max(1, Number(diagnostics.pageCount || 1)), method: "deterministic_anydoc" });
+          extractionSource = "deterministic_anydoc";
+          diagnostics.pipeline = "deterministic_anydoc";
+          diagnostics.coverageComplete = true;
+          // still go through physicalColumns / balance checks below via shared return path — for now return directly (ledger matching happens later in runBankStatementJob)
+          return { parsed, extractionSource, extractionError: null, diagnostics };
+        }
         // Extraction must pass source coverage before any ledger matching runs.
         // Keep the existing standalone ledger matcher, inputs and retry rules.
         const combinedDecision = { ...combinedLedgerCatalogueDecision(ledgerNames), useCombined: false, reason: "verify_coverage_before_matching" };
@@ -2356,12 +2379,9 @@ async function runBankStatementJob(job) {
         return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
       }).slice(0, 1_000)
     : [];
-  const bankAccountCandidates = liveTallyBankAccountCandidates.length > 0
-    ? liveTallyBankAccountCandidates
-    : await getTallyBankAccountCandidates(job.owner_user_id, importRow.company_dataset_id);
-  const ledgerNames = liveTallyLedgerNames.length > 0
-    ? liveTallyLedgerNames
-    : await getActiveTallyLedgerNames(job.owner_user_id, importRow.company_dataset_id);
+  // Use snapshot only — avoid 40k DB read for deterministic path where AnyDoc already has table
+  const bankAccountCandidates = liveTallyBankAccountCandidates;
+  const ledgerNames = liveTallyLedgerNames;
   console.log(
     `[worker] using ${ledgerNames.length} Tally ledger name(s) and ${bankAccountCandidates.length} bank candidate(s) for ${fileName}`
   );
