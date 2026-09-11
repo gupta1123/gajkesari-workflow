@@ -1697,23 +1697,35 @@ async function extractBankStatementAdaptive({
         const deterministic = deterministicTransactionsFromAnydoc(anydocResult.markdownText);
         if (deterministic && deterministic.transactions.length > 0) {
           const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
-          parsed = {
-            account: deterministicAccount,
-            statementPeriodStart: null,
-            statementPeriodEnd: null,
-            openingBalance: null,
-            transactions: deterministic.transactions,
-            pageResults: [],
+          const deterministicSource = extractBankStatementMarkdownAmounts(anydocResult.markdownText);
+          const deterministicBalance = validateRunningBalanceContinuity(
+            deterministic.transactions,
+            deterministicSource.openingBalance,
+          );
+          diagnostics.anydoc.deterministic = {
+            rowCount: deterministic.transactions.length,
+            headers: deterministic.headers,
+            normalized: true,
+            balanceValidation: deterministicBalance,
+            used: deterministicBalance.status !== "failed",
           };
-          diagnostics.anydoc.deterministic = { rowCount: deterministic.transactions.length, headers: deterministic.headers, used: true };
-          parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
-          diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
-          parsed.transactions = addBankStatementPageProvenance(parsed.transactions, { startPage: 1, endPage: Math.max(1, Number(diagnostics.pageCount || 1)), method: "deterministic_anydoc" });
-          extractionSource = "deterministic_anydoc";
-          diagnostics.pipeline = "deterministic_anydoc";
-          diagnostics.coverageComplete = true;
-          // still go through physicalColumns / balance checks below via shared return path — for now return directly (ledger matching happens later in runBankStatementJob)
-          return { parsed, extractionSource, extractionError: null, diagnostics };
+          if (deterministicBalance.status !== "failed") {
+            parsed = {
+              account: deterministicAccount,
+              statementPeriodStart: null,
+              statementPeriodEnd: null,
+              openingBalance: deterministicSource.openingBalance,
+              transactions: deterministic.transactions,
+              pageResults: [],
+            };
+            parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+            diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
+            parsed.transactions = addBankStatementPageProvenance(parsed.transactions, { startPage: 1, endPage: Math.max(1, Number(diagnostics.pageCount || 1)), method: "deterministic_anydoc" });
+            extractionSource = "deterministic_anydoc";
+            diagnostics.pipeline = "deterministic_anydoc";
+            diagnostics.coverageComplete = true;
+            return { parsed, extractionSource, extractionError: null, diagnostics };
+          }
         }
         // Extraction must pass source coverage before any ledger matching runs.
         // Keep the existing standalone ledger matcher, inputs and retry rules.
