@@ -373,7 +373,7 @@ const BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION = Math.min(
 // only) instead of locally generated candidates. Keep disabled unless it is
 // explicitly enabled so a large catalogue cannot unexpectedly exhaust context.
 const BANK_LEDGER_AI_FULL_CATALOGUE = /^(1|true|yes|on)$/i.test(
-  String(process.env.OPENROUTER_BANK_LEDGER_FULL_CATALOGUE ?? "true").trim()
+  String(process.env.OPENROUTER_BANK_LEDGER_FULL_CATALOGUE ?? "false").trim()
 );
 
 const BANK_NARRATION_NOISE_TOKENS = new Set([
