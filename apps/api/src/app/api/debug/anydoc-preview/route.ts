@@ -6,6 +6,18 @@ import path from "node:path";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+type AnyDocModule = {
+  toMarkdown: (inputPath: string) => Promise<string> | string;
+  [key: string]: unknown;
+};
+
+function errorMessage(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  if (!cause) return error.message;
+  return `${error.message} | cause: ${cause instanceof Error ? cause.message : String(cause)}`;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const form = await req.formData();
@@ -17,14 +29,17 @@ export async function POST(req: NextRequest) {
     const start = Date.now();
 
     // Use createRequire to bypass Next/Turbopack bundling of native .node
-    let anydoc: any = null;
+    let anydoc: AnyDocModule | null = null;
     let loadError: string | null = null;
     try {
       const { createRequire } = await import("node:module");
       const require = createRequire(import.meta.url);
-      anydoc = require("@firecrawl/anydoc");
+      const loaded: unknown = require("@firecrawl/anydoc");
+      if (loaded && typeof loaded === "object" && typeof (loaded as { toMarkdown?: unknown }).toMarkdown === "function") {
+        anydoc = loaded as AnyDocModule;
+      }
     } catch (e) {
-      loadError = e instanceof Error ? (e.message + (e.cause ? " | cause: " + String((e as any).cause?.message || (e as any).cause) : "")) : String(e);
+      loadError = errorMessage(e);
       try {
         const { createRequire: cr2 } = await import("node:module");
         const req2 = cr2(import.meta.url);
