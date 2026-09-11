@@ -2377,13 +2377,13 @@ async function runBankStatementJob(job) {
       .select("catalogue").eq("id", importRow.catalogue_snapshot_id)
       .eq("owner_user_id", job.owner_user_id).eq("company_dataset_id", importRow.company_dataset_id).single();
     if (snapshotError) throw snapshotError;
-    analysisContext.liveTallyLedgerNames = snapshot.catalogue.ledgerNames || [];
-    analysisContext.liveTallyBankAccountCandidates = snapshot.catalogue.bankAccountCandidates || [];
+    analysisContext.liveTallyLedgerNames = snapshot.catalogue?.ledgerNames || [];
+    analysisContext.liveTallyBankAccountCandidates = snapshot.catalogue?.bankAccountCandidates || [];
   }
-  const liveTallyLedgerNames = Array.isArray(analysisContext.liveTallyLedgerNames)
+  let liveTallyLedgerNames = Array.isArray(analysisContext.liveTallyLedgerNames)
     ? Array.from(new Set(analysisContext.liveTallyLedgerNames.map((name) => textCell(name)).filter(Boolean))).slice(0, 20_000)
     : [];
-  const liveTallyBankAccountCandidates = Array.isArray(analysisContext.liveTallyBankAccountCandidates)
+  let liveTallyBankAccountCandidates = Array.isArray(analysisContext.liveTallyBankAccountCandidates)
     ? analysisContext.liveTallyBankAccountCandidates.flatMap((candidate) => {
         if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
         const ledgerName = textCell(candidate.ledgerName);
@@ -2391,7 +2391,23 @@ async function runBankStatementJob(job) {
         return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
       }).slice(0, 1_000)
     : [];
-  // Use snapshot only — avoid 40k DB read for deterministic path where AnyDoc already has table
+  const needsLedgerFallback = liveTallyLedgerNames.length === 0;
+  const needsBankCandidateFallback = liveTallyBankAccountCandidates.length === 0;
+  if (needsLedgerFallback || needsBankCandidateFallback) {
+    const [datasetLedgers, datasetBankCandidates] = await Promise.all([
+      needsLedgerFallback
+        ? getActiveTallyLedgerNames(job.owner_user_id, importRow.company_dataset_id)
+        : Promise.resolve([]),
+      needsBankCandidateFallback
+        ? getTallyBankAccountCandidates(job.owner_user_id, importRow.company_dataset_id)
+        : Promise.resolve([]),
+    ]);
+    if (needsLedgerFallback) liveTallyLedgerNames = datasetLedgers;
+    if (needsBankCandidateFallback) liveTallyBankAccountCandidates = datasetBankCandidates;
+    console.log(
+      `[worker] lightweight catalogue snapshot fallback loaded ${datasetLedgers.length} ledger name(s) and ${datasetBankCandidates.length} bank candidate(s) for dataset ${importRow.company_dataset_id}`
+    );
+  }
   const bankAccountCandidates = liveTallyBankAccountCandidates;
   const ledgerNames = liveTallyLedgerNames;
   console.log(
