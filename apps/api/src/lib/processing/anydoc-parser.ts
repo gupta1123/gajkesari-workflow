@@ -30,6 +30,7 @@ async function loadAnydocModule() {
   } catch {
     // 2. Try resolving from local Anydoc directory node_modules
     const localModulePaths = [
+      "C:/Users/Shubham/Desktop/Projects V2/GajkesariAIagents/node_modules/@firecrawl/anydoc/index.js",
       "C:/Users/Shubham/Desktop/Projects V2/Anydoc/node_modules/@firecrawl/anydoc/index.js",
       "../Anydoc/node_modules/@firecrawl/anydoc/index.js",
     ];
@@ -142,6 +143,20 @@ export async function parseWithAnydoc(
         }
       } catch (err) {
         fs.rmSync(tmpDir, { recursive: true, force: true });
+        // propagate real error (e.g. OCR required) instead of falling through to generic unavailable message
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.toLowerCase().includes("ocr") || msg.toLowerCase().includes("scanned") || msg.toLowerCase().includes("unsupported")) {
+          return {
+            success: false,
+            markdownText: "",
+            hasMarkdownTables: false,
+            tableCount: 0,
+            executionTimeMs: Date.now() - startTime,
+            format: ext,
+            error: msg,
+          };
+        }
+        throw err;
       }
     }
 
