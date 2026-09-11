@@ -54,11 +54,11 @@ type ValidatedAiLedgerMatch = Omit<BankLedgerSuggestion, "counterpartyName" | "m
 
 const BANK_LEDGER_AI_BATCH_SIZE = Math.min(
   25,
-  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_SIZE ?? 3) || 3)
+  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_SIZE ?? 10) || 10)
 );
 const BANK_LEDGER_AI_BATCH_CONCURRENCY = Math.min(
   4,
-  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_CONCURRENCY ?? 2) || 2)
+  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_CONCURRENCY ?? 4) || 4)
 );
 
 const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
@@ -714,6 +714,7 @@ export async function suggestBankLedgersForTransactions(input: {
   companyName?: string | null;
   ledgerCatalogue?: OfflineLedgerCatalogueEntry[];
   transactions: BankLedgerSuggestionTransaction[];
+  onProgress?: (completedBatches: number, totalBatches: number) => void | Promise<void>;
 }): Promise<BankLedgerSuggestion[]> {
   if (input.transactions.length === 0) return [];
 
@@ -824,6 +825,8 @@ export async function suggestBankLedgersForTransactions(input: {
   if (ledgers.length > 0) {
     const chunks = chunkValues(unresolvedTransactions, BANK_LEDGER_AI_BATCH_SIZE);
     let nextChunkIndex = 0;
+    let completedChunkCount = 0;
+    let progressUpdate = Promise.resolve();
     const matchChunkWithRecovery = async (chunk: typeof unresolvedTransactions): Promise<void> => {
       try {
         const aiMatches = await aiMatchLedgersForTransactions({
@@ -869,7 +872,16 @@ export async function suggestBankLedgersForTransactions(input: {
       while (nextChunkIndex < chunks.length) {
         const chunk = chunks[nextChunkIndex];
         nextChunkIndex += 1;
-        await matchChunkWithRecovery(chunk);
+        try {
+          await matchChunkWithRecovery(chunk);
+        } finally {
+          completedChunkCount += 1;
+          const completed = completedChunkCount;
+          progressUpdate = progressUpdate.then(async () => {
+            await input.onProgress?.(completed, chunks.length);
+          });
+          await progressUpdate;
+        }
       }
     };
 

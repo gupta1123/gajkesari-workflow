@@ -2153,6 +2153,7 @@ async function addBankLedgerRecommendations({
   accountId,
   companyName,
   ledgerNames,
+  jobId,
 }) {
   if (rows.length === 0) return rows;
 
@@ -2162,6 +2163,17 @@ async function addBankLedgerRecommendations({
     connectionId,
     companyName,
     ledgerCatalogue: (ledgerNames || []).map((name) => ({ name })),
+    onProgress: async (completedBatches, totalBatches) => {
+      const progress = 82 + Math.floor((completedBatches / Math.max(1, totalBatches)) * 5);
+      try {
+        await updateBankJob(jobId, {
+          progress,
+          stage: `Matching Tally ledgers: batch ${completedBatches} of ${totalBatches}`,
+        });
+      } catch (error) {
+        console.warn(`[worker] could not publish ledger matching progress: ${diagnosticError(error)}`);
+      }
+    },
     transactions: rows.map((row) => ({
       accountId,
       transaction: bankLedgerMatchTransaction(row),
@@ -2476,6 +2488,7 @@ async function runBankStatementJob(job) {
           accountId: String(selectedAccountId || importRow.bank_account_id || ""),
           companyName,
           ledgerNames,
+          jobId: job.id,
         });
   } catch (error) {
     const detail = diagnosticError(error);
