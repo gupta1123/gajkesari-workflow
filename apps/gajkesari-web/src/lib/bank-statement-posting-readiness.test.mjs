@@ -138,7 +138,8 @@ test("UI and submission use ready scopes, with no unresolved advance fallback", 
   }
   assert.doesNotMatch(page, /Review ambiguous Tally matches before sending anything/);
   assert.doesNotMatch(page, /buildDirectAdvanceAllocation\(reviewedTransaction\)/);
-  assert.match(page, /held for review — not included in posting/);
+  assert.match(page, /need review/);
+  assert.doesNotMatch(page, /Direct vouchers · No bill allocation or Advance/);
   assert.match(page, /const directPosting = !billMatchingRequested/);
   assert.match(page, /async function matchPendingBills\(\) \{\s*setBillMatchingRequested\(true\)/);
   assert.match(page, /!directPosting && billAllocation\?\.status === "ready_to_post"/);

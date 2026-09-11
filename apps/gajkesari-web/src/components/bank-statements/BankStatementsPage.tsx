@@ -3887,7 +3887,39 @@ export function BankStatementsPage() {
   ).length;
   const postTallyButtonLabel = sendingMode
     ? "Sending..."
-    : `Post to Tally (${selectedPostingTransactions.length})`;
+    : `Post ${selectedPostingTransactions.length} entries`;
+  const footerPrimaryStatus = preview?.requiresManualExtraction || preview?.extractionDiagnostics?.coverageComplete === false
+    ? "Posting blocked"
+    : matchingBills
+      ? "Checking statement against Tally"
+      : statementCompletedCleanly
+        ? tallyPostingStatus?.voucherTotal
+          ? "Posted and verified"
+          : "Verified in Tally"
+        : uncheckedTallyPresenceCount > 0
+          ? `${readyPostingTransactions.length} prepared`
+          : readyPostingTransactions.length > 0
+            ? `${readyPostingTransactions.length} ready to post`
+            : heldPostingRowCount > 0
+              ? "No entries ready"
+              : alreadyInTallyCount > 0
+                ? "All entries already in Tally"
+                : "Nothing to post";
+  const footerSecondaryStatus = preview?.requiresManualExtraction || preview?.extractionDiagnostics?.coverageComplete === false
+    ? "Complete the extraction review before posting."
+    : matchingBills
+      ? "Checking duplicates and existing vouchers."
+      : statementCompletedCleanly
+        ? "Statement processing is complete."
+        : uncheckedTallyPresenceCount > 0
+          ? "Tally duplicate check pending"
+          : readyPostingTransactions.length > 0
+            ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
+            : heldPostingRowCount > 0
+              ? "Resolve the entries that need review."
+              : alreadyInTallyCount > 0
+                ? "No new vouchers are required."
+                : "No posting action is available.";
   const statementReviewLocked = Boolean(statementDoneSummary) || tallyPostingInProgress;
   const statementReviewDrawerLocked = tallyPostingInProgress;
   const openPostingReviewAction = useCallback(
@@ -8870,37 +8902,24 @@ export function BankStatementsPage() {
       {preview ? (
         <div className="sticky bottom-[calc(4.75rem+env(safe-area-inset-bottom))] md:bottom-0 z-40 w-full border-t border-[#ddd3c5] bg-white/95 px-2 py-2.5 shadow-[0_-4px_20px_rgba(49,39,26,0.08)] backdrop-blur-xl">
           <div className="flex w-full max-w-none flex-wrap items-center justify-between gap-2">
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-1">
-              <div className="contents text-[11px] font-bold">
-                <span className={`inline-flex h-6 items-center rounded-full border px-2.5 text-[11px] font-bold ${newReceiptCount > 0 && !statementCompletedCleanly ? "border-blue-200 bg-blue-50 text-blue-800" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
-                {preview.requiresManualExtraction || preview.extractionDiagnostics?.coverageComplete === false
-                  ? "Posting blocked · Statement extraction is incomplete"
-                  : matchingBills
-                  ? "Checking statement against Tally..."
-                  : statementCompletedCleanly
-                    ? tallyPostingStatus?.voucherTotal
-                      ? "Posted & verified"
-                      : "Verified in Tally"
-                  : uncheckedTallyPresenceCount > 0
-                    ? `${readyPostingTransactions.length} ready · ${uncheckedTallyPresenceCount} need Tally check`
-                  : readyPostingTransactions.length > 0
-                    ? `${readyPostingTransactions.length} entr${readyPostingTransactions.length === 1 ? "y" : "ies"} ready to post · ${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
-                  : heldPostingRowCount > 0
-                    ? "No ready entries · Resolve rows needing review"
-                  : alreadyInTallyCount > 0
-                    ? "All entries already in Tally · Nothing to post"
-                    : "Nothing to post"}
+            <div className="flex min-w-[220px] flex-1 flex-col justify-center gap-0.5">
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 text-[11px] font-bold">
+                <span className={preview.requiresManualExtraction || preview.extractionDiagnostics?.coverageComplete === false ? "text-rose-700" : "text-[#2b241d]"}>
+                  {footerPrimaryStatus}
                 </span>
                 {!statementCompletedCleanly && heldPostingRowCount > 0 ? (
-                  <span className="text-[11px] font-bold text-amber-800" role="status">
-                    {heldPostingRowCount} held for review — not included in posting
+                  <span className="before:mr-2 before:text-[#c8bbaa] before:content-['·'] text-amber-800" role="status">
+                    {heldPostingRowCount} need review
                   </span>
                 ) : null}
                 {!statementCompletedCleanly && selectedPostingSuspenseCount > 0 ? (
-                  <span className="inline-flex h-6 items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-bold text-amber-800">
-                    {selectedPostingSuspenseCount} entr{selectedPostingSuspenseCount === 1 ? "y" : "ies"} will use Suspense
+                  <span className="before:mr-2 before:text-[#c8bbaa] before:content-['·'] text-amber-700">
+                    {selectedPostingSuspenseCount} use Suspense
                   </span>
                 ) : null}
+              </div>
+              <div className="truncate text-[10px] font-medium text-slate-500" title={directPosting ? "Direct vouchers. Duplicate checks run before posting; bill allocation is optional." : undefined}>
+                {footerSecondaryStatus}
               </div>
               {!statementCompletedCleanly && tallyPostingStatus ? (
                 <div
@@ -8946,11 +8965,6 @@ export function BankStatementsPage() {
               ) : null}
             </div>
             <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
-              {directPosting && !statementDoneSummary && (
-                <span className="text-[10px] text-slate-600">
-                  Direct vouchers · No bill allocation or Advance · Duplicates checked before posting
-                </span>
-              )}
               <Button
                 className="h-8 flex-1 rounded-lg border-[#ddd3c5] bg-white px-3 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] sm:flex-none"
                 onClick={() => clearStatementReview()}
@@ -8977,7 +8991,7 @@ export function BankStatementsPage() {
                     variant="outline"
                   >
                     {matchingBills ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                    Check Tally Matches ({validTransactions.length})
+                    Check Tally ({validTransactions.length})
                   </Button>
                   {transactionsNeedingTallyWork.length > 0 ? (
                     <div className="flex flex-1 items-center sm:flex-none">
@@ -8994,7 +9008,7 @@ export function BankStatementsPage() {
                         onChange={(event) => setTallyPostingScope(event.target.value as TallyPostingScope)}
                         value={tallyPostingScope}
                       >
-                        <option value="all">All ready entries ({readyPostingTransactions.length})</option>
+                        <option value="all">All ({readyPostingTransactions.length})</option>
                         <option disabled={newReceiptCount === 0} value="receipts">Receipts only ({newReceiptCount})</option>
                         <option disabled={missingOutgoingCount === 0} value="payments">Payments only ({missingOutgoingCount})</option>
                       </select>
