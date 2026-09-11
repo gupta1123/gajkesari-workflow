@@ -369,6 +369,41 @@ const BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION = Math.min(
   Math.max(10, Number(process.env.OPENROUTER_BANK_LEDGER_CANDIDATE_LIMIT ?? 40) || 40)
 );
 
+const BANK_NARRATION_NOISE_TOKENS = new Set([
+  "ach", "bank", "beneficiary", "by", "cash", "chq", "cr", "credit", "debit", "dr",
+  "from", "ifsc", "imps", "nach", "neft", "nrtgs", "payment", "ref", "reference",
+  "rrn", "rtgs", "to", "transaction", "transfer", "txn", "upi", "upiref", "utr",
+]);
+
+/**
+ * Produce bounded identity/purpose phrases directly from the bank narration.
+ * A parsed counterparty is useful evidence, but is intentionally not required:
+ * banks frequently encode parties after slash-delimited routing references.
+ */
+export function bankNarrationMatchingQueries(description?: string | null) {
+  const raw = String(description ?? "").trim();
+  if (!raw) return [];
+
+  const tokens = ledgerNameTokens(raw)
+    .filter((token) => {
+      if (!token || BANK_NARRATION_NOISE_TOKENS.has(token)) return false;
+      if (/^\d+$/.test(token)) return false;
+      if (/^(?=.*\d)[a-z0-9]+$/i.test(token)) return false;
+      return token.length > 1;
+    });
+  const phrases = new Set<string>();
+  // Longer phrases retain party identity; shorter ones recover truncated names.
+  for (let size = Math.min(6, tokens.length); size >= 2; size -= 1) {
+    for (let index = 0; index + size <= tokens.length; index += 1) {
+      const phrase = tokens.slice(index, index + size).join(" ");
+      if (phrase.length >= 5) phrases.add(phrase);
+      if (phrases.size >= 60) return Array.from(phrases);
+    }
+  }
+  if (tokens.length === 1 && tokens[0].length >= 5) phrases.add(tokens[0]);
+  return Array.from(phrases);
+}
+
 export function shortlistBankLedgersForTransaction(
   ledgers: TallyMasterRow[],
   transaction: MatchableTransaction,
@@ -381,6 +416,7 @@ export function shortlistBankLedgersForTransaction(
     counterpartyName,
     transaction.counterpartyName,
     extractCounterpartyName(rawDescription),
+    ...bankNarrationMatchingQueries(rawDescription),
   ].map((value) => String(value ?? "").trim()).filter(Boolean)));
   if (queries.length === 0) return [];
 
@@ -502,7 +538,6 @@ async function aiMatchLedgersForTransactions(input: {
     }
   }
   const candidateLedgers = Array.from(candidateLedgerByKey.values());
-  if (candidateLedgers.length === 0) return input.transactions.map(() => null);
 
   const raw = await callOpenRouter(
     [
