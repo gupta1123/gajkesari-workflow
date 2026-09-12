@@ -153,7 +153,7 @@ export async function vectoriseCompany({ db, companyName, companyGuid, appUserDa
   const target = getCollectionPath(vectorDir, key);
   let manifest = loadManifest(vectorDir, key);
   let collection;
-  if (!manifest && fs.existsSync(target) && entry.vector?.status === "indexing" &&
+  if (!manifest && fs.existsSync(target) && ["indexing", "ready"].includes(entry.vector?.status) &&
       entry.vector?.embeddingModel === EMBEDDING_MODEL && entry.vector?.dimensions === EMBEDDING_DIMENSIONS) {
     const completed = Math.max(0, Math.min(Number(entry.vector.indexedCount) || 0, ledgers.length));
     manifest = emptyManifest();
