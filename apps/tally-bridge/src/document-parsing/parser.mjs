@@ -29,8 +29,9 @@ async function loadBankStatementModules() {
     load("bank-statement-markdown-amounts.mjs"),
     load("bank-statement-running-balance.mjs"),
     load("bank-statement-resilience.mjs"),
-  ]).then(([deterministic, account, amounts, runningBalance, resilience]) => ({
-    deterministic, account, amounts, runningBalance, resilience,
+    load("bank-statement-pdf-columns.mjs"),
+  ]).then(([deterministic, account, amounts, runningBalance, resilience, pdfColumns]) => ({
+    deterministic, account, amounts, runningBalance, resilience, pdfColumns,
   }));
   return bankStatementModulesPromise;
 }
@@ -138,9 +139,58 @@ function approximatePdfPageCount(bytes) {
   return Math.max(1, (source.match(/\/Type\s*\/Page\b/g) || []).length);
 }
 
-export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1 } = {}) {
-  const { deterministic, account, amounts, runningBalance, resilience } = await loadBankStatementModules();
-  const normalized = deterministic.deterministicTransactionsFromAnydoc(markdown);
+function physicalDate(value) {
+  const match = String(value || "").match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+  return match ? `${match[3]}-${match[2].padStart(2, "0")}-${match[1].padStart(2, "0")}` : null;
+}
+
+function transactionsFromPhysicalRows(rows) {
+  return rows.map((row, sourceIndex) => ({
+    row_index: sourceIndex + 1,
+    transaction_date: physicalDate(row.sourceDate),
+    value_date: physicalDate(row.sourceDate),
+    description: String(row.narration || "").replace(/\s+/g, " ").trim(),
+    reference_number: row.reference || null,
+    debit_amount: row.debitAmount > 0 ? row.debitAmount : null,
+    credit_amount: row.creditAmount > 0 ? row.creditAmount : null,
+    balance_amount: row.balanceAmount,
+    transaction_type: "unknown",
+    category: row.creditAmount > 0 ? "receipt" : "payment",
+    counterparty_name: null,
+    suggested_ledger_name: null,
+    suggestion_confidence: null,
+    suggestion_reason: null,
+    confirmed_ledger_name: null,
+    additional_charges: [],
+    confidence: 0.95,
+    raw_payload: {
+      rowNumber: sourceIndex + 1,
+      source: "physical_pdf_columns",
+      extractionProvenance: {
+        startPage: row.page,
+        endPage: row.page,
+        sourceIndex,
+        method: "physical_pdf_columns",
+      },
+    },
+  }));
+}
+
+export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1, pdfBytes = null } = {}) {
+  const { deterministic, account, amounts, runningBalance, resilience, pdfColumns } = await loadBankStatementModules();
+  let normalized = deterministic.deterministicTransactionsFromAnydoc(markdown);
+  let pipeline = "deterministic_anydoc";
+  let physical = null;
+  if (!normalized?.transactions?.length && pdfBytes) {
+    physical = await pdfColumns.readBankStatementPhysicalColumns(pdfBytes);
+    if (physical.detected && physical.rows.length) {
+      normalized = {
+        headers: [`physical:${physical.layout}`],
+        transactions: transactionsFromPhysicalRows(physical.rows),
+      };
+      pipeline = "physical_pdf_columns";
+    }
+  }
   if (!normalized?.transactions?.length) {
     const error = new Error("The bank-statement tables could not be normalized deterministically.");
     error.code = "deterministic_extraction_unavailable";
@@ -164,15 +214,18 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
       statementPeriodStart: null,
       statementPeriodEnd: null,
       openingBalance: source.openingBalance,
-      transactions: resilience.addBankStatementPageProvenance(normalized.transactions, {
-        startPage: 1,
-        endPage: Math.max(1, Number(pageCount) || 1),
-        method: "deterministic_anydoc",
-      }),
+      transactions: pipeline === "physical_pdf_columns"
+        ? normalized.transactions
+        : resilience.addBankStatementPageProvenance(normalized.transactions, {
+            startPage: 1,
+            endPage: Math.max(1, Number(pageCount) || 1),
+            method: "deterministic_anydoc",
+          }),
       pageResults: [],
     },
     diagnostics: {
-      pipeline: "deterministic_anydoc",
+      pipeline,
+      physicalLayout: physical?.layout ?? null,
       rowCount: normalized.transactions.length,
       headers: normalized.headers,
       normalized: true,
@@ -198,6 +251,7 @@ export async function parseDocumentLocal(request = {}) {
       const markdown = await toMarkdownBytes(bytes, format);
       const bankStatement = await processBankStatementMarkdownLocal(markdown, {
         pageCount: request.pageCount || approximatePdfPageCount(bytes),
+        pdfBytes: bytes,
       });
       return {
         outputFormat: "json",

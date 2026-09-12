@@ -66,3 +66,14 @@ Page No 1 -
 NRTGS/PUNBR wrapped continuation U123456 03-09-2026 50.00 950.00 Dr.`;
   assert.equal(deterministicTransactionsFromAnydoc(markdown), null);
 });
+
+test("accepts a valid HDFC timestamp contaminated by a repeated bank footer", () => {
+  const markdown = `Statement of Account For Period: 02-Sep-2026 to 02-Sep-2026
+|Transaction Date|Transaction Description|Reference No.|Value Date|Debit Amount|Credit Amount|Closing Balance|
+|---|---|---|---|---|---|---|
+|02-Sep-2026 19:47:45 HDFC BANK LIMITED|RTGS Cr- Customer receipt|REF001|02-Sep-2026||1,131,857.00|-278,256,565.09|`;
+  const rows = deterministicTransactionsFromAnydoc(markdown).transactions;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].transaction_date, "2026-09-02");
+  assert.equal(rows[0].credit_amount, 1131857);
+});

@@ -56,9 +56,10 @@ function detectPnbLayout(items, page) {
   const credit = header(items, "cr amount");
   const reference = header(items, "txn no.", "txn no");
   const date = header(items, "txn date");
+  const description = header(items, "description", "narration", "particulars");
   const balance = header(items, "balance");
-  if (!debit || !credit || !reference || !date || !balance) return null;
-  const headerY = [debit, credit, reference, date, balance].map((item) => item.y);
+  if (!debit || !credit || !reference || !date || !description || !balance) return null;
+  const headerY = [debit, credit, reference, date, description, balance].map((item) => item.y);
   if (Math.max(...headerY) - Math.min(...headerY) > 20) return null;
   const gap = center(credit) - center(debit);
   if (gap < 30 || Math.abs(center(balance) - center(credit) - gap) > gap * 0.2) return null;
@@ -69,6 +70,7 @@ function detectPnbLayout(items, page) {
     balance: center(balance),
     reference: center(reference),
     date: center(date),
+    description: center(description),
     gap,
     width: page.width,
   };
@@ -104,7 +106,8 @@ function extractPnbRows(items, page, layout) {
   const rows = [];
   for (let index = 0; index < references.length; index += 1) {
     const reference = references[index];
-    if (!items.some((item) => /^\d{2}-\d{2}-\d{4}$/.test(item.text) && Math.abs(item.y - reference.y) < 4 && Math.abs(center(item) - layout.date) < 28)) {
+    const date = items.find((item) => /^\d{2}-\d{2}-\d{4}$/.test(item.text) && Math.abs(item.y - reference.y) < 4 && Math.abs(center(item) - layout.date) < 28);
+    if (!date) {
       throw new Error("PNB transaction/date alignment is uncertain");
     }
     const bounds = rowBounds(references, index);
@@ -114,7 +117,34 @@ function extractPnbRows(items, page, layout) {
     if (Number(debitAmount > 0) + Number(creditAmount > 0) !== 1 || balanceAmount === null) {
       throw new Error("PNB transaction columns are incomplete");
     }
-    rows.push({ reference: reference.text.toUpperCase(), debitAmount, creditAmount, balanceAmount, page: page.pageNumber });
+    // PNB descriptions wrap within roughly two text lines around the row
+    // anchor. Tighten only the narration bounds so the final transaction does
+    // not absorb the disclaimer immediately below the table.
+    const narrationBounds = {
+      top: Math.min(bounds.top, reference.y + 36),
+      bottom: Math.max(bounds.bottom, reference.y - 36),
+    };
+    const narration = columnCell(
+      items,
+      layout.description,
+      (layout.date + layout.description) / 2,
+      layout.debit - layout.gap / 2,
+      narrationBounds
+    )
+      .sort((left, right) => right.y - left.y || left.x - right.x)
+      .map((item) => item.text)
+      .join(" ")
+      .trim();
+    if (!narration) throw new Error("PNB transaction narration is incomplete");
+    rows.push({
+      reference: reference.text.toUpperCase(),
+      sourceDate: date.text,
+      narration,
+      debitAmount,
+      creditAmount,
+      balanceAmount,
+      page: page.pageNumber,
+    });
   }
   return rows;
 }

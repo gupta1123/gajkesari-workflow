@@ -85,7 +85,10 @@ function parseDateValue(v, fallbackYear = null) {
     const dt = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
     if (dt.getUTCFullYear() === Number(y) && dt.getUTCMonth() === Number(m) - 1 && dt.getUTCDate() === Number(d)) return `${String(y).padStart(4,"0")}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
   }
-  const shortMonth = raw.match(/^(\d{1,2})[\s-]+([A-Za-z]{3,9})(?:[\s-]+(\d{2,4}))?$/);
+  // PDF converters sometimes append a repeated bank heading/footer to the date
+  // cell (for example "02-Sep-2026 19:47:45 HDFC BANK LIMITED"). The leading
+  // date is still authoritative, so accept trailing time or converter noise.
+  const shortMonth = raw.match(/^(\d{1,2})[\s-]+([A-Za-z]{3,9})(?:[\s-]+(\d{2,4}))?\b/);
   if (shortMonth) {
     const year = shortMonth[3]
       ? (shortMonth[3].length === 2 ? `20${shortMonth[3]}` : shortMonth[3])

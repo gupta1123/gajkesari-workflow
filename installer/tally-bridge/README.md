@@ -58,7 +58,9 @@ The connector bundles Firecrawl AnyDoc and parses supported documents entirely o
 the connector machine. Markdown is the default output. For PDFs, `--output json`
 uses the same deterministic table normalization, account extraction, amount
 reconciliation, provenance, and running-balance validation as the backend bank
-statement worker. Other document types return AnyDoc's structured document model.
+statement worker. If AnyDoc loses a known bank's columns across pages, the
+connector uses the backend's physical PDF-column reader before returning JSON.
+Other document types return AnyDoc's structured document model.
 Hosted OCR is disabled.
 
 ```powershell

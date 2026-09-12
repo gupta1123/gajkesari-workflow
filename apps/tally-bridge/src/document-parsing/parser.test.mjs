@@ -57,3 +57,15 @@ test("uses the backend worker logic for normalized bank-statement JSON", async (
   assert.equal(result.parsed.transactions[0].raw_payload.extractionProvenance.endPage, 2);
   assert.equal(result.diagnostics.balanceValidation.status, "verified");
 });
+
+test("falls back to canonical physical PDF columns when AnyDoc loses continuation tables", async () => {
+  const markdown = `|Txn No.|Txn Date|Description|Dr Amount|Cr Amount|Balance|
+|---|---|---|---|---|---|
+|T1|03-09-2026|NRTGS DR Supplier|100.00||900.00 Dr.|
+Page No 1 -
+NRTGS/PUNBR wrapped continuation U123456 03-09-2026 50.00 950.00 Dr.`;
+  await assert.rejects(
+    () => processBankStatementMarkdownLocal(markdown),
+    /could not be normalized deterministically/
+  );
+});

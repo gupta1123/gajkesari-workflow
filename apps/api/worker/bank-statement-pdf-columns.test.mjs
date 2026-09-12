@@ -3,12 +3,13 @@ import {extractBankStatementPhysicalColumns,extractPnbPhysicalColumns} from './b
 import {reconcileBankStatementMarkdownAmounts} from './bank-statement-markdown-amounts.mjs';
 import {buildBankVoucherXml} from '../../tally-bridge/src/bridge.mjs';
 const item=(str,x,y,width=40)=>({str,width,transform:[1,0,0,1,x,y]});
-const headers=[item('Txn No.',80,700),item('Txn Date',180,700),item('Dr Amount',680,700),item('Cr Amount',780,700),item('Balance',880,700)];
-const row=(ref,y,debit,credit,balance)=>[item(ref,65,y,70),item('03-09-2026',165,y,70),...(debit?[item(debit,660,y,85)]:[]),...(credit?[item(credit,760,y,85)]:[]),item(balance,860,y,85)];
+const headers=[item('Txn No.',80,700),item('Txn Date',180,700),item('Description',380,700),item('Dr Amount',680,700),item('Cr Amount',780,700),item('Balance',880,700)];
+const row=(ref,y,debit,credit,balance)=>[item(ref,65,y,70),item('03-09-2026',165,y,70),item(`Narration ${ref}`,350,y,180),...(debit?[item(debit,660,y,85)]:[]),...(credit?[item(credit,760,y,85)]:[]),item(balance,860,y,85)];
 test('headerless continuation preserves physical columns and wrapped decimals through XML',()=>{
  const pages=[{pageNumber:1,width:1000,items:[...headers,...row('T123456',600,'20,98,696.00',null,'9,65,64,682.49Dr.')]},
  {pageNumber:2,width:1000,items:[...row('T29161971',1100,null,null,'9,44,65,986.49Dr.'),item('1,00,00,000.0',660,1108,85),item('0',737,1092,8),...row('T24969455',1020,null,'2,50,000.00','8,44,65,986.49Dr.')]}];
  const physical=extractPnbPhysicalColumns(pages);assert.equal(physical.rows.length,3);
+ assert.equal(physical.rows[1].narration,'Narration T29161971');
  const parsed={transactions:[{reference_number:'T29161971',credit_amount:10000000,debit_amount:null,category:'receipt'}, {reference_number:'T24969455',credit_amount:null,debit_amount:250000,category:'payment'}]};
  const fixed=reconcileBankStatementMarkdownAmounts(parsed,'',physical);
  assert.deepEqual(fixed.transactions.map(r=>[r.debit_amount,r.credit_amount,r.category]),[[10000000,null,'payment'],[null,250000,'receipt']]);

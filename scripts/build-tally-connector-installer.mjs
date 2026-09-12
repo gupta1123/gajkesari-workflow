@@ -33,6 +33,9 @@ const webSocketPackageSource = path.join(repoRoot, "node_modules", "ws");
 const zvecPackageSource = path.join(repoRoot, "node_modules", "@zvec", "zvec");
 const zvecBindingsSource = path.join(repoRoot, "node_modules", "@zvec");
 const anydocPackageSource = path.join(repoRoot, "node_modules", "@firecrawl", "anydoc");
+const pdfjsPackageSource = path.join(repoRoot, "node_modules", "pdfjs-dist");
+const napiCanvasSource = path.join(repoRoot, "node_modules", "@napi-rs", "canvas");
+const napiCanvasWindowsSource = path.join(repoRoot, "node_modules", "@napi-rs", "canvas-win32-x64-msvc");
 const anydocWindowsSource = path.join(repoRoot, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc");
 const powerShellSource = path.join(bridgeRoot, "powershell");
 const samplesSource = path.join(bridgeRoot, "samples");
@@ -297,12 +300,16 @@ for (const name of [
   "bank-statement-markdown-amounts.mjs",
   "bank-statement-running-balance.mjs",
   "bank-statement-resilience.mjs",
+  "bank-statement-pdf-columns.mjs",
 ]) {
   fs.copyFileSync(path.join(bankStatementWorkerSource, name), path.join(documentParsingLogicDir, name));
 }
 copyDir(path.join(electronAppSource, "src", "local-matching"), path.join(appDir, "src", "local-matching"));
 copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
 copyDir(anydocPackageSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc"));
+copyDir(pdfjsPackageSource, path.join(appDir, "node_modules", "pdfjs-dist"));
+copyDir(napiCanvasSource, path.join(appDir, "node_modules", "@napi-rs", "canvas"));
+copyDir(napiCanvasWindowsSource, path.join(appDir, "node_modules", "@napi-rs", "canvas-win32-x64-msvc"));
 copyDir(anydocWindowsSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc"));
 if (fs.existsSync(zvecPackageSource)) {
   copyDir(path.join(repoRoot, "node_modules", "@zvec"), path.join(appDir, "node_modules", "@zvec"));
@@ -324,7 +331,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.64",
+      version: "0.1.65",
       private: true,
       type: "module",
     },
