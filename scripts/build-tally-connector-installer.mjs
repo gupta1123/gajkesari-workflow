@@ -304,7 +304,6 @@ for (const name of [
 ]) {
   fs.copyFileSync(path.join(bankStatementWorkerSource, name), path.join(documentParsingLogicDir, name));
 }
-copyDir(path.join(electronAppSource, "src", "local-matching"), path.join(appDir, "src", "local-matching"));
 copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
 copyDir(anydocPackageSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc"));
 copyDir(pdfjsPackageSource, path.join(appDir, "node_modules", "pdfjs-dist"));
