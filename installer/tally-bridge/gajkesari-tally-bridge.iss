@@ -1,5 +1,5 @@
 #define AppName "Gajkesari Tally Connector"
-#define AppVersion "0.1.62"
+#define AppVersion "0.1.63"
 #define AppPublisher "Gajkesari"
 #define AppInstallDir "C:\Gajkesari\tally-bridge"
 #define AppExeName "Gajkesari Tally Connector.exe"

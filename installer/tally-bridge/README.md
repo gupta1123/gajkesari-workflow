@@ -52,6 +52,22 @@ the clean runtime during every build.
 The connector displays `Connected to <company name>` after pairing when Tally Prime
 is reachable and a company is loaded.
 
+## Local document parsing
+
+The connector bundles Firecrawl AnyDoc and parses supported documents entirely on
+the connector machine. Markdown is the default output; pass `--output json` for
+AnyDoc's structured document model. PDF JSON responses contain Markdown because
+AnyDoc does not expose its structured block model for PDFs. Hosted OCR is disabled.
+
+```powershell
+npm run document:parse --workspace @gajkesari/tally-bridge -- --input "C:\path\invoice.pdf"
+npm run document:parse --workspace @gajkesari/tally-bridge -- --input "C:\path\report.docx" --output json --out parsed.json
+```
+
+The paired bridge accepts a `parse_document` command with `documentUrl` (HTTPS) or
+`base64`, an optional `fileName`/`format`, and `output: "markdown" | "json"`.
+Documents are limited to 25 MB and are never sent to Firecrawl.
+
 ### One-time native PDF activation
 
 The canonical TDL is installed at:

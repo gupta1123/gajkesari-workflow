@@ -7,6 +7,7 @@ import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, getStatusForC
 import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable } from "./src/local-matching/vector.mjs";
 import { syncLedgersReadOnly } from "./src/local-matching/sync.mjs";
 import { suggestLedgers } from "./src/local-matching/suggest.mjs";
+import { parseDocumentLocal } from "./src/document-parsing/parser.mjs";
 import { exportTallyCollection, fetchAvailableCompanies, testTally } from "./src/bridge.mjs";
 
 const BRAND_NAME = "Gajkesari";
@@ -838,6 +839,7 @@ if (!gotLock) {
           embedTexts: requestSemanticEmbeddings,
         });
       });
+      ipcMain.handle("document-parsing:parse", async (_event, payload) => parseDocumentLocal(payload || {}));
     } catch (e) { appendLog(errPath, `Local Matching IPC failed: ${formatConnectorError(e)}`); }
     createWindow();
     const protocolArg =

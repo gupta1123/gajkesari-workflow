@@ -8,7 +8,8 @@ export type TallyBridgeCommandType =
   | "create_debit_note"
   | "export_debit_note_pdf"
   | "create_purchase_voucher"
-  | "verify_bank_transaction";
+  | "verify_bank_transaction"
+  | "parse_document";
 
 export type TallyBridgeCommandStatus =
   | "queued"
@@ -53,6 +54,7 @@ export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
   "export_debit_note_pdf",
   "create_purchase_voucher",
   "verify_bank_transaction",
+  "parse_document",
 ];
 
 export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow, includeClaimToken = false) {

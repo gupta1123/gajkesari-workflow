@@ -1,6 +1,6 @@
 {
   "name": "@gajkesari/tally-bridge",
-  "version": "0.1.62",
+  "version": "0.1.63",
   "private": true,
   "type": "module",
   "exports": {
@@ -13,10 +13,12 @@
     "disconnect": "node src/bridge.mjs disconnect",
     "test": "node src/bridge.mjs test",
     "sync": "node src/bridge.mjs sync-masters",
+    "document:parse": "node src/document-parsing/cli.mjs",
     "local-matching:suggest": "node src/local-matching/cli.mjs",
     "test:local-matching": "node --test src/local-matching/*.test.mjs src/local-matching/*.test.mjs"
   },
   "dependencies": {
+    "@firecrawl/anydoc": "0.2.4",
     "@zvec/zvec": "^0.7.1",
     "ws": "8.21.1"
   },

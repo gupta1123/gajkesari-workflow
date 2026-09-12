@@ -27,9 +27,12 @@ const outputExe = path.join(outputDir, connector.setupName);
 const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
 const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
 const localMatchingSource = path.join(bridgeRoot, "src", "local-matching");
+const documentParsingSource = path.join(bridgeRoot, "src", "document-parsing");
 const webSocketPackageSource = path.join(repoRoot, "node_modules", "ws");
 const zvecPackageSource = path.join(repoRoot, "node_modules", "@zvec", "zvec");
 const zvecBindingsSource = path.join(repoRoot, "node_modules", "@zvec");
+const anydocPackageSource = path.join(repoRoot, "node_modules", "@firecrawl", "anydoc");
+const anydocWindowsSource = path.join(repoRoot, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc");
 const powerShellSource = path.join(bridgeRoot, "powershell");
 const samplesSource = path.join(bridgeRoot, "samples");
 const tdlSource = path.join(bridgeRoot, "tdl");
@@ -69,6 +72,8 @@ function validateSources() {
   ensureFile(path.join(webSocketPackageSource, "package.json"), "ws runtime dependency");
   ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
   ensureFile(path.join(electronAppSource, "package.json"), "Electron wrapper package");
+  ensureFile(path.join(anydocPackageSource, "package.json"), "AnyDoc runtime dependency");
+  ensureFile(path.join(anydocWindowsSource, "package.json"), "AnyDoc Windows runtime dependency");
   ensureFile(tdlFile, "native Tally PDF TDL");
   ensureContains(
     dashboardSource,
@@ -282,8 +287,11 @@ fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "mai
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
+copyDir(documentParsingSource, path.join(appDir, "src", "document-parsing"));
 copyDir(path.join(electronAppSource, "src", "local-matching"), path.join(appDir, "src", "local-matching"));
 copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
+copyDir(anydocPackageSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc"));
+copyDir(anydocWindowsSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc"));
 if (fs.existsSync(zvecPackageSource)) {
   copyDir(path.join(repoRoot, "node_modules", "@zvec"), path.join(appDir, "node_modules", "@zvec"));
   // Also copy @zvec's transitive bindings if present
@@ -304,7 +312,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.62",
+      version: "0.1.63",
       private: true,
       type: "module",
     },

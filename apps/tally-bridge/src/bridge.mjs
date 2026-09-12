@@ -9,12 +9,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { parseDocumentLocal } from "./document-parsing/parser.mjs";
 
 const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.62";
+const BRIDGE_VERSION = "0.1.63";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -5072,7 +5073,8 @@ async function assertCommandTarget(config, command) {
     throw new Error("The command targets an old or different connector session. Review it before retrying.");
   }
   // Rendering a previously verified document is not a new Tally read/write.
-  if (command.commandType === "export_debit_note_pdf" ||
+  if (command.commandType === "parse_document" ||
+      command.commandType === "export_debit_note_pdf" ||
       (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf")) return;
   const readiness = await testTally(config.tallyUrl);
   const companies = await fetchAvailableCompanies(config.tallyUrl, readiness.companyName);
@@ -5092,6 +5094,23 @@ async function executeCommand(config, command, options = {}) {
     await assertCommandTarget(config, command);
   } catch (error) {
     await sendCommandResult(config, command, { success: false, error: error.message, result: { beforeExecution: true } });
+    return;
+  }
+
+  if (command.commandType === "parse_document") {
+    try {
+      const parsed = await parseDocumentLocal(command.payload || {});
+      await sendCommandResult(config, command, { success: true, result: parsed });
+      console.log(`Command ${command.id} completed: document parsed locally as ${parsed.outputFormat}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Document parsing failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: { processing: "local", ocrUsed: false, code: error?.code || "parse_failed" },
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
     return;
   }
 

@@ -189,6 +189,67 @@ export async function POST(
       ? (body.payload as Record<string, unknown>)
       : {};
 
+    if (commandType === "parse_document") {
+      const documentUrl = toNullableText(rawPayload.documentUrl ?? rawPayload.sourceUrl, 4000);
+      const base64 = typeof rawPayload.base64 === "string" ? rawPayload.base64.trim() : "";
+      const outputValue = toNullableText(rawPayload.output ?? rawPayload.outputFormat, 20)?.toLowerCase() || "markdown";
+      const output = outputValue === "md" ? "markdown" : outputValue;
+      if (!documentUrl && !base64) {
+        return jsonWithCors(request, { error: "Document URL or base64 content is required." }, { status: 400 });
+      }
+      if (documentUrl && !/^https:\/\//i.test(documentUrl)) {
+        return jsonWithCors(request, { error: "Document URL must use HTTPS." }, { status: 400 });
+      }
+      if (base64.length > 35_000_000) {
+        return jsonWithCors(request, { error: "Base64 document is larger than the 25 MB connector limit." }, { status: 413 });
+      }
+      if (output !== "markdown" && output !== "json") {
+        return jsonWithCors(request, { error: 'Document output must be "markdown" or "json".' }, { status: 400 });
+      }
+      const payload = {
+        ...(documentUrl ? { documentUrl } : { base64 }),
+        fileName: toNullableText(rawPayload.fileName, 500),
+        format: toNullableText(rawPayload.format, 20),
+        output,
+      };
+
+      if (isLocalDbMode()) {
+        const command = await createLocalTallyCommand({
+          connectionId: id,
+          ownerUserId: user.id,
+          commandType,
+          payload,
+          priority: 15,
+        });
+        return jsonWithCors(request, { command: serializeTallyBridgeCommand(command) });
+      }
+
+      const supabase = createSupabaseAdminClient();
+      const { data, error } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          command_type: commandType,
+          status: "queued",
+          priority: 15,
+          payload,
+        })
+        .select("*")
+        .single();
+      if (error) throw error;
+      await supabase.from("tally_connection_events").insert({
+        connection_id: id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Local document parsing queued for connector.",
+        payload: { commandType, fileName: payload.fileName, output },
+      });
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+      });
+    }
+
     if (commandType === "sync_masters") {
       const companyName =
         toNullableText(rawPayload.companyName, 240) ??
