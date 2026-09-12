@@ -289,6 +289,7 @@ const appDir = path.join(payloadDir, "resources", "app");
 fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
+copyDir(path.join(electronAppSource, "assets"), path.join(appDir, "assets"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
 copyDir(documentParsingSource, path.join(appDir, "src", "document-parsing"));
@@ -330,7 +331,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.66",
+      version: "0.1.67",
       private: true,
       type: "module",
     },

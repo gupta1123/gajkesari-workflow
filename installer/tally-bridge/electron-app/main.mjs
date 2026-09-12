@@ -14,7 +14,6 @@ const BRAND_NAME = "Gajkesari";
 const CONNECTOR_NAME = "Gajkesari Tally Connector";
 const PROTOCOL_NAME = "gajkesari-tally";
 const APP_USER_MODEL_ID = "com.gajkesari.tally-connector";
-const BRAND_MARK = "P";
 
 // The connector UI is lightweight and does not need GPU acceleration. Some
 // Windows machines cannot start Electron's GPU subprocess, which otherwise
@@ -23,6 +22,8 @@ app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const brandLogoPath = path.join(__dirname, "assets", "gajkesari-logo.png");
+const brandLogoDataUrl = `data:image/png;base64,${fs.readFileSync(brandLogoPath).toString("base64")}`;
 const installDir = path.resolve(__dirname, "..", "..");
 const logPath = path.join(installDir, "bridge.log");
 const errPath = path.join(installDir, "bridge.err.log");
@@ -563,10 +564,14 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     title: CONNECTOR_NAME,
     width: 540,
-    height: 680,
+    height: 620,
+    minWidth: 460,
+    minHeight: 540,
     show: false,
     resizable: true,
-    backgroundColor: "#f8f5ef",
+    frame: false,
+    icon: brandLogoPath,
+    backgroundColor: "#f6f1ec",
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -577,35 +582,42 @@ function createWindow() {
     <html>
       <head>
         <style>
-          :root{--ink:#231b16;--muted:#756b63;--line:#e8e1da;--surface:#fff;--canvas:#f7f5f2;--accent:#167a50;--accent-soft:#eaf7f0;--danger:#b42318}
+          :root{--ink:#211916;--muted:#786b65;--line:#e7ddd6;--surface:#fffdfb;--canvas:#f6f1ec;--brand:#e51522;--brand-deep:#571016;--accent:#167a50;--accent-soft:#eaf7f0;--danger:#b42318}
           *{box-sizing:border-box}
           html,body{width:100%;min-width:0;overflow-x:hidden}
-          body{font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;margin:0;background:var(--canvas);color:var(--ink);font-size:13px}
+          body{font-family:"Aptos","Segoe UI Variable Text",sans-serif;margin:0;background:var(--canvas);color:var(--ink);font-size:13px;letter-spacing:.002em}
           button,input,textarea{font:inherit}
           button{cursor:pointer}
-          button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid rgba(22,122,80,.2);outline-offset:2px}
-          #localPanel{display:none;position:absolute;inset:0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 22px 24px}
+          button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid rgba(229,21,34,.18);outline-offset:2px}
+          .titleBar{height:42px;display:flex;align-items:center;padding-left:14px;color:#fff;background:linear-gradient(105deg,#3a0c10 0%,#68131a 65%,#841820 100%);-webkit-app-region:drag;user-select:none}
+          .titleBrand{display:flex;align-items:center;gap:9px;min-width:0;font-family:"Aptos Display","Aptos",sans-serif;font-size:12px;font-weight:650;letter-spacing:.01em}
+          .titleLogo{width:20px;height:20px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.18))}
+          .windowControls{display:flex;margin-left:auto;height:100%;-webkit-app-region:no-drag}
+          .windowControl{width:46px;height:100%;border:0;background:transparent;color:rgba(255,255,255,.82);display:grid;place-items:center;font-size:16px}
+          .windowControl:hover{background:rgba(255,255,255,.1);color:#fff}.windowControl.close:hover{background:#c42b35}
+          #appContent{height:calc(100vh - 42px);overflow:auto}
+          #localPanel{display:none;position:absolute;inset:42px 0 0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 20px 20px}
           #localPanel.open{display:block}
-          .stickyHeader{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:18px 0 10px;background:linear-gradient(var(--canvas) 82%,rgba(247,245,242,0))}
-          .pageTitle{font-size:20px;font-weight:720;letter-spacing:-.02em;margin:0}
-          .contextLine{display:flex;align-items:center;gap:7px;min-width:0;margin:0 0 14px;padding-left:48px;color:var(--muted);font-size:12px}
+          .stickyHeader{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:10px;padding:13px 0 7px;background:linear-gradient(var(--canvas) 82%,rgba(246,241,236,0))}
+          .pageTitle{font-family:"Aptos Display","Aptos",sans-serif;font-size:20px;font-weight:700;letter-spacing:-.025em;margin:0}
+          .contextLine{display:flex;align-items:center;gap:7px;min-width:0;margin:0 0 11px;padding-left:42px;color:var(--muted);font-size:12px}
           .contextLine strong{color:var(--ink);font-weight:680}
           .contextCompany{max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-weight:650}
           .step{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:14px}
-          .step{padding:16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(35,27,22,.03)}
+          .step{padding:13px 15px;margin-bottom:10px;box-shadow:0 2px 8px rgba(61,34,25,.035)}
           .stepReady{border-color:#b9dfca;background:linear-gradient(135deg,#fff 45%,#f1faf5)}
-          .stepHeader{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-          .stepNumber{flex:0 0 24px;height:24px;border-radius:8px;display:grid;place-items:center;background:#eee9e4;color:#685c52;font-size:11px;font-weight:750}
+          .stepHeader{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+          .stepNumber{flex:0 0 22px;height:22px;border-radius:7px;display:grid;place-items:center;background:#eee8e3;color:#685c52;font-size:11px;font-weight:750}
           .stepReady .stepNumber{background:var(--accent);color:#fff}
           .stepCopy{min-width:0;flex:1}
-          .stepTitle{font-size:14px;font-weight:720;line-height:1.2;margin:0}
-          .stepHint,.meta,.statusLine{font-size:12px;color:var(--muted);line-height:1.45}
+          .stepTitle{font-family:"Aptos Display","Aptos",sans-serif;font-size:14px;font-weight:700;line-height:1.2;margin:0;letter-spacing:-.01em}
+          .stepHint,.meta,.statusLine{font-size:12px;color:var(--muted);line-height:1.35}
           .metric{font-size:26px;font-weight:740;letter-spacing:-.04em;line-height:1;margin-bottom:4px}
           .row{display:flex;align-items:center;gap:10px;min-width:0}
           .rowBetween{justify-content:space-between}
           .pill{display:inline-flex;align-items:center;gap:5px;max-width:100%;font-size:11px;font-weight:650;padding:4px 8px;border-radius:999px;background:#f3f0ed;color:#62574e;border:1px solid var(--line);white-space:nowrap}
           .pillReady{background:var(--accent-soft);color:#11643f;border-color:#b9dfca}
-          .btn{min-height:36px;padding:8px 13px;border-radius:10px;border:1px solid var(--ink);background:var(--ink);color:#fff;font-weight:680;transition:transform .12s ease,box-shadow .12s ease}
+          .btn{min-height:34px;padding:7px 13px;border-radius:9px;border:1px solid var(--brand-deep);background:var(--brand-deep);color:#fff;font-weight:680;transition:transform .12s ease,box-shadow .12s ease}
           .btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(35,27,22,.15)}
           .btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
           .btnSecondary{min-height:34px;padding:7px 11px;border-radius:9px;border:1px solid var(--line);background:#fff;color:var(--ink);font-weight:650}
@@ -613,7 +625,7 @@ function createWindow() {
           .kv{font-size:12px;color:var(--muted);line-height:1.5;min-width:0;overflow-wrap:anywhere}
           .kv b{color:var(--ink)}
           .resultNote{display:none;margin-top:10px;padding:9px 10px;border-radius:9px;background:#f7f5f2;color:var(--muted);font-size:11px;line-height:1.4}
-          .field{width:100%;min-height:72px;border:1px solid #dcd4cc;border-radius:11px;padding:10px 11px;background:#fff;resize:vertical;line-height:1.4;color:var(--ink)}
+          .field{width:100%;min-height:62px;border:1px solid #dcd4cc;border-radius:10px;padding:9px 11px;background:#fff;resize:vertical;line-height:1.4;color:var(--ink)}
           .field::placeholder{color:#978d84}
           .searchBar{display:flex;align-items:flex-end;gap:9px;margin-top:10px}
           .searchBar .field{flex:1}
@@ -627,27 +639,35 @@ function createWindow() {
           @media(max-width:460px){#localPanel{padding-left:14px;padding-right:14px}.contextLine{padding-left:0}.searchBar{align-items:stretch;flex-direction:column}.searchBar .btn{width:100%}}
         </style>
       </head>
-      <body style="font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f8f5ef;color:#24140c">
-        <div style="padding:20px 20px 12px 20px">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
-            <div style="width:34px;height:34px;border-radius:10px;background:#24140c;color:white;display:grid;place-items:center;font-weight:700">${BRAND_MARK}</div>
+      <body>
+        <header class="titleBar">
+          <div class="titleBrand"><img class="titleLogo" src="${brandLogoDataUrl}" alt=""><span>${CONNECTOR_NAME}</span></div>
+          <div class="windowControls">
+            <button id="minimizeBtn" class="windowControl" aria-label="Minimize">−</button>
+            <button id="maximizeBtn" class="windowControl" aria-label="Maximize">□</button>
+            <button id="closeBtn" class="windowControl close" aria-label="Close">×</button>
+          </div>
+        </header>
+        <main id="appContent"><div style="padding:16px 20px 10px">
+          <div style="display:flex;align-items:center;gap:11px;margin-bottom:12px">
+            <img src="${brandLogoDataUrl}" alt="Gajkesari" style="width:38px;height:38px;object-fit:contain">
             <div style="flex:1">
-              <h2 style="margin:0;font-size:18px">${CONNECTOR_NAME}</h2>
-              <div style="font-size:12px;color:#6c5c4f">Desktop bridge for Tally Prime</div>
+              <h2 style="font-family:'Aptos Display','Aptos',sans-serif;margin:0;font-size:18px;letter-spacing:-.02em">${CONNECTOR_NAME}</h2>
+              <div style="font-size:12px;color:var(--muted);margin-top:1px">Desktop bridge for Tally Prime</div>
             </div>
             <div style="position:relative">
-              <button id="menuBtn" title="Menu" style="width:34px;height:34px;border-radius:8px;border:1px solid #ded1c3;background:#fff;font-size:20px;line-height:1">⋮</button>
+              <button id="menuBtn" title="More" aria-label="More options" style="width:28px;height:32px;padding:0;border:0;background:transparent;color:var(--ink);font-size:22px;line-height:1">⋮</button>
               <div id="menu" style="display:none;position:absolute;right:0;top:38px;min-width:180px;background:#fff;border:1px solid #ded1c3;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,0.12);overflow:hidden;z-index:20">
                 <button id="menuLocalMatching" style="width:100%;text-align:left;padding:10px 14px;background:#fff;border:0;font-size:13px">Local Matching</button>
               </div>
             </div>
           </div>
-          <div id="card" style="border:1px solid #ded1c3;border-radius:12px;background:#fffaf5;padding:16px">
+          <div id="card" style="border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:14px">
             <div id="title" style="font-size:15px;font-weight:650">Waiting for connection</div>
             <div id="detail" style="margin-top:6px;color:#6c5c4f;font-size:13px;line-height:1.4">Open ${BRAND_NAME} and click Connect.</div>
           </div>
-          <div style="margin-top:12px;color:#8a7b6f;font-size:12px">Do not close this window while posting entries to Tally.</div>
-        </div>
+          <div style="margin-top:10px;color:#8a7b6f;font-size:11px">Keep the connector open while using Tally.</div>
+        </div></main>
 
         <div id="localPanel">
           <div class="stickyHeader">
@@ -681,6 +701,9 @@ function createWindow() {
 
         <script>
           const { ipcRenderer } = require('electron');
+          document.getElementById('minimizeBtn').addEventListener('click', () => ipcRenderer.send('window:minimize'));
+          document.getElementById('maximizeBtn').addEventListener('click', () => ipcRenderer.send('window:toggle-maximize'));
+          document.getElementById('closeBtn').addEventListener('click', () => ipcRenderer.send('window:close'));
           const card = document.getElementById('card');
           const menuBtn = document.getElementById('menuBtn');
           const menu = document.getElementById('menu');
@@ -902,6 +925,13 @@ if (!gotLock) {
   });
   app.whenReady().then(() => {
     installSystemNetworkFetch();
+    ipcMain.on("window:minimize", () => mainWindow?.minimize());
+    ipcMain.on("window:toggle-maximize", () => {
+      if (!mainWindow) return;
+      if (mainWindow.isMaximized()) mainWindow.unmaximize();
+      else mainWindow.maximize();
+    });
+    ipcMain.on("window:close", () => mainWindow?.close());
     // Local Matching IPC (read-only, persistent)
     try {
       ipcMain.handle("local-matching:getStatus", async () => getLocalMatchingStatus());
