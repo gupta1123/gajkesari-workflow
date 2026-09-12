@@ -6,7 +6,7 @@ import { hashSecret, TALLY_CONNECTION_SELECT, type TallyConnectionRow } from "@/
 
 const MODEL = "openai/text-embedding-3-small";
 const DIMENSIONS = 512;
-const MAX_INPUTS = 64;
+const MAX_INPUTS = 256;
 const MAX_INPUT_LENGTH = 1_000;
 
 function bridgeToken(request: Request) {

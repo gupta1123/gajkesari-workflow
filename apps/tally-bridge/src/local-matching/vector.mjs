@@ -6,7 +6,7 @@ import { getLocalDbPaths, normalizeCompanyKey, saveLocalDb } from "./store.mjs";
 export const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 export const EMBEDDING_DIMENSIONS = 512;
 const VECTOR_VERSION = 3;
-const BATCH_SIZE = 64;
+const BATCH_SIZE = 256;
 
 const packageCandidates = () => [
   path.join(process.cwd(), "node_modules", "@zvec", "zvec", "package.json"),
@@ -46,6 +46,37 @@ async function loadZvec() {
 
 function getCollectionPath(vectorDir, companyKey) {
   return path.join(vectorDir, "zvec", companyKey.replace(/[:]/g, "_"));
+}
+
+function getManifestPath(vectorDir, companyKey) {
+  return path.join(vectorDir, "zvec", `${companyKey.replace(/[:]/g, "_")}.manifest.json`);
+}
+
+function ledgerFingerprint(ledger) {
+  return crypto.createHash("sha256").update(JSON.stringify([
+    ledger.master_key, ledger.tally_name, ledger.parent_name || "", Boolean(ledger.is_active),
+  ])).digest("hex");
+}
+
+function emptyManifest() {
+  return { version: VECTOR_VERSION, model: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS, fingerprints: {} };
+}
+
+function loadManifest(vectorDir, companyKey) {
+  const file = getManifestPath(vectorDir, companyKey);
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (value.version === VECTOR_VERSION && value.model === EMBEDDING_MODEL && value.dimensions === EMBEDDING_DIMENSIONS && value.fingerprints) return value;
+  } catch {}
+  return null;
+}
+
+function saveManifest(vectorDir, companyKey, manifest) {
+  const file = getManifestPath(vectorDir, companyKey);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(manifest), { mode: 0o600 });
+  fs.renameSync(temporary, file);
 }
 
 function safeDocumentId(masterKey) {
@@ -97,6 +128,13 @@ async function createCollection(vectorDir, companyKey) {
   return collection;
 }
 
+async function openCollection(vectorDir, companyKey) {
+  const api = apiFrom(await loadZvec());
+  const target = getCollectionPath(vectorDir, companyKey);
+  if (!api.open || !fs.existsSync(target)) return null;
+  try { return await api.open(target); } catch { return null; }
+}
+
 export function getVectorStatus(db, { companyName, companyGuid }) {
   const key = normalizeCompanyKey({ companyGuid, companyName });
   const value = db.companies[key]?.vector || { status: "idle", lastVectorisedAt: null, vectorCount: 0, engine: "zvec", error: null };
@@ -112,15 +150,32 @@ export async function vectoriseCompany({ db, companyName, companyGuid, appUserDa
   const ledgers = Object.values(entry.ledgers || {}).filter((ledger) => ledger.is_active);
   const { vectorDir } = getLocalDbPaths({ appUserDataPath, baseDir });
   const startedAt = Date.now();
-  entry.vector = { status: "indexing", engine: "zvec", embeddingModel: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS,
-    vectorCount: 0, indexedCount: 0, progress: { done: 0, total: ledgers.length }, error: null };
-  saveLocalDb(db, { appUserDataPath, baseDir });
-  onProgress?.({ phase: "embedding", done: 0, total: ledgers.length });
+  const target = getCollectionPath(vectorDir, key);
+  let manifest = loadManifest(vectorDir, key);
   let collection;
-  try {
+  if (!manifest && fs.existsSync(target) && entry.vector?.status === "indexing" &&
+      entry.vector?.embeddingModel === EMBEDDING_MODEL && entry.vector?.dimensions === EMBEDDING_DIMENSIONS) {
+    const completed = Math.max(0, Math.min(Number(entry.vector.indexedCount) || 0, ledgers.length));
+    manifest = emptyManifest();
+    for (const ledger of ledgers.slice(0, completed)) manifest.fingerprints[ledger.master_key] = ledgerFingerprint(ledger);
+    saveManifest(vectorDir, key, manifest);
+  }
+  if (manifest) collection = await openCollection(vectorDir, key);
+  if (!collection) {
+    manifest = emptyManifest();
     collection = await createCollection(vectorDir, key);
-    for (let offset = 0; offset < ledgers.length; offset += BATCH_SIZE) {
-      const batch = ledgers.slice(offset, offset + BATCH_SIZE);
+    saveManifest(vectorDir, key, manifest);
+  }
+  const pendingLedgers = ledgers.filter((ledger) => manifest.fingerprints[ledger.master_key] !== ledgerFingerprint(ledger));
+  const alreadyDone = ledgers.length - pendingLedgers.length;
+  entry.vector = { status: "indexing", engine: "zvec", embeddingModel: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS,
+    version: VECTOR_VERSION, vectorCount: alreadyDone, indexedCount: alreadyDone,
+    progress: { done: alreadyDone, total: ledgers.length }, error: null };
+  saveLocalDb(db, { appUserDataPath, baseDir });
+  onProgress?.({ phase: "embedding", done: alreadyDone, total: ledgers.length });
+  try {
+    for (let offset = 0; offset < pendingLedgers.length; offset += BATCH_SIZE) {
+      const batch = pendingLedgers.slice(offset, offset + BATCH_SIZE);
       const embeddings = await embedTexts(batch.map(embeddingText), "search_document");
       if (!Array.isArray(embeddings) || embeddings.length !== batch.length) throw new Error("Embedding provider returned the wrong number of vectors.");
       const documents = batch.map((ledger, index) => ({
@@ -128,12 +183,17 @@ export async function vectoriseCompany({ db, companyName, companyGuid, appUserDa
         fields: { ledgerName: ledger.tally_name, parentGroup: ledger.parent_name || "", isActive: true,
           tallyGuid: ledger.tally_guid || "", masterKey: ledger.master_key },
       }));
-      if (collection.insert) await collection.insert(documents);
+      if (collection.upsert) await collection.upsert(documents);
+      else if (collection.upsertSync) collection.upsertSync(documents);
+      else if (collection.insert) await collection.insert(documents);
       else if (collection.insertSync) collection.insertSync(documents);
       else throw new Error("Installed Zvec does not support document insertion.");
-      const done = Math.min(offset + batch.length, ledgers.length);
+      for (const ledger of batch) manifest.fingerprints[ledger.master_key] = ledgerFingerprint(ledger);
+      saveManifest(vectorDir, key, manifest);
+      const done = Math.min(alreadyDone + offset + batch.length, ledgers.length);
       entry.vector.progress = { done, total: ledgers.length };
       entry.vector.indexedCount = done;
+      entry.vector.vectorCount = done;
       saveLocalDb(db, { appUserDataPath, baseDir });
       onProgress?.({ phase: "embedding", done, total: ledgers.length });
     }
@@ -141,7 +201,8 @@ export async function vectoriseCompany({ db, companyName, companyGuid, appUserDa
     entry.vector = { status: "ready", engine: "zvec", embeddingModel: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS,
       embeddingSource: "openrouter", version: VECTOR_VERSION, lastVectorisedAt: new Date().toISOString(), vectorCount: ledgers.length,
       indexedCount: ledgers.length, progress: { done: ledgers.length, total: ledgers.length },
-      result: { elapsedMs: Date.now() - startedAt, mode: "semantic", docCount: ledgers.length }, error: null, zvecVersion: getZvecPackageVersion() };
+      result: { elapsedMs: Date.now() - startedAt, mode: pendingLedgers.length ? "incremental" : "up-to-date",
+        embeddedCount: pendingLedgers.length, skippedCount: alreadyDone, docCount: ledgers.length }, error: null, zvecVersion: getZvecPackageVersion() };
     saveLocalDb(db, { appUserDataPath, baseDir });
     return { ...entry.vector, companyKey: key };
   } catch (error) {
@@ -157,7 +218,9 @@ export async function clearVectorIndex({ db, companyName, companyGuid, appUserDa
   const key = normalizeCompanyKey({ companyGuid, companyName });
   const { vectorDir } = getLocalDbPaths({ appUserDataPath, baseDir });
   const target = getCollectionPath(vectorDir, key);
+  const manifest = getManifestPath(vectorDir, key);
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+  if (fs.existsSync(manifest)) fs.rmSync(manifest, { force: true });
   if (db.companies[key]) {
     db.companies[key].vector = { status: "idle", lastVectorisedAt: null, vectorCount: 0, engine: "zvec", error: null };
     saveLocalDb(db, { appUserDataPath, baseDir });
