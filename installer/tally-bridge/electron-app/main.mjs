@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, net, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, net, ipcMain, safeStorage } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,7 +6,7 @@ import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.m
 import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
 import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable } from "./src/local-matching/vector.mjs";
 import { syncLedgersReadOnly } from "./src/local-matching/sync.mjs";
-import { suggestLedgers } from "./src/local-matching/suggest.mjs";
+import { suggestLedgers, suggestLedgersBatch } from "./src/local-matching/suggest.mjs";
 import { parseDocumentLocal } from "./src/document-parsing/parser.mjs";
 import { exportTallyCollection, fetchAvailableCompanies, testTally } from "./src/bridge.mjs";
 
@@ -29,6 +29,50 @@ const errPath = path.join(installDir, "bridge.err.log");
 const nodeFetch = globalThis.fetch.bind(globalThis);
 const ELECTRON_NETWORK_RETRY_MS = 5 * 60 * 1000;
 let preferNodeFetchUntil = 0;
+let directEmbeddingConfig = null;
+
+function directEmbeddingConfigPath() {
+  return path.join(app.getPath("userData"), "direct-embedding.json");
+}
+
+function forgetDirectEmbeddingConfig() {
+  directEmbeddingConfig = null;
+  try { fs.rmSync(directEmbeddingConfigPath(), { force: true }); } catch {}
+}
+
+async function loadDirectEmbeddingConfig({ refresh = false } = {}) {
+  if (!refresh && directEmbeddingConfig) return directEmbeddingConfig;
+  if (!refresh && safeStorage.isEncryptionAvailable()) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(directEmbeddingConfigPath(), "utf8"));
+      const apiKey = safeStorage.decryptString(Buffer.from(saved.encryptedApiKey, "base64"));
+      if (apiKey && saved.endpoint && saved.model === "openai/text-embedding-3-small" && saved.dimensions === 512) {
+        directEmbeddingConfig = { ...saved, apiKey };
+        return directEmbeddingConfig;
+      }
+    } catch {}
+  }
+  const config = runner?.config;
+  if (!config?.apiBase || !config?.connectionId || !config?.bridgeToken) throw new Error("Reconnect this connector to enable direct AI vector search.");
+  const response = await fetch(`${config.apiBase}/api/tally/bridge/direct-embedding-config?connectionId=${encodeURIComponent(config.connectionId)}`, {
+    headers: { Authorization: `Bearer ${config.bridgeToken}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error || "Direct AI configuration is unavailable.");
+  if (payload?.endpoint !== "https://openrouter.ai/api/v1/embeddings" || payload?.model !== "openai/text-embedding-3-small" || payload?.dimensions !== 512 || !payload?.apiKey) {
+    throw new Error("Direct AI configuration is incompatible.");
+  }
+  directEmbeddingConfig = payload;
+  if (safeStorage.isEncryptionAvailable()) {
+    const saved = { ...payload, apiKey: undefined, encryptedApiKey: safeStorage.encryptString(payload.apiKey).toString("base64") };
+    const target = directEmbeddingConfigPath();
+    const temporary = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(saved), { mode: 0o600 });
+    fs.renameSync(temporary, target);
+  }
+  return directEmbeddingConfig;
+}
 
 let mainWindow = null;
 let runner = null;
@@ -298,6 +342,43 @@ async function handleLocalVectorise() {
 }
 
 async function requestSemanticEmbeddings(inputs) {
+  if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > 256) throw new Error("AI embedding batch requires 1-256 inputs.");
+  try {
+    return await requestDirectSemanticEmbeddings(inputs);
+  } catch (error) {
+    appendLog(errPath, `Direct AI embedding unavailable; using secure proxy: ${formatConnectorError(error)}`);
+    return await requestProxySemanticEmbeddings(inputs);
+  }
+}
+
+async function requestDirectSemanticEmbeddings(inputs, refresh = false) {
+  const direct = await loadDirectEmbeddingConfig({ refresh });
+  const response = await nodeFetch(direct.endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${direct.apiKey}`,
+      "HTTP-Referer": "https://gajkesari.com",
+      "X-Title": "Gajkesari Tally Connector",
+    },
+    body: JSON.stringify({ model: direct.model, input: inputs, dimensions: direct.dimensions }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if ((response.status === 401 || response.status === 403) && !refresh) {
+    forgetDirectEmbeddingConfig();
+    return await requestDirectSemanticEmbeddings(inputs, true);
+  }
+  if (!response.ok) throw new Error(`OpenRouter embedding request failed (${response.status}).`);
+  const ordered = Array.isArray(payload?.data) ? [...payload.data].sort((a, b) => Number(a.index) - Number(b.index)) : [];
+  const embeddings = ordered.map((item) => item?.embedding);
+  if (embeddings.length !== inputs.length || embeddings.some((vector) => !Array.isArray(vector) || vector.length !== direct.dimensions || vector.some((value) => !Number.isFinite(value)))) {
+    throw new Error("OpenRouter returned an incompatible embedding batch.");
+  }
+  return embeddings;
+}
+
+async function requestProxySemanticEmbeddings(inputs) {
   const config = runner?.config;
   if (!config?.apiBase || !config?.connectionId || !config?.bridgeToken) {
     throw new Error("Reconnect this connector to enable secure AI vector search.");
@@ -839,7 +920,53 @@ if (!gotLock) {
           embedTexts: requestSemanticEmbeddings,
         });
       });
+      ipcMain.handle("local-matching:suggest-batch", async (_event, payload) => {
+        const queries = payload?.queries || payload?.items;
+        return await suggestLedgersBatch({
+          queries,
+          companyId: payload?.companyId || payload?.companyGuid || null,
+          companyName: payload?.companyName || null,
+          companyGuid: payload?.companyGuid || null,
+          topK: payload?.topK || payload?.top_k || 5,
+          appUserDataPath: app.getPath("userData"),
+          embedTexts: requestSemanticEmbeddings,
+        });
+      });
       ipcMain.handle("document-parsing:parse", async (_event, payload) => parseDocumentLocal(payload || {}));
+      ipcMain.handle("document-parsing:parse-and-suggest", async (_event, payload) => {
+        const startedAt = performance.now();
+        const parseStartedAt = performance.now();
+        const parsed = await parseDocumentLocal({ ...(payload || {}), output: "json" });
+        const parseMs = performance.now() - parseStartedAt;
+        const transactions = Array.isArray(parsed?.content?.transactions) ? parsed.content.transactions : [];
+        const queries = transactions.map((transaction) => String(transaction?.description || "").trim());
+        if (!queries.length) throw new Error("The document contains no transactions to match.");
+        if (queries.some((query) => !query)) throw new Error("Every parsed transaction must have a description for vector search.");
+        const searchStartedAt = performance.now();
+        const matches = [];
+        for (let offset = 0; offset < queries.length; offset += 256) {
+          matches.push(...await suggestLedgersBatch({
+            queries: queries.slice(offset, offset + 256),
+            companyId: payload?.companyId || payload?.companyGuid || null,
+            companyName: payload?.companyName || null,
+            companyGuid: payload?.companyGuid || null,
+            topK: payload?.topK || payload?.top_k || 5,
+            appUserDataPath: app.getPath("userData"),
+            embedTexts: requestSemanticEmbeddings,
+          }));
+        }
+        const searchMs = performance.now() - searchStartedAt;
+        return {
+          parsed,
+          transactions: transactions.map((transaction, index) => ({ ...transaction, ledgerSuggestions: matches[index]?.suggestions || [] })),
+          matching: matches,
+          timing: {
+            parseMs: Number(parseMs.toFixed(2)),
+            vectorSearchMs: Number(searchMs.toFixed(2)),
+            totalMs: Number((performance.now() - startedAt).toFixed(2)),
+          },
+        };
+      });
     } catch (e) { appendLog(errPath, `Local Matching IPC failed: ${formatConnectorError(e)}`); }
     createWindow();
     const protocolArg =

@@ -1,6 +1,6 @@
 
 import { getLocalDbPaths, loadLocalDb } from "./store.mjs";
-import { isZvecAvailable, queryZvec } from "./vector.mjs";
+import { isZvecAvailable, queryZvec, queryZvecBatch } from "./vector.mjs";
 
 const DEFAULT_TOP_K = 5;
 const MAX_TOP_K = 20;
@@ -76,6 +76,52 @@ function emptyResult({ query, companyId = null, companyName = null, reason, erro
   };
 }
 
+function resultFromDocuments({ searchQuery, company, activeLedgers, documents, limit }) {
+  const suggestions = (Array.isArray(documents) ? documents : [])
+    .map((document) => ({ document, ledger: findLedger(document, activeLedgers) }))
+    .filter((item) => item.ledger)
+    .slice(0, limit)
+    .map(({ document, ledger }, index) => {
+      const confidence = normalizeVectorScore(document);
+      return {
+        ledgerId: ledger.master_key,
+        ledgerName: ledger.tally_name,
+        parentGroup: ledger.parent_name || null,
+        rank: index + 1,
+        localScore: 0,
+        vectorScore: Number(confidence.toFixed(4)),
+        aiScore: null,
+        confidence: Number(confidence.toFixed(4)),
+        source: "zvec",
+        retrievalSource: "zvec",
+        reasons: ["vector similarity"],
+        needsReview: confidence < 0.6,
+        isActive: true,
+        tallyGuid: ledger.tally_guid || null,
+      };
+    });
+
+  return {
+    query: searchQuery,
+    companyId: company.key,
+    companyName: company.entry.companyName,
+    companyGuid: company.entry.companyGuid,
+    suggestions,
+    isEmpty: suggestions.length === 0,
+    emptyReason: suggestions.length ? null : "no_vector_candidates",
+    meta: {
+      topK: limit,
+      totalActive: activeLedgers.length,
+      retrieved: suggestions.length,
+      vectorEngine: "zvec",
+      searchMode: "vector_only",
+      usedAI: true,
+      embeddingModel: "openai/text-embedding-3-small",
+      vectorError: null,
+    },
+  };
+}
+
 export async function suggestLedgers({
   narration,
   ledgerQuery,
@@ -141,47 +187,37 @@ export async function suggestLedgers({
     });
   }
 
-  const suggestions = (Array.isArray(documents) ? documents : [])
-    .map((document) => ({ document, ledger: findLedger(document, activeLedgers) }))
-    .filter((item) => item.ledger)
-    .slice(0, limit)
-    .map(({ document, ledger }, index) => {
-      const confidence = normalizeVectorScore(document);
-      return {
-        ledgerId: ledger.master_key,
-        ledgerName: ledger.tally_name,
-        parentGroup: ledger.parent_name || null,
-        rank: index + 1,
-        localScore: 0,
-        vectorScore: Number(confidence.toFixed(4)),
-        aiScore: null,
-        confidence: Number(confidence.toFixed(4)),
-        source: "zvec",
-        retrievalSource: "zvec",
-        reasons: ["vector similarity"],
-        needsReview: confidence < 0.6,
-        isActive: true,
-        tallyGuid: ledger.tally_guid || null,
-      };
-    });
+  return resultFromDocuments({ searchQuery, company, activeLedgers, documents, limit });
+}
 
-  return {
-    query: searchQuery,
-    companyId: company.key,
-    companyName: company.entry.companyName,
-    companyGuid: company.entry.companyGuid,
-    suggestions,
-    isEmpty: suggestions.length === 0,
-    emptyReason: suggestions.length ? null : "no_vector_candidates",
-    meta: {
-      topK: limit,
-      totalActive: activeLedgers.length,
-      retrieved: suggestions.length,
-      vectorEngine: "zvec",
-      searchMode: "vector_only",
-      usedAI: true,
-      embeddingModel: "openai/text-embedding-3-small",
-      vectorError: null,
-    },
-  };
+export async function suggestLedgersBatch({ queries, companyId, companyName, companyGuid, topK, appUserDataPath, baseDir, embedTexts } = {}) {
+  if (!Array.isArray(queries) || queries.length === 0 || queries.length > 256) {
+    throw new Error("Vector search batch requires 1-256 queries.");
+  }
+  const searchQueries = queries.map((value) => String(value ?? "").trim());
+  if (searchQueries.some((value) => !value)) throw new Error("Every vector search query must contain text.");
+
+  let db;
+  try { db = loadLocalDb({ appUserDataPath, baseDir }); } catch { db = { companies: {} }; }
+  const company = resolveCompany(db, { companyId, companyName, companyGuid });
+  if (!company) return searchQueries.map((searchQuery) => emptyResult({ query: searchQuery, companyId, companyName, reason: "no_company_data" }));
+
+  const activeLedgers = Object.values(company.entry.ledgers || {}).filter((ledger) => ledger.is_active);
+  if (!activeLedgers.length) return searchQueries.map((searchQuery) => emptyResult({ query: searchQuery, companyId: company.key, companyName: company.entry.companyName, reason: "no_active_ledgers" }));
+  if (!isZvecAvailable() || company.entry.vector?.status !== "ready") {
+    return searchQueries.map((searchQuery) => emptyResult({ query: searchQuery, companyId: company.key, companyName: company.entry.companyName, reason: "vector_search_not_ready", totalActive: activeLedgers.length }));
+  }
+
+  const limit = clampTopK(topK);
+  try {
+    if (typeof embedTexts !== "function") throw new Error("Secure AI embedding service is unavailable.");
+    const embeddings = await embedTexts(searchQueries, "search_query");
+    if (!Array.isArray(embeddings) || embeddings.length !== searchQueries.length) throw new Error("The AI embedding service returned an incomplete batch.");
+    const { vectorDir } = getLocalDbPaths({ appUserDataPath, baseDir });
+    const batches = await queryZvecBatch({ vectorDir, companyKey: company.key, embeddings, topK: limit });
+    return searchQueries.map((searchQuery, index) => resultFromDocuments({ searchQuery, company, activeLedgers, documents: batches[index], limit }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return searchQueries.map((searchQuery) => emptyResult({ query: searchQuery, companyId: company.key, companyName: company.entry.companyName, reason: "vector_search_unavailable", error: message, totalActive: activeLedgers.length }));
+  }
 }

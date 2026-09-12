@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { loadLocalDb, saveLocalDb, upsertLedgers } from "./store.mjs";
-import { suggestLedgers } from "./suggest.mjs";
+import { suggestLedgers, suggestLedgersBatch } from "./suggest.mjs";
 
 function tmpBase() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-vector-only-test-"));
@@ -92,5 +92,28 @@ test("result limit remains capped without exposing another search path", async (
   assert.equal(result.meta.searchMode, "vector_only");
   assert.ok(!JSON.stringify(result).includes("fts"));
   assert.ok(!JSON.stringify(result).includes("deterministic"));
+  clean(baseDir);
+});
+
+test("batch vector search validates its bounded request", async () => {
+  await assert.rejects(() => suggestLedgersBatch({ queries: [] }), /1-256 queries/);
+  await assert.rejects(() => suggestLedgersBatch({ queries: Array(257).fill("ledger") }), /1-256 queries/);
+  await assert.rejects(() => suggestLedgersBatch({ queries: ["ledger", " "] }), /must contain text/);
+});
+
+test("batch vector search does not invoke embeddings when the index is unavailable", async () => {
+  const baseDir = tmpBase();
+  seedDb(baseDir);
+  let embeddingCalls = 0;
+  const results = await suggestLedgersBatch({
+    queries: ["Aarav", "Bharat"],
+    companyId: "test-guid",
+    baseDir,
+    embedTexts: async () => { embeddingCalls += 1; return []; },
+  });
+  assert.equal(embeddingCalls, 0);
+  assert.equal(results.length, 2);
+  assert.ok(results.every((result) => result.emptyReason === "vector_search_not_ready"));
+  assert.ok(results.every((result) => result.meta.searchMode === "vector_only"));
   clean(baseDir);
 });

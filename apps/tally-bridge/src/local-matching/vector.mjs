@@ -247,3 +247,26 @@ export async function queryZvec({ vectorDir, companyKey, embedding, topK = 10 })
     try { if (collection?.closeSync) collection.closeSync(); else await collection?.close?.(); } catch {}
   }
 }
+
+export async function queryZvecBatch({ vectorDir, companyKey, embeddings, topK = 10 }) {
+  if (!Array.isArray(embeddings) || embeddings.length === 0 || embeddings.length > BATCH_SIZE) {
+    throw new Error(`Vector batch requires 1-${BATCH_SIZE} embeddings.`);
+  }
+  const vectors = embeddings.map(validateEmbedding);
+  const api = apiFrom(await loadZvec());
+  const target = getCollectionPath(vectorDir, companyKey);
+  if (!fs.existsSync(target)) throw new Error("Vectorise the ledgers before searching.");
+  let collection;
+  try {
+    collection = api.open ? await api.open(target) : await api.create?.(target);
+    if (!collection?.query) throw new Error("Installed Zvec does not support vector queries.");
+    const results = [];
+    for (const vector of vectors) {
+      const response = await collection.query({ fieldName: "embedding", vector, topk: topK });
+      results.push(Array.isArray(response) ? response : response?.results || response?.docs || response?.data || []);
+    }
+    return results;
+  } finally {
+    try { if (collection?.closeSync) collection.closeSync(); else await collection?.close?.(); } catch {}
+  }
+}
