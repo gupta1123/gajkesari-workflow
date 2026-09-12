@@ -10,6 +10,31 @@ export const SUPPORTED_DOCUMENT_EXTENSIONS = [
   ".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", ".csv",
 ];
 
+let bankStatementModulesPromise = null;
+
+async function loadBankStatementModules() {
+  if (bankStatementModulesPromise) return bankStatementModulesPromise;
+  const runtimeRoot = new URL("./backend-logic/", import.meta.url);
+  const sourceRoot = new URL("../../../api/worker/", import.meta.url);
+  const load = async (name) => {
+    try {
+      return await import(new URL(name, runtimeRoot));
+    } catch {
+      return import(new URL(name, sourceRoot));
+    }
+  };
+  bankStatementModulesPromise = Promise.all([
+    load("bank-statement-deterministic.mjs"),
+    load("bank-statement-account.mjs"),
+    load("bank-statement-markdown-amounts.mjs"),
+    load("bank-statement-running-balance.mjs"),
+    load("bank-statement-resilience.mjs"),
+  ]).then(([deterministic, account, amounts, runningBalance, resilience]) => ({
+    deterministic, account, amounts, runningBalance, resilience,
+  }));
+  return bankStatementModulesPromise;
+}
+
 function normalizeOutput(value) {
   const output = String(value || "markdown").trim().toLowerCase();
   if (output === "md") return "markdown";
@@ -108,6 +133,55 @@ function metadata({ fileName, format, bytes, startedAt, structured }) {
   };
 }
 
+function approximatePdfPageCount(bytes) {
+  const source = Buffer.from(bytes).toString("latin1");
+  return Math.max(1, (source.match(/\/Type\s*\/Page\b/g) || []).length);
+}
+
+export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1 } = {}) {
+  const { deterministic, account, amounts, runningBalance, resilience } = await loadBankStatementModules();
+  const normalized = deterministic.deterministicTransactionsFromAnydoc(markdown);
+  if (!normalized?.transactions?.length) {
+    const error = new Error("The bank-statement tables could not be normalized deterministically.");
+    error.code = "deterministic_extraction_unavailable";
+    throw error;
+  }
+  const source = amounts.extractBankStatementMarkdownAmounts(markdown);
+  const accountFromMarkdown = account.extractAccountFromBankStatementMarkdown(markdown);
+  const balanceValidation = runningBalance.validateRunningBalanceContinuity(
+    normalized.transactions,
+    source.openingBalance,
+  );
+  if (balanceValidation.status === "failed") {
+    const error = new Error(`Running-balance validation failed at ${balanceValidation.breaks.length} transaction${balanceValidation.breaks.length === 1 ? "" : "s"}.`);
+    error.code = "running_balance_failed";
+    error.diagnostics = { balanceValidation };
+    throw error;
+  }
+  return {
+    parsed: {
+      account: account.mergeBankStatementAccount({}, accountFromMarkdown),
+      statementPeriodStart: null,
+      statementPeriodEnd: null,
+      openingBalance: source.openingBalance,
+      transactions: resilience.addBankStatementPageProvenance(normalized.transactions, {
+        startPage: 1,
+        endPage: Math.max(1, Number(pageCount) || 1),
+        method: "deterministic_anydoc",
+      }),
+      pageResults: [],
+    },
+    diagnostics: {
+      pipeline: "deterministic_anydoc",
+      rowCount: normalized.transactions.length,
+      headers: normalized.headers,
+      normalized: true,
+      balanceValidation,
+      used: true,
+    },
+  };
+}
+
 export async function parseDocumentLocal(request = {}) {
   const startedAt = performance.now();
   const output = normalizeOutput(request.output || request.outputFormat);
@@ -122,10 +196,17 @@ export async function parseDocumentLocal(request = {}) {
     }
     if (format === "pdf") {
       const markdown = await toMarkdownBytes(bytes, format);
+      const bankStatement = await processBankStatementMarkdownLocal(markdown, {
+        pageCount: request.pageCount || approximatePdfPageCount(bytes),
+      });
       return {
         outputFormat: "json",
-        content: { blocks: null, notes: [], assets: [], markdown },
-        metadata: metadata({ fileName, format, bytes, startedAt, structured: false }),
+        content: bankStatement.parsed,
+        metadata: {
+          ...metadata({ fileName, format, bytes, startedAt, structured: true }),
+          sourceFormat: "anydoc_markdown",
+          diagnostics: bankStatement.diagnostics,
+        },
       };
     }
     const document = await toDocument(bytes, format);

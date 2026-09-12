@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { parseDocumentLocal } from "./parser.mjs";
+import { parseDocumentLocal, processBankStatementMarkdownLocal } from "./parser.mjs";
 
 test("parses CSV to Markdown by default", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-anydoc-"));
@@ -32,4 +32,28 @@ test("rejects unknown output formats", async () => {
     parseDocumentLocal({ bytes: Buffer.from("a,b\n1,2"), fileName: "test.csv", output: "xml" }),
     /markdown.*json/i
   );
+});
+
+test("uses the backend worker logic for normalized bank-statement JSON", async () => {
+  const markdown = `| Account Holder | Account Number | Bank Name |
+|---|---|---|
+| Solution Nyx | 8822014500 | ICICI Bank |
+
+| Opening Balance | 1000.00 |
+|---|---|
+| Statement | 1000.00 |
+
+| Transaction Date | Description | Reference | Debit | Credit | Balance |
+|---|---|---|---|---|---|
+| 01 Aug 2026 | NEFT CREDIT-NOVA ALLOY | REF001 | - | 200.00 | 1200.00 |
+| 02 Aug 2026 | UPI DEBIT-METRO MART | REF002 | 50.00 | - | 1150.00 |`;
+  const result = await processBankStatementMarkdownLocal(markdown, { pageCount: 2 });
+  assert.equal(result.parsed.account.accountNumber, "8822014500");
+  assert.equal(result.parsed.openingBalance, 1000);
+  assert.equal(result.parsed.transactions.length, 2);
+  assert.equal(result.parsed.transactions[0].credit_amount, 200);
+  assert.equal(result.parsed.transactions[1].debit_amount, 50);
+  assert.equal(result.parsed.transactions[0].raw_payload.extractionProvenance.method, "deterministic_anydoc");
+  assert.equal(result.parsed.transactions[0].raw_payload.extractionProvenance.endPage, 2);
+  assert.equal(result.diagnostics.balanceValidation.status, "verified");
 });

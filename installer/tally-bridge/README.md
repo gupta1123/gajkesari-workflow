@@ -55,9 +55,11 @@ is reachable and a company is loaded.
 ## Local document parsing
 
 The connector bundles Firecrawl AnyDoc and parses supported documents entirely on
-the connector machine. Markdown is the default output; pass `--output json` for
-AnyDoc's structured document model. PDF JSON responses contain Markdown because
-AnyDoc does not expose its structured block model for PDFs. Hosted OCR is disabled.
+the connector machine. Markdown is the default output. For PDFs, `--output json`
+uses the same deterministic table normalization, account extraction, amount
+reconciliation, provenance, and running-balance validation as the backend bank
+statement worker. Other document types return AnyDoc's structured document model.
+Hosted OCR is disabled.
 
 ```powershell
 npm run document:parse --workspace @gajkesari/tally-bridge -- --input "C:\path\invoice.pdf"

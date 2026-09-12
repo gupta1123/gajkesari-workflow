@@ -28,6 +28,7 @@ const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
 const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
 const localMatchingSource = path.join(bridgeRoot, "src", "local-matching");
 const documentParsingSource = path.join(bridgeRoot, "src", "document-parsing");
+const bankStatementWorkerSource = path.join(repoRoot, "apps", "api", "worker");
 const webSocketPackageSource = path.join(repoRoot, "node_modules", "ws");
 const zvecPackageSource = path.join(repoRoot, "node_modules", "@zvec", "zvec");
 const zvecBindingsSource = path.join(repoRoot, "node_modules", "@zvec");
@@ -288,6 +289,17 @@ fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, 
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
 copyDir(documentParsingSource, path.join(appDir, "src", "document-parsing"));
+const documentParsingLogicDir = path.join(appDir, "src", "document-parsing", "backend-logic");
+fs.mkdirSync(documentParsingLogicDir, { recursive: true });
+for (const name of [
+  "bank-statement-deterministic.mjs",
+  "bank-statement-account.mjs",
+  "bank-statement-markdown-amounts.mjs",
+  "bank-statement-running-balance.mjs",
+  "bank-statement-resilience.mjs",
+]) {
+  fs.copyFileSync(path.join(bankStatementWorkerSource, name), path.join(documentParsingLogicDir, name));
+}
 copyDir(path.join(electronAppSource, "src", "local-matching"), path.join(appDir, "src", "local-matching"));
 copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
 copyDir(anydocPackageSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc"));
@@ -312,7 +324,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.63",
+      version: "0.1.64",
       private: true,
       type: "module",
     },
