@@ -504,22 +504,19 @@ function createWindow() {
           button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid rgba(22,122,80,.2);outline-offset:2px}
           #localPanel{display:none;position:absolute;inset:0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 22px 24px}
           #localPanel.open{display:block}
-          .stickyHeader{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:18px 0 14px;background:linear-gradient(var(--canvas) 78%,rgba(247,245,242,0))}
-          .eyebrow{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
-          .pageTitle{font-size:20px;font-weight:720;letter-spacing:-.02em;margin:2px 0 0}
-          .intro{margin:0 0 18px;color:var(--muted);line-height:1.5}
-          .summary{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,.7fr);gap:10px;margin-bottom:14px}
-          .summaryCard,.step{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:14px}
-          .summaryCard{padding:13px 14px}
-          .summaryLabel{font-size:11px;color:var(--muted);margin-bottom:4px}
-          .summaryValue{font-size:14px;font-weight:680;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+          .stickyHeader{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;padding:18px 0 10px;background:linear-gradient(var(--canvas) 82%,rgba(247,245,242,0))}
+          .pageTitle{font-size:20px;font-weight:720;letter-spacing:-.02em;margin:0}
+          .contextLine{display:flex;align-items:center;gap:7px;min-width:0;margin:0 0 14px;padding-left:48px;color:var(--muted);font-size:12px}
+          .contextLine strong{color:var(--ink);font-weight:680}
+          .contextCompany{max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-weight:650}
+          .step{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:14px}
           .step{padding:16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(35,27,22,.03)}
           .stepReady{border-color:#b9dfca;background:linear-gradient(135deg,#fff 45%,#f1faf5)}
-          .stepHeader{display:flex;align-items:flex-start;gap:12px;margin-bottom:12px}
-          .stepNumber{flex:0 0 28px;height:28px;border-radius:9px;display:grid;place-items:center;background:#eee9e4;color:#685c52;font-weight:750}
+          .stepHeader{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+          .stepNumber{flex:0 0 24px;height:24px;border-radius:8px;display:grid;place-items:center;background:#eee9e4;color:#685c52;font-size:11px;font-weight:750}
           .stepReady .stepNumber{background:var(--accent);color:#fff}
           .stepCopy{min-width:0;flex:1}
-          .stepTitle{font-size:14px;font-weight:720;line-height:1.2;margin:1px 0 3px}
+          .stepTitle{font-size:14px;font-weight:720;line-height:1.2;margin:0}
           .stepHint,.meta,.statusLine{font-size:12px;color:var(--muted);line-height:1.45}
           .metric{font-size:26px;font-weight:740;letter-spacing:-.04em;line-height:1;margin-bottom:4px}
           .row{display:flex;align-items:center;gap:10px;min-width:0}
@@ -545,8 +542,7 @@ function createWindow() {
           .options input[type=number]{width:48px;border:1px solid #dcd4cc;border-radius:7px;padding:5px;background:#fff}
           .resultCard{border:1px solid var(--line);border-radius:11px;background:#fff;padding:11px}
           .resultTitle{font-size:13px;font-weight:700;margin-bottom:4px}
-          .footerNote{display:flex;gap:8px;align-items:flex-start;color:var(--muted);font-size:11px;line-height:1.45;padding:4px 2px}
-          @media(max-width:460px){#localPanel{padding-left:14px;padding-right:14px}.summary{grid-template-columns:1fr}.searchBar{align-items:stretch;flex-direction:column}.searchBar .btn{width:100%}}
+          @media(max-width:460px){#localPanel{padding-left:14px;padding-right:14px}.contextLine{padding-left:0}.searchBar{align-items:stretch;flex-direction:column}.searchBar .btn{width:100%}}
         </style>
       </head>
       <body style="font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f8f5ef;color:#24140c">
@@ -574,38 +570,31 @@ function createWindow() {
         <div id="localPanel">
           <div class="stickyHeader">
             <button id="backBtn" class="iconBtn" aria-label="Back to connector status">←</button>
-            <div style="min-width:0;flex:1"><div class="eyebrow">Tally tools</div><div class="pageTitle">Ledger matching</div></div>
-            <span class="pill" id="dbStatusPill">Checking…</span>
+            <div class="pageTitle">Ledger matching</div>
           </div>
-          <p class="intro">Prepare a fast local copy of your Tally ledgers, then check which ledger best matches a bank narration.</p>
-
-          <div class="summary">
-            <div class="summaryCard"><div class="summaryLabel">Open company</div><div id="companyIdentity" class="summaryValue">Checking Tally…</div><div id="companyGuid" style="display:none"></div></div>
-            <div class="summaryCard"><div class="summaryLabel">Saved ledgers</div><div id="ledgerCount" class="summaryValue">—</div></div>
-          </div>
-          <div id="localDbStatus" style="display:none"></div><div id="localDbPath" style="display:none"></div>
+          <div class="contextLine"><span id="companyIdentity" class="contextCompany">Checking Tally…</span><span>·</span><span><strong id="ledgerCount">—</strong> ledgers</span></div>
+          <div id="companyGuid" style="display:none"></div><div id="localDbStatus" style="display:none"></div><div id="localDbPath" style="display:none"></div><span id="dbStatusPill" style="display:none"></span>
 
           <section id="ledgerStep" class="step stepReady">
-            <div class="stepHeader"><div class="stepNumber">1</div><div class="stepCopy"><div class="stepTitle">Update ledger list</div><div class="stepHint">Copies ledger names from the open Tally company. Nothing in Tally is changed.</div></div></div>
-            <div class="row rowBetween"><div><div id="syncState" class="statusLine">Ready to update</div><div id="lastSync" class="meta">Not updated yet</div></div><button id="syncBtn" class="btn">Update ledgers</button></div>
+            <div class="stepHeader"><div class="stepNumber">1</div><div class="stepTitle">Ledgers</div></div>
+            <div class="row rowBetween"><div><div id="syncState" class="statusLine">Ready</div><div id="lastSync" class="meta">Not updated yet</div></div><button id="syncBtn" class="btn">Refresh</button></div>
             <div id="syncCounts" class="resultNote"></div>
           </section>
 
           <section id="vectorStep" class="step">
-            <div class="stepHeader"><div class="stepNumber">2</div><div class="stepCopy"><div class="stepTitle">Vectorise your ledgers</div><div class="stepHint">Creates AI embeddings for ledger names with text-embedding-3-small. No vouchers or other Tally data are indexed.</div></div></div>
-            <div class="row rowBetween"><div><div id="vectorState" class="statusLine">Waiting for ledgers</div><div id="lastVector" class="meta">Not vectorised yet</div></div><button id="vectorBtn" class="btnSecondary">Vectorise ledgers</button></div>
+            <div class="stepHeader"><div class="stepNumber">2</div><div class="stepTitle">Search index</div></div>
+            <div class="row rowBetween"><div><div id="vectorState" class="statusLine">Waiting for ledgers</div><div id="lastVector" class="meta">Not indexed yet</div></div><button id="vectorBtn" class="btnSecondary">Update index</button></div>
             <div id="vectorCount" style="display:none"></div><div id="vectorProgress" class="resultNote"></div>
           </section>
 
           <section class="step">
-            <div class="stepHeader"><div class="stepNumber">3</div><div class="stepCopy"><div class="stepTitle">Find a matching ledger</div><div class="stepHint">Paste a bank narration or type a party name to see the closest matches.</div></div><span id="zvecReady" class="pill">Checking…</span></div>
-            <div class="searchBar"><textarea id="suggestInput" class="field" aria-label="Bank narration or party name" placeholder="Example: UPI payment to Aarav Steel Traders"></textarea><button id="suggestBtn" class="btn">Find matches</button></div>
+            <div class="stepHeader"><div class="stepNumber">3</div><div class="stepTitle">Find a ledger</div><span id="zvecReady" class="pill" style="margin-left:auto">Checking…</span></div>
+            <div class="searchBar"><textarea id="suggestInput" class="field" aria-label="Bank narration or party name" placeholder="Bank narration or party name"></textarea><button id="suggestBtn" class="btn">Search</button></div>
             <input id="topK" type="hidden" value="5">
-            <div id="suggestStatus" class="statusLine" style="margin-top:10px">Enter a narration to begin.</div>
+            <div id="suggestStatus" class="statusLine" style="margin-top:10px"></div>
             <div id="suggestResults" style="margin-top:10px;display:grid;gap:8px;max-height:250px;overflow-y:auto;overflow-x:hidden"></div>
           </section>
 
-          <div class="footerNote"><span aria-hidden="true">🔒</span><span>Ledger names and searches are securely sent to OpenRouter for embedding. The resulting vector index stays on this computer.</span></div>
         </div>
 
         <script>
@@ -652,22 +641,18 @@ function createWindow() {
           async function refreshLocalStatus(){
             try{
               const s = await ipcRenderer.invoke('local-matching:getStatus');
-              document.getElementById('dbStatusPill').textContent = s.db.exists ? 'Ready' : 'Not prepared';
-              document.getElementById('dbStatusPill').className = s.db.exists ? 'pill pillReady' : 'pill';
               document.getElementById('localDbStatus').textContent = s.db.exists ? 'Local data ready' : 'Local data not created';
               document.getElementById('localDbPath').textContent = s.db.path || '';
               document.getElementById('companyIdentity').textContent = s.tally.companyName || 'Open a company in Tally';
               document.getElementById('companyGuid').textContent = s.tally.companyGuid ? 'GUID: '+s.tally.companyGuid : (s.tally.companyName ? '' : 'Tally not reachable');
               document.getElementById('ledgerCount').textContent = formatCount(s.ledgers.count);
               document.getElementById('lastSync').textContent = s.ledgers.lastSyncAt ? 'Updated '+fmtTime(s.ledgers.lastSyncAt) : 'Not updated yet';
-              document.getElementById('syncState').textContent = s.ledgers.count ? 'Ledger list is ready' : 'Ready to update';
+              document.getElementById('syncState').textContent = s.ledgers.count ? 'Ready' : 'Not synced';
               const sc = s.ledgers.counts;
               const syncCountsEl = document.getElementById('syncCounts');
-              if(sc){
+              if(sc && (sc.added || sc.updated || sc.deleted)){
                 syncCountsEl.style.display='block';
-                syncCountsEl.textContent = sc.added || sc.updated || sc.deleted
-                  ? sc.added+' added · '+sc.updated+' updated · '+sc.deleted+' no longer active'
-                  : 'Everything is up to date.';
+                syncCountsEl.textContent = sc.added+' added · '+sc.updated+' updated · '+sc.deleted+' removed';
               } else { syncCountsEl.style.display='none'; }
               // vector
               const v = s.vector;
@@ -678,24 +663,24 @@ function createWindow() {
               vectorState.textContent = v.error
                 ? 'AI vector search unavailable'
                 : searchReady
-                  ? formatCount(indexed)+' of '+formatCount(indexTotal)+' ledgers vectorised'
+                  ? formatCount(indexed)+' of '+formatCount(indexTotal)+' indexed'
                   : v.status==='indexing'
-                    ? formatCount(indexed)+' of '+formatCount(indexTotal)+' ledgers vectorised'
-                    : s.ledgers.count ? 'Ready to vectorise '+formatCount(s.ledgers.count)+' ledgers' : 'Waiting for ledgers';
+                    ? formatCount(indexed)+' of '+formatCount(indexTotal)+' indexed'
+                    : s.ledgers.count ? 'Ready to index' : 'Waiting for ledgers';
               vectorState.style.color = v.error ? 'var(--danger)' : '';
               document.getElementById('vectorCount').textContent = v.vectorCount||0;
               const progressEl = document.getElementById('vectorProgress');
               progressEl.style.display = v.error ? 'block' : 'none';
               progressEl.textContent = v.error ? v.error : '';
-              document.getElementById('lastVector').textContent = v.lastVectorisedAt ? 'Last vectorised '+fmtTime(v.lastVectorisedAt) : 'Not vectorised yet';
+              document.getElementById('lastVector').textContent = v.lastVectorisedAt ? 'Updated '+fmtTime(v.lastVectorisedAt) : 'Not indexed yet';
               // Zvec ready pill for suggestion
               const zr = document.getElementById('zvecReady');
               if(zr){
                 const isReady = searchReady;
                 const detail = v.engineDetail && typeof v.engineDetail==='object' ? v.engineDetail.reason : v.engineDetail;
                 const zvecAvail = s.isZvecAvailable ? ' • Zvec pkg yes' : (s.zvecVersion ? '' : ' • Zvec pkg no');
-                zr.textContent = isReady ? 'AI vector search ready' : v.status==='error' ? 'AI vector search unavailable' : 'AI vector search not ready';
-                zr.title = (detail || v.engine || 'Search index') + (v.zvecError ? ' | '+v.zvecError.slice(0,120) : '') + zvecAvail;
+                zr.textContent = isReady ? 'Ready' : v.status==='error' ? 'Unavailable' : 'Not ready';
+                zr.title = v.error || '';
                 zr.className = isReady ? 'pill pillReady' : 'pill';
               }
             }catch(e){
@@ -717,7 +702,7 @@ function createWindow() {
           ipcRenderer.on('local-matching:vector-progress', (_event, progress) => {
             const done = Number(progress?.done || 0);
             const total = Number(progress?.total || 0);
-            setVectorState(formatCount(done)+' of '+formatCount(total)+' ledgers vectorised', false);
+            setVectorState(formatCount(done)+' of '+formatCount(total)+' indexed', false);
           });
 
           syncBtn.addEventListener('click', async () => {
@@ -728,18 +713,18 @@ function createWindow() {
               await refreshLocalStatus();
             }catch(e){
               setSyncState(e.message||String(e), true);
-            } finally { syncBtn.disabled=false; syncBtn.textContent='Update ledgers'; }
+            } finally { syncBtn.disabled=false; syncBtn.textContent='Refresh'; }
           });
 
           vectorBtn.addEventListener('click', async () => {
-            vectorBtn.disabled=true; vectorBtn.textContent='Vectorising…'; setVectorState('Starting ledger vectorisation…');
+            vectorBtn.disabled=true; vectorBtn.textContent='Updating…'; setVectorState('Starting…');
             try{
               const r = await ipcRenderer.invoke('local-matching:vectorise');
-              setVectorState(formatCount(r.vectorCount)+' of '+formatCount(r.vectorCount)+' ledgers vectorised', false);
+              setVectorState(formatCount(r.vectorCount)+' of '+formatCount(r.vectorCount)+' indexed', false);
               await refreshLocalStatus();
             }catch(e){
               setVectorState(e.message||String(e), true);
-            } finally { vectorBtn.disabled=false; vectorBtn.textContent='Vectorise ledgers'; }
+            } finally { vectorBtn.disabled=false; vectorBtn.textContent='Update index'; }
           });
 
           const suggestInput = document.getElementById('suggestInput');
@@ -766,14 +751,12 @@ function createWindow() {
                   : 'No vector results found.';
                 return;
               }
-              suggestStatus.textContent = 'Vector search · '+res.suggestions.length+' possible match'+(res.suggestions.length===1?'':'es')+'.';
+              suggestStatus.textContent = res.suggestions.length+' match'+(res.suggestions.length===1?'':'es');
               suggestResults.innerHTML = res.suggestions.map(function(s){
                 const confidence = Math.max(0,Math.min(100,Math.round(Number(s.confidence||0)*100)));
                 return '<div class="resultCard">'
                   + '<div class="row rowBetween"><div class="resultTitle">' + escapeHtml(s.ledgerName) + '</div><span class="pill">' + confidence + '% match</span></div>'
                   + (s.parentGroup?'<div class="meta">'+escapeHtml(s.parentGroup)+'</div>':'')
-                  + '<div class="meta" style="margin-top:5px">Vector result</div>'
-                  + (s.needsReview?'<div class="meta" style="color:#9a6700;margin-top:5px">Please review before using this match.</div>':'')
                   + '</div>';
               }).join('');
             }catch(e){
