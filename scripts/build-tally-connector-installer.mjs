@@ -26,7 +26,10 @@ const outputDir = path.join(installerRoot, "output");
 const outputExe = path.join(outputDir, connector.setupName);
 const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
 const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
+const localMatchingSource = path.join(bridgeRoot, "src", "local-matching");
 const webSocketPackageSource = path.join(repoRoot, "node_modules", "ws");
+const zvecPackageSource = path.join(repoRoot, "node_modules", "@zvec", "zvec");
+const zvecBindingsSource = path.join(repoRoot, "node_modules", "@zvec");
 const powerShellSource = path.join(bridgeRoot, "powershell");
 const samplesSource = path.join(bridgeRoot, "samples");
 const tdlSource = path.join(bridgeRoot, "tdl");
@@ -84,6 +87,13 @@ function validateSources() {
     connector.connectorName,
     "Electron product name"
   );
+  // Zvec is required for Local Matching vector search. Validate if installed.
+  if (fs.existsSync(path.join(zvecPackageSource, "package.json"))) {
+    ensureContains(path.join(electronAppSource, "main.mjs"), "Local Matching", "Electron Local Matching UI");
+    console.log(`Zvec package found: ${zvecPackageSource}`);
+  } else {
+    console.warn(`Warning: @zvec/zvec not installed at ${zvecPackageSource} — payload will fallback to FTS and UI will show unavailable. Install with: npm install @zvec/zvec --workspace @gajkesari/tally-bridge`);
+  }
   console.log(
     `Installer sources validated for ${connector.connectorName} (${connector.protocolName}://).`
   );
@@ -271,13 +281,30 @@ fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
+copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
+copyDir(path.join(electronAppSource, "src", "local-matching"), path.join(appDir, "src", "local-matching"));
 copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
+if (fs.existsSync(zvecPackageSource)) {
+  copyDir(path.join(repoRoot, "node_modules", "@zvec"), path.join(appDir, "node_modules", "@zvec"));
+  // Also copy @zvec's transitive bindings if present
+  const bindings = ["@zvec/bindings-win32-x64", "@zvec/bindings-linux-x64", "@zvec/bindings-darwin-arm64", "@zvec/bindings-linux-arm64"];
+  for (const b of bindings) {
+    const src = path.join(repoRoot, "node_modules", b);
+    if (fs.existsSync(src)) copyDir(src, path.join(appDir, "node_modules", b));
+  }
+  // Zvec runtime requires detect-libc (pure JS) — ensure it's in payload
+  const detectLibcSrc = path.join(repoRoot, "node_modules", "detect-libc");
+  if (fs.existsSync(detectLibcSrc)) copyDir(detectLibcSrc, path.join(appDir, "node_modules", "detect-libc"));
+  console.log("Zvec payload included (native bindings will require electron-rebuild).");
+} else {
+  console.warn("Zvec not installed — payload will use FTS fallback.");
+}
 fs.writeFileSync(
   path.join(payloadDir, "package.json"),
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.61",
+      version: "0.1.62",
       private: true,
       type: "module",
     },

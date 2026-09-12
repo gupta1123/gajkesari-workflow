@@ -1,7 +1,13 @@
 {
   "name": "gajkesari-tally-connector-wrapper",
-  "version": "0.1.61",
+  "version": "0.1.62",
   "private": true,
   "type": "module",
-  "main": "main.mjs"
+  "main": "main.mjs",
+  "dependencies": {
+    "@zvec/zvec": "^0.7.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.0"
+  }
 }

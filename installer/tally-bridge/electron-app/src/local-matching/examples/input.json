@@ -1,0 +1,9 @@
+{
+  "narration": "UPI DR Aarav Steel Traders 5000",
+  "amount": 5000,
+  "date": "2026-09-12",
+  "direction": "debit",
+  "accountId": "acc-123",
+  "companyId": "mock-guid-123",
+  "topK": 10
+}

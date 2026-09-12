@@ -1,6 +1,6 @@
 {
   "name": "@gajkesari/tally-bridge",
-  "version": "0.1.61",
+  "version": "0.1.62",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,9 +12,16 @@
     "start": "node src/bridge.mjs start",
     "disconnect": "node src/bridge.mjs disconnect",
     "test": "node src/bridge.mjs test",
-    "sync": "node src/bridge.mjs sync-masters"
+    "sync": "node src/bridge.mjs sync-masters",
+    "local-matching:suggest": "node src/local-matching/cli.mjs",
+    "test:local-matching": "node --test src/local-matching/*.test.mjs src/local-matching/*.test.mjs"
   },
   "dependencies": {
+    "@zvec/zvec": "^0.7.1",
     "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.0",
+    "electron": "^31.7.7"
   }
 }

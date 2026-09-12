@@ -1,0 +1,41 @@
+{
+  "query": "UPI DR Aarav Steel Traders 5000",
+  "companyId": "guid:mock-guid-123",
+  "companyName": "Mock Company",
+  "suggestions": [
+    {
+      "ledgerId": "ledger:aarav steel traders",
+      "ledgerName": "Aarav Steel Traders",
+      "parentGroup": "Sundry Debtors",
+      "rank": 1,
+      "localScore": 0.92,
+      "vectorScore": 0.8,
+      "aiScore": null,
+      "confidence": 0.92,
+      "source": "deterministic",
+      "reasons": ["exact normalized match", "localScore 0.92"],
+      "needsReview": false
+    },
+    {
+      "ledgerId": "ledger:aarav steel traders pvt ltd",
+      "ledgerName": "Aarav Steel Traders Pvt Ltd",
+      "parentGroup": "Sundry Debtors",
+      "rank": 2,
+      "localScore": 0.78,
+      "vectorScore": 0.6,
+      "aiScore": null,
+      "confidence": 0.78,
+      "source": "fts",
+      "reasons": ["vectorScore 0.60 (fts)", "needsReview: low confidence or close collision"],
+      "needsReview": true
+    }
+  ],
+  "isEmpty": false,
+  "meta": {
+    "topK": 10,
+    "totalActive": 7,
+    "retrieved": 2,
+    "vectorEngine": "fts",
+    "usedAI": false
+  }
+}
