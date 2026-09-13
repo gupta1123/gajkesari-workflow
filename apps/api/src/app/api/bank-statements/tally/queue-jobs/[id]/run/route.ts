@@ -3,10 +3,13 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { refreshBankStatementQueueJobStatus } from "@/lib/bank-statement-tally-queue-status";
 import { POST as runTallyQueue } from "../../../queue/route";
 
-const QUEUE_JOB_BATCH_SIZE = Math.max(
-  1,
-  Math.min(10, Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 10))
+const MAX_QUEUE_JOB_BATCH_SIZE = 50;
+const configuredQueueJobBatchSize = Number(
+  process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? MAX_QUEUE_JOB_BATCH_SIZE
 );
+const QUEUE_JOB_BATCH_SIZE = Number.isFinite(configuredQueueJobBatchSize)
+  ? Math.max(1, Math.min(MAX_QUEUE_JOB_BATCH_SIZE, Math.floor(configuredQueueJobBatchSize)))
+  : MAX_QUEUE_JOB_BATCH_SIZE;
 
 type QueueJobPayload = {
   connectionId?: string;

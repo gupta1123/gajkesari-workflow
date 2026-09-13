@@ -3324,6 +3324,8 @@ export function BankStatementsPage() {
   const [bankLedgerVerified, setBankLedgerVerified] = useState(false);
   const [bankLedgerManuallyConfirmed, setBankLedgerManuallyConfirmed] = useState(false);
   const [bankLedgerChangeMode, setBankLedgerChangeMode] = useState(false);
+  const [loadingLedgerCatalogue, setLoadingLedgerCatalogue] = useState(false);
+  const [ledgerCatalogueError, setLedgerCatalogueError] = useState("");
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
@@ -4425,27 +4427,35 @@ export function BankStatementsPage() {
       return [];
     }
 
-    const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
-    const liveCompanyName = selectedCompanyName || connectionCompany?.companyName || "";
-    // This live catalogue is used only when the user explicitly needs the full
-    // review picker. Matching itself uses the connector's local vector index;
-    // never mirror the complete ledger list into Supabase from this page.
-    const payload = await runCashDiscountLiveRequest<{
-      ledgers?: TallyMaster[];
-      groups?: TallyMaster[];
-    }>({
-      connectionId,
-      companyName: liveCompanyName,
-      operation: "local_ledger_catalogue",
-      payload: {
-        source: "connector_local_db",
-      },
-    });
-    const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
-    if (loadSeq === ledgerLoadSeqRef.current) {
-      setLedgerMasters(masters);
+    setLoadingLedgerCatalogue(true);
+    setLedgerCatalogueError("");
+    try {
+      const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
+      const liveCompanyName = selectedCompanyName || connectionCompany?.companyName || "";
+      // This catalogue comes from the connector's local database only when the
+      // user opens a manual picker. Matching uses the local vector index; never
+      // mirror the complete ledger list into Supabase from this page.
+      const payload = await runCashDiscountLiveRequest<{
+        ledgers?: TallyMaster[];
+        groups?: TallyMaster[];
+      }>({
+        connectionId,
+        companyName: liveCompanyName,
+        operation: "local_ledger_catalogue",
+        payload: {
+          source: "connector_local_db",
+        },
+      });
+      const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
+      if (loadSeq === ledgerLoadSeqRef.current) {
+        setLedgerMasters(masters);
+      }
+      return masters;
+    } finally {
+      if (loadSeq === ledgerLoadSeqRef.current) {
+        setLoadingLedgerCatalogue(false);
+      }
     }
-    return masters;
   }, [companyOptions, selectedCompanyName]);
 
   useEffect(() => {
@@ -4798,10 +4808,10 @@ export function BankStatementsPage() {
   }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
 
   useEffect(() => {
-    // The connector already returned the relevant vector candidates. Fetch the
-    // complete live catalogue only when a user opens manual ledger editing.
+    // The connector already returned the relevant vector candidates. Fetch its
+    // complete local catalogue only when a user opens either manual ledger picker.
     if (
-      editingLedgerIds.size === 0 ||
+      (!bankLedgerChangeMode && editingLedgerIds.size === 0) ||
       !tallyConnectionId ||
       fullLedgerCatalogueConnectionRef.current === tallyConnectionId
     ) return;
@@ -4811,11 +4821,17 @@ export function BankStatementsPage() {
       .then(() => {
         if (!cancelled) fullLedgerCatalogueConnectionRef.current = tallyConnectionId;
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        if (!cancelled) {
+          setLedgerCatalogueError(
+            error instanceof Error ? error.message : "Could not load the connector ledger catalogue."
+          );
+        }
+      });
     return () => {
       cancelled = true;
     };
-  }, [editingLedgerIds.size, loadLedgerMasters, tallyConnectionId]);
+  }, [bankLedgerChangeMode, editingLedgerIds.size, loadLedgerMasters, tallyConnectionId]);
 
   useEffect(() => {
     if ((loading || sending || matchingBills || syncingMasters || postUploadSyncImportId) && selectedCompanyId) {
@@ -5191,6 +5207,7 @@ export function BankStatementsPage() {
     setPendingBankLedgerName("");
   }
   function beginBankLedgerChange() {
+    setLedgerCatalogueError("");
     setPendingBankLedgerName(bankLedgerName);
     setBankLedgerChangeMode(true);
   }
@@ -7577,7 +7594,7 @@ export function BankStatementsPage() {
                           <div className="flex items-center gap-1.5">
                             <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Tally Ledger</span>
                             <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[7px] font-extrabold uppercase tracking-wider text-emerald-800">
-                              Matched
+                              {bankLedgerVerified ? "Matched" : bankLedgerManuallyConfirmed ? "Selected" : "Chosen"}
                             </span>
                           </div>
                           <div className="truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={bankLedgerName}>
@@ -7599,6 +7616,16 @@ export function BankStatementsPage() {
                               placeholder="Search bank accounts or all Tally ledgers"
                               value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
                             />
+                            {bankLedgerChangeMode && loadingLedgerCatalogue ? (
+                              <div className="mt-1 text-[8px] font-semibold text-slate-500">
+                                Loading all ledgers from the connector…
+                              </div>
+                            ) : null}
+                            {bankLedgerChangeMode && ledgerCatalogueError ? (
+                              <div className="mt-1 text-[8px] font-semibold text-red-700">
+                                {ledgerCatalogueError}
+                              </div>
+                            ) : null}
                           </div>
                           {!bankLedgerChangeMode ? (
                             <div className="flex max-w-[220px] items-start gap-1 text-[8px] font-semibold leading-3 text-amber-700">
