@@ -28,6 +28,9 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install project dependencies
+        run: npm ci
+
       - name: Install Windows Electron runtime
         shell: pwsh
         run: |
