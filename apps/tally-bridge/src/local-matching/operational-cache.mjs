@@ -129,43 +129,58 @@ export function upsertVoucherPartition(
   let added = 0, updated = 0, unchanged = 0, deleted = 0;
   let maxAlterId = Number(partition.cursor?.lastAlterId) || 0;
   let maxMasterId = Number(partition.cursor?.lastMasterId) || 0;
+  const markAffectedParties = (voucher) => {
+    if (!voucher) return;
+    for (const name of [voucher.partyLedgerName, ...(voucher.ledgerNames || [])]) {
+      if (name && normalize(name) !== normalize(bankLedgerName)) affectedPartyNames.add(String(name).trim());
+    }
+  };
 
   for (const voucher of vouchers || []) {
     const key = voucherIdentity(voucher);
     seen.add(key);
     const belongsToBank = voucherTouchesLedger(voucher, bankLedgerName) && !/^yes$/i.test(String(voucher.isCancelled || ""));
     const previous = partition.vouchers[key];
-    for (const name of [voucher.partyLedgerName, ...(voucher.ledgerNames || [])]) {
-      if (name && normalize(name) !== normalize(bankLedgerName)) affectedPartyNames.add(String(name).trim());
-    }
-    // Tally emits cancelled vouchers without their party or ledger entries.
-    // Use the cached pre-cancellation identity so its open-bill bucket is
-    // invalidated and refreshed instead of serving the settled bill state.
-    if (previous) {
-      for (const name of [previous.partyLedgerName, ...(previous.ledgerNames || [])]) {
-        if (name && normalize(name) !== normalize(bankLedgerName)) affectedPartyNames.add(String(name).trim());
-      }
-    }
     const numericAlterId = Number(voucher.alterId);
     const numericMasterId = Number(voucher.masterId);
     if (Number.isFinite(numericAlterId)) maxAlterId = Math.max(maxAlterId, numericAlterId);
     if (Number.isFinite(numericMasterId)) maxMasterId = Math.max(maxMasterId, numericMasterId);
     if (!belongsToBank) {
-      if (previous?.isActive) { previous.isActive = false; previous.deletedAt = now; deleted += 1; }
+      if (previous?.isActive) {
+        previous.isActive = false;
+        previous.deletedAt = now;
+        deleted += 1;
+        // Tally emits cancelled vouchers without their ledger entries, so use
+        // the cached identity to invalidate the correct bill bucket.
+        markAffectedParties(previous);
+      }
       continue;
     }
     const next = minimalVoucher(voucher, now);
-    if (!previous) { partition.vouchers[key] = next; added += 1; }
+    if (!previous) {
+      partition.vouchers[key] = next;
+      added += 1;
+      markAffectedParties(next);
+    }
     else {
       const changed = JSON.stringify({ ...previous, lastSeenAt: null }) !== JSON.stringify({ ...next, lastSeenAt: null });
       partition.vouchers[key] = { ...previous, ...next, updatedAt: changed ? now : previous.updatedAt };
-      if (changed) updated += 1; else unchanged += 1;
+      if (changed) {
+        updated += 1;
+        markAffectedParties(previous);
+        markAffectedParties(next);
+      } else unchanged += 1;
     }
   }
 
   if (mode === "full_snapshot") {
     for (const [key, voucher] of Object.entries(partition.vouchers)) {
-      if (voucher.isActive && !seen.has(key)) { voucher.isActive = false; voucher.deletedAt = now; deleted += 1; }
+      if (voucher.isActive && !seen.has(key)) {
+        voucher.isActive = false;
+        voucher.deletedAt = now;
+        deleted += 1;
+        markAffectedParties(voucher);
+      }
     }
     partition.lastFullRefreshAt = now;
   } else if (mode === "scoped_snapshot" && dateFrom && dateTo) {
@@ -175,6 +190,7 @@ export function upsertVoucherPartition(
         voucher.isActive = false;
         voucher.deletedAt = now;
         deleted += 1;
+        markAffectedParties(voucher);
       }
     }
   }

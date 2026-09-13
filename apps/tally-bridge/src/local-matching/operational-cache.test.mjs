@@ -80,3 +80,19 @@ test("scoped snapshot retires only missing in-range vouchers and preserves the g
   assert.equal(partition.vouchers["voucher:outside"].isActive, true);
   assert.deepEqual(partition.cursor, { lastAlterId: "50", lastMasterId: "40" });
 });
+
+test("scoped snapshot keeps bill caches for unchanged vouchers", () => {
+  const db = loadOperationalCache({ baseDir: temp() });
+  const { partition } = ensureVoucherPartition(db, { companyGuid: "c1", bankLedgerName: "Bank A", financialYear: "2026-27" });
+  const cachedVoucher = voucher({ date: "20260901", effectiveDate: "20260901" });
+  upsertVoucherPartition(partition, [cachedVoucher], { mode: "full_snapshot", bankLedgerName: "Bank A" });
+  putCachedBillBucket(partition, "Customer A", { complete: true, openBills: [], existingAdvances: [] });
+
+  const result = upsertVoucherPartition(partition, [cachedVoucher], {
+    mode: "scoped_snapshot", bankLedgerName: "Bank A", dateFrom: "2026-09-01", dateTo: "2026-09-01",
+  });
+
+  assert.equal(result.counts.unchanged, 1);
+  assert.deepEqual(result.affectedPartyNames, []);
+  assert.ok(getCachedBillBucket(partition, "Customer A"));
+});
