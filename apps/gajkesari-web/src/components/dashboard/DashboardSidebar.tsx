@@ -4,6 +4,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useRef, useState } from "react";
 import {
+  CircleAlert,
+  CircleDashed,
   Landmark,
   LogOut,
   ChevronsUpDown,
@@ -12,6 +14,8 @@ import {
   PlugZap,
 } from "lucide-react";
 
+import { useTallyConnectionStatus } from "@/components/tally/TallyConnectionStatusProvider";
+import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import styles from "./DashboardSidebar.module.css";
 
 /* ── Sectioned nav ───────────────────────────── */
@@ -53,6 +57,7 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const userRowRef = useRef<HTMLDivElement>(null);
+  const { connection, loading } = useTallyConnectionStatus();
 
   const displayUser: UserInfo = user ?? {
     name: "Admin",
@@ -66,12 +71,26 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
     .toUpperCase()
     .slice(0, 2);
 
+  const tallyConnected = Boolean(
+    connection?.bridgeConnected &&
+      connection.tallyReachable &&
+      connection.companyLoaded,
+  );
+  const tallyDetail = tallyConnected
+    ? connection?.lastCompanyName || "Company loaded"
+    : connection?.bridgeConnected
+      ? connection.tallyReachable
+        ? "Open a company in Tally"
+        : "Tally Prime is unavailable"
+      : "Connector is offline";
+  const TallyStatusIcon = loading ? CircleDashed : CircleAlert;
+
   return (
     <aside className={`${styles.sidebar} ${collapsed ? styles.collapsed : ""}`}>
       {/* ── BRAND ── */}
       <div className={`${styles.brandRow} ${collapsed ? styles.collapsed : ""}`}>
         <div className={styles.brandLeft}>
-          <div className={styles.brandLogoMark}>P</div>
+          <div className={styles.brandLogoMark}>G</div>
           <span className={styles.brandTitle}>Gajkesari</span>
         </div>
         <button
@@ -142,6 +161,29 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
       </nav>
 
       <div className={styles.spacer} />
+
+      <Link
+        href="/tally-prime?view=connection"
+        className={`${styles.tallyStatusCard} ${
+          tallyConnected ? styles.tallyStatusConnected : styles.tallyStatusOffline
+        }`}
+        aria-label={
+          loading
+            ? "Checking Tally connection"
+            : `${tallyConnected ? "Tally connected" : "Tally not connected"}. ${tallyDetail}`
+        }
+        title={collapsed ? tallyDetail : undefined}
+      >
+        {tallyConnected ? (
+          <GradientSuccessMark size="sm" />
+        ) : (
+          <TallyStatusIcon className={styles.tallyStatusIcon} aria-hidden="true" />
+        )}
+        <span className={styles.tallyStatusCopy}>
+          <strong>{loading ? "Checking Tally" : tallyConnected ? "Tally connected" : "Tally not connected"}</strong>
+          <small>{loading ? "Reading connection status" : tallyDetail}</small>
+        </span>
+      </Link>
 
       {/* ── USER ROW (opens popover) ── */}
       <div className={styles.userRowWrapper} ref={userRowRef}>

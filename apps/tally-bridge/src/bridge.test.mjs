@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   buildCollectionExportXml,
@@ -21,12 +24,35 @@ import {
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   reconcileBankTransactionsInTally,
+  refreshCachedBankVouchers,
   resolveBankVoucherLedgerIdentities,
   strictBankTransactionCandidates,
   indexBankVouchersByDate,
   fetchAvailableCompanies,
   testTally,
 } from "./bridge.mjs";
+
+test("operational voucher provider bootstraps once then requests only changed vouchers", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-provider-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const fullXml = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
+  const request = {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
+    transactions: [{ referenceNumber: "UTR-1" }],
+  };
+  const dependencies = {
+    localMatchingBaseDir: baseDir,
+    companyGuid: "company-guid",
+    exportCollection: async (_url, options) => { calls.push(options); return fullXml; },
+  };
+  const first = await refreshCachedBankVouchers("http://tally", request, dependencies);
+  assert.equal(first.diagnostics.refreshMode, "full_snapshot");
+  assert.equal(first.vouchers.length, 1);
+  const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
+  assert.equal(second.diagnostics.refreshMode, "delta");
+  assert.match(calls[1].formulae[0].formula, /AlterID > 20/);
+});
 
 test("Tally response decoding preserves Unicode ledger punctuation", () => {
   const xml = '<LEDGER NAME="Task Metcorp Global (Opc) Private Limited – Jalna"></LEDGER>';

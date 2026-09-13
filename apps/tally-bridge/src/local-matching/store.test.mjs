@@ -3,7 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, getStatusForCompany, normalizeCompanyKey } from "./store.mjs";
+import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, upsertGroups, getLocalMasterCatalogue, getStatusForCompany, normalizeCompanyKey } from "./store.mjs";
 
 function tmpBase() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-local-matching-test-"));
@@ -81,6 +81,27 @@ test("missing/deleted records are marked inactive", () => {
   const deleted = Object.values(entry.ledgers).find((l)=> l.tally_name==="DeleteMe");
   assert.equal(deleted.is_active, false);
   clean(base);
+});
+
+test("delta updates never retire masters omitted from a partial response", () => {
+  const db = loadLocalDb({ baseDir: tmpBase() });
+  upsertLedgers({ db, companyName: "Co", companyGuid: "g", ledgers: [
+    { name: "A", guid: "a", alterID: "1" }, { name: "B", guid: "b", alterID: "2" },
+  ] });
+  const result = upsertLedgers({ db, companyName: "Co", companyGuid: "g", mode: "delta", ledgers: [
+    { name: "A changed", guid: "a", alterID: "3" },
+  ] });
+  assert.equal(result.counts.deleted, 0);
+  assert.equal(result.entry.ledgerCount, 2);
+});
+
+test("group hierarchy is persisted and exposed with the local catalogue", () => {
+  const db = loadLocalDb({ baseDir: tmpBase() });
+  upsertLedgers({ db, companyName: "Co", companyGuid: "g", ledgers: [{ name: "Party", guid: "l", parent: "Regional Debtors" }] });
+  upsertGroups({ db, companyName: "Co", companyGuid: "g", groups: [{ name: "Regional Debtors", guid: "grp", parent: "Sundry Debtors" }] });
+  const catalogue = getLocalMasterCatalogue(db, { companyName: "Co", companyGuid: "g" });
+  assert.equal(catalogue.ledgers.length, 1);
+  assert.equal(catalogue.groups[0].parent, "Sundry Debtors");
 });
 
 test("stable company identity prevents duplicate company records", () => {

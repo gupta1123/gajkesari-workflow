@@ -9,7 +9,7 @@ import {
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
-import { tallyMasterFreshnessCutoff } from "@/lib/tally/masters";
+import { isBankStatementExtractionIncomplete } from "@/lib/bank-statement-extraction-status";
 
 export const runtime = "nodejs";
 
@@ -56,6 +56,7 @@ async function resolveStatementBankLedger(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
   ownerUserId: string,
   connectionId: string | null,
+  companyDatasetId: string | null,
   accountNumber: string | null,
   savedCandidates: Array<{ accountNumber?: string | null; tallyLedgerName?: string | null }>,
   legacyProvidedLedgerName: string | null | undefined
@@ -84,10 +85,10 @@ async function resolveStatementBankLedger(
     return { ledgerName: null, source: "ambiguous_saved_bank_account_mapping", requiresSelection: true, verified: false };
   }
 
-  if (!connectionId || !normalizedAccountNumber) {
+  if ((!connectionId && !companyDatasetId) || !normalizedAccountNumber) {
     return {
       ledgerName: legacyProvidedLedger || null,
-      source: legacyProvidedLedger ? "legacy_manual_selection" : connectionId ? "missing_statement_account_number" : "missing_tally_connection",
+      source: legacyProvidedLedger ? "legacy_manual_selection" : (connectionId || companyDatasetId) ? "missing_statement_account_number" : "missing_tally_connection",
       requiresSelection: !legacyProvidedLedger,
       verified: false,
     };
@@ -101,16 +102,17 @@ async function resolveStatementBankLedger(
     ["group", groupRows],
   ] as const) {
     for (let from = 0; from < 20000; from += pageSize) {
-      const { data, error } = await supabase
+      let query = supabase
         .from("tally_masters")
         .select("tally_name, parent_name, raw_payload")
         .eq("owner_user_id", ownerUserId)
-        .eq("connection_id", connectionId)
         .eq("master_type", masterType)
         .eq("is_active", true)
-        .gte("last_synced_at", tallyMasterFreshnessCutoff())
-        .order("tally_name", { ascending: true })
-        .range(from, from + pageSize - 1);
+        .order("tally_name", { ascending: true });
+      query = companyDatasetId
+        ? query.eq("company_dataset_id", companyDatasetId)
+        : query.eq("connection_id", connectionId);
+      const { data, error } = await query.range(from, from + pageSize - 1);
       if (error) throw error;
       const page = (data ?? []) as Array<Record<string, unknown>>;
       target.push(...page);
@@ -321,13 +323,21 @@ export async function GET(
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
     const jobIsTerminal = ["succeeded", "failed", "cancelled"].includes(jobStatus);
-    const publicJobStatus =
-      jobStatus === "succeeded" && effectiveImportStatus === "manual_review_required"
-        ? "partial"
-        : jobStatus;
     const processing =
       !jobIsTerminal &&
       (effectiveImportStatus === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
+    const extractionDiagnostics = readRecord(
+      previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics
+    );
+    const requiresManualExtraction = isBankStatementExtractionIncomplete({
+      effectiveImportStatus,
+      processing,
+      transactionCount: transactionsTotal,
+      extractionDiagnostics,
+      legacyRequiresManualExtraction: Boolean(previewMeta.requiresManualExtraction),
+    });
+    const publicJobStatus =
+      jobStatus === "succeeded" && requiresManualExtraction ? "partial" : jobStatus;
 
     const { data: postedRows, error: postedRowsError } = await supabase
       .from("bank_transactions")
@@ -388,11 +398,6 @@ export async function GET(
       jobRow = repairedJobRow;
     }
 
-    const requiresManualExtraction =
-      effectiveImportStatus === "manual_review_required" ||
-      effectiveImportStatus === "failed" ||
-      Boolean(previewMeta.requiresManualExtraction) ||
-      (!processing && transactionsTotal === 0);
     const account = {
       bankName:
         typeof previewAccount.bankName === "string"
@@ -427,10 +432,10 @@ export async function GET(
           ifscCode: account.ifscCode,
         }, importRow.company_dataset_id)
       : [];
-    const bankLedgerResolution = processing
+    const bankLedgerResolution = processing || !includeTransactions
       ? {
           ledgerName: account.tallyLedgerName,
-          source: "analysis_processing",
+          source: processing ? "analysis_processing" : "metadata_only",
           requiresSelection: !account.tallyLedgerName,
           verified: false,
         }
@@ -438,6 +443,7 @@ export async function GET(
           supabase,
           user.id,
           readConnectionIdFromMeta(processingMeta),
+          typeof importRow.company_dataset_id === "string" ? importRow.company_dataset_id : null,
           account.accountNumber,
           candidates,
           account.tallyLedgerName
@@ -457,7 +463,7 @@ export async function GET(
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
-      extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
+      extractionDiagnostics: Object.keys(extractionDiagnostics).length > 0 ? extractionDiagnostics : null,
       ledgerRecommendationError:
         previewMeta.ledgerRecommendationError ?? processingMeta.ledgerRecommendationError ?? null,
       processing,

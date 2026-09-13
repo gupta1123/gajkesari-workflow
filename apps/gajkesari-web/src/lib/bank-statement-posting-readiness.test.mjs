@@ -95,6 +95,43 @@ test("Suspense receipt badge does not report a missing ledger", async () => {
   assert.equal(badges.getBillAllocationBadgeText({...receipt, selectedLedgerName: ""}, []), "Needs Ledger");
 });
 
+test("an explicit Suspense fallback stays postable when close-match alternatives exist", async () => {
+  const page = await readFile(new URL("../components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("page.tsx", page, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const helper = ast.statements.find((node) =>
+    ts.isFunctionDeclaration(node) && node.name?.text === "getReviewStatus"
+  );
+  assert.ok(helper);
+  const stubs = `
+    const isSuspenseLedgerName = name => String(name).toLowerCase().includes('suspense');
+  `;
+  const compiled = ts.transpileModule(stubs + "export " + helper.getText(ast), {
+    compilerOptions: { module: ts.ModuleKind.ESNext },
+  }).outputText;
+  const { getReviewStatus } = await import(
+    "data:text/javascript;base64," + Buffer.from(compiled).toString("base64")
+  );
+  assert.equal(getReviewStatus({
+    selectedLedgerName: "Suspense",
+    ledgerAction: "use_suspense",
+    requiresUserConfirmation: true,
+    candidateLedgerNames: ["NACH DR Administrative Expenses"],
+  }), "suspense");
+  assert.equal(getReviewStatus({
+    selectedLedgerName: "",
+    ledgerAction: "needs_review",
+    requiresUserConfirmation: true,
+    candidateLedgerNames: ["NACH DR Administrative Expenses"],
+  }), "needs_review");
+});
+
+test("close-match Suspense and plain Suspense have distinct labels and colors", async () => {
+  const page = await readFile(new URL("../components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
+  assert.match(page, /Close match · defaults to Suspense/);
+  assert.match(page, /status === "suspense" && transaction\.candidateLedgerNames\.length > 0\) return "bg-sky-500"/);
+  assert.match(page, /return "bg-amber-500"/);
+});
+
 test("bill-wise rows require a completed, balanced reviewed allocation", () => {
   assert.equal(isReadyForTallyPosting(ready({ billRequired: true })), false);
   for (const overrides of [

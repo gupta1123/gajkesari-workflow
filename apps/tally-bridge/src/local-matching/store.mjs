@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 export const LOCAL_DB_VERSION = 1;
-export const LOCAL_DB_SCHEMA_VERSION = 1;
+export const LOCAL_DB_SCHEMA_VERSION = 2;
 
 const CONFIG_DIR = path.join(os.homedir(), ".gajkesari-tally-bridge");
 
@@ -78,12 +78,13 @@ function migrateDb(raw) {
   }
   // v1 initial — ensure fields
   if (!raw.version) raw.version = LOCAL_DB_VERSION;
-  if (!raw.schemaVersion) raw.schemaVersion = LOCAL_DB_SCHEMA_VERSION;
+  raw.schemaVersion = LOCAL_DB_SCHEMA_VERSION;
   if (!raw.companies || typeof raw.companies !== "object") raw.companies = {};
   if (!raw.meta) raw.meta = { createdAt: new Date().toISOString() };
   // Ensure companies structure
   for (const [k, v] of Object.entries(raw.companies)) {
     if (!v.ledgers || typeof v.ledgers !== "object") v.ledgers = {};
+    if (!v.groups || typeof v.groups !== "object") v.groups = {};
     if (!v.syncHistory) v.syncHistory = {};
     if (!v.vector) v.vector = { status: "idle", lastVectorisedAt: null, vectorCount: 0, engine: "fts", error: null };
   }
@@ -112,7 +113,7 @@ export function getCompanyEntry(db, companyKey) {
   return db.companies[companyKey] || null;
 }
 
-export function upsertLedgers({ db, companyName, companyGuid, ledgers, cursor }) {
+export function upsertLedgers({ db, companyName, companyGuid, ledgers, cursor, mode = "full_snapshot" }) {
   const companyKey = normalizeCompanyKey({ companyGuid, companyName });
   const now = new Date().toISOString();
   let entry = db.companies[companyKey];
@@ -125,6 +126,7 @@ export function upsertLedgers({ db, companyName, companyGuid, ledgers, cursor })
       ledgerCount: 0,
       syncCursor: cursor || null,
       ledgers: {},
+      groups: {},
       syncHistory: { lastCounts: null, lastError: null },
       vector: { status: "idle", lastVectorisedAt: null, vectorCount: 0, engine: "fts", error: null, incremental: true },
     };
@@ -183,11 +185,13 @@ export function upsertLedgers({ db, companyName, companyGuid, ledgers, cursor })
   }
 
   let deleted = 0;
-  for (const [key, ledger] of Object.entries(entry.ledgers)) {
-    if (!incomingKeys.has(key) && ledger.is_active) {
-      ledger.is_active = false;
-      ledger.deletedAt = now;
-      deleted += 1;
+  if (mode === "full_snapshot") {
+    for (const [key, ledger] of Object.entries(entry.ledgers)) {
+      if (!incomingKeys.has(key) && ledger.is_active) {
+        ledger.is_active = false;
+        ledger.deletedAt = now;
+        deleted += 1;
+      }
     }
   }
 
@@ -202,6 +206,7 @@ export function upsertLedgers({ db, companyName, companyGuid, ledgers, cursor })
   }
   entry.syncCursor = syncCursor;
   entry.lastSyncAt = now;
+  if (mode === "full_snapshot") entry.lastFullSyncAt = now;
   entry.ledgerCount = Object.values(entry.ledgers).filter((l) => l.is_active).length;
   const total = Object.keys(entry.ledgers).length;
   const counts = { added, updated, unchanged, deleted, inactive: deleted, error: 0, total, active: entry.ledgerCount };
@@ -210,6 +215,93 @@ export function upsertLedgers({ db, companyName, companyGuid, ledgers, cursor })
   entry.syncHistory.lastError = null;
 
   return { companyKey, counts, entry };
+}
+
+function normalizeGroupKey({ name, guid }) {
+  const source = guid ? String(guid).trim() : String(name || "").trim();
+  return `group:${source.toLowerCase().replace(/\s+/g, " ")}`;
+}
+
+export function upsertGroups({ db, companyName, companyGuid, groups = [], cursor, mode = "full_snapshot" }) {
+  const companyKey = normalizeCompanyKey({ companyGuid, companyName });
+  const now = new Date().toISOString();
+  const entry = db.companies[companyKey];
+  if (!entry) throw new Error("Company ledger entry must exist before groups are stored.");
+  entry.groups ||= {};
+  const incomingKeys = new Set();
+  let added = 0, updated = 0, unchanged = 0, deleted = 0;
+  for (const group of groups) {
+    const name = String(group.name || "").trim();
+    if (!name) continue;
+    const guid = group.guid ? String(group.guid).trim() : null;
+    const key = normalizeGroupKey({ name, guid });
+    incomingKeys.add(key);
+    const payload = {
+      tally_name: name,
+      tally_guid: guid,
+      parent_name: group.parent ? String(group.parent).trim() : null,
+      master_key: key,
+      alterID: group.alterID ? String(group.alterID).trim() : null,
+      masterID: group.masterID ? String(group.masterID).trim() : null,
+      is_active: true,
+      lastSeen: now,
+    };
+    const existing = entry.groups[key];
+    if (!existing) {
+      entry.groups[key] = payload;
+      added += 1;
+    } else if (
+      existing.tally_name !== payload.tally_name ||
+      (existing.tally_guid || "") !== (payload.tally_guid || "") ||
+      (existing.parent_name || "") !== (payload.parent_name || "") ||
+      (existing.alterID || "") !== (payload.alterID || "") ||
+      (existing.masterID || "") !== (payload.masterID || "")
+    ) {
+      entry.groups[key] = { ...existing, ...payload, updatedAt: now };
+      updated += 1;
+    } else {
+      existing.lastSeen = now;
+      existing.is_active = true;
+      unchanged += 1;
+    }
+  }
+  if (mode === "full_snapshot") {
+    for (const [key, group] of Object.entries(entry.groups)) {
+      if (!incomingKeys.has(key) && group.is_active) {
+        group.is_active = false;
+        group.deletedAt = now;
+        deleted += 1;
+      }
+    }
+  }
+  entry.syncCursor = { ...(entry.syncCursor || {}), ...(cursor || {}), updatedAt: now };
+  entry.groupCount = Object.values(entry.groups).filter((group) => group.is_active).length;
+  return { companyKey, counts: { added, updated, unchanged, deleted, active: entry.groupCount, mode }, entry };
+}
+
+export function getLocalMasterCatalogue(db, { companyName, companyGuid } = {}) {
+  const companyKey = normalizeCompanyKey({ companyGuid, companyName });
+  const entry = db.companies[companyKey];
+  if (!entry) return null;
+  return {
+    companyKey,
+    companyName: entry.companyName,
+    companyGuid: entry.companyGuid,
+    fetchedAt: entry.lastSyncAt,
+    ledgers: Object.values(entry.ledgers || {}).filter((item) => item.is_active).map((item) => ({
+      name: item.tally_name,
+      guid: item.tally_guid || null,
+      parent: item.parent_name || null,
+      type: "ledger",
+      billWiseEnabled: typeof item.raw_payload?.billWiseEnabled === "boolean" ? item.raw_payload.billWiseEnabled : null,
+    })),
+    groups: Object.values(entry.groups || {}).filter((item) => item.is_active).map((item) => ({
+      name: item.tally_name,
+      guid: item.tally_guid || null,
+      parent: item.parent_name || null,
+      type: "group",
+    })),
+  };
 }
 
 export function markSyncError({ db, companyName, companyGuid, error }) {

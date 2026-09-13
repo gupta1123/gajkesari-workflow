@@ -96,6 +96,56 @@ export async function resolveTallyTarget(request: Request, ownerUserId: string, 
     connectionId, sessionGeneration: c.session_generation as number, companyGuid, companyName };
 }
 
+export async function resolveBankStatementUploadTarget(
+  request: Request,
+  ownerUserId: string,
+  connectionId: string,
+  companyName: string
+) {
+  const binding = browserBindingToken(request);
+  if (!binding) throw new Error("Pair this browser with its local connector first.");
+
+  const db = createSupabaseAdminClient();
+  const { data, error } = await db.rpc("resolve_bank_statement_upload_target", {
+    p_owner: ownerUserId,
+    p_connection: connectionId,
+    p_binding_hash: hashSecret(binding),
+    p_company_name: companyName,
+    p_selected_dataset: request.headers.get("x-tally-dataset-id") || null,
+  });
+
+  if (error) {
+    const missingFunction =
+      error.code === "PGRST202" ||
+      error.message?.includes("resolve_bank_statement_upload_target");
+    if (missingFunction) {
+      return resolveTallyTarget(request, ownerUserId, connectionId, companyName);
+    }
+    throw error;
+  }
+
+  const target = data && typeof data === "object" && !Array.isArray(data)
+    ? data as Record<string, unknown>
+    : null;
+  if (
+    !target?.installationId ||
+    !target.companyDatasetId ||
+    !target.connectionId ||
+    !target.companyGuid
+  ) {
+    throw new Error("The selected Tally company could not be resolved.");
+  }
+
+  return {
+    installationId: String(target.installationId),
+    companyDatasetId: String(target.companyDatasetId),
+    connectionId: String(target.connectionId),
+    sessionGeneration: Number(target.sessionGeneration ?? 0),
+    companyGuid: String(target.companyGuid),
+    companyName: String(target.companyName || companyName),
+  };
+}
+
 // Reconnection changes a session, never the installation/company owning a row.
 export async function targetForDataset(request: Request, ownerUserId: string, datasetId: string) {
   if (!(await browserDatasetIds(request, ownerUserId)).includes(datasetId)) {

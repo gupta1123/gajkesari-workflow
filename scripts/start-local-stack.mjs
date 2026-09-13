@@ -1,6 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import net from "node:net";
 
+// This launcher is specifically for the local production-like stack. Next's
+// production server otherwise falls back to the remote worker pool when the
+// shell did not export APP_BASE_URL, allowing an older deployed worker to
+// claim a job created from localhost.
+const localStackEnv = {
+  ...process.env,
+  APP_BASE_URL: process.env.APP_BASE_URL || "http://localhost:3001",
+  BANK_STATEMENT_WORKER_POOL: "local",
+};
+
 const serviceDefinitions = [
   ["frontend", "npm run start --workspace @gajkesari/web -- -p 3000", 3000],
   ["api", "npm run start --workspace @gajkesari/api", 3001],
@@ -58,12 +68,12 @@ for (const [name, command] of services) {
   const child = process.platform === "win32"
     ? spawn("cmd.exe", ["/d", "/s", "/c", command], {
         cwd: process.cwd(),
-        env: process.env,
+        env: localStackEnv,
         stdio: "inherit",
       })
     : spawn("sh", ["-c", command], {
         cwd: process.cwd(),
-        env: process.env,
+        env: localStackEnv,
         stdio: "inherit",
       });
 

@@ -3,6 +3,19 @@ import test from "node:test";
 
 import { deterministicTransactionsFromAnydoc } from "./bank-statement-deterministic.mjs";
 
+test("recognizes an AnyDoc table with fused withdrawal and deposit headings", () => {
+  const markdown = `
+Account statement-controlled open-bill workflow test 01 Sep 2026
+|DATE|PARTICULARS|REFERENCE / UTR|WITHDRAWAL DEPOSIT|
+|---|---|---|---|
+|01 Sep|NEFT CR FROM Example Customer|GKSSEP0101|10,000.00|`;
+  const result = deterministicTransactionsFromAnydoc(markdown);
+  assert.equal(result.transactions.length, 1);
+  assert.equal(result.transactions[0].transaction_date, "2026-09-01");
+  assert.equal(result.transactions[0].credit_amount, 10_000);
+  assert.equal(result.transactions[0].debit_amount, null);
+});
+
 test("recovers a transaction embedded in an Axis header and infers its year", () => {
   const markdown = `Statement period: 28 Aug 2026 to 28 Aug 2026
 |Date 28 Aug|Description / Particulars IMPS CR Acme Metals|Reference / UTR AXIS001|Debit|Credit 10,000.00|Balance 1,10,000.00|

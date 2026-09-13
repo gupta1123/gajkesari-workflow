@@ -23,7 +23,8 @@ const installerRoot = path.join(repoRoot, "installer", "tally-bridge");
 const electronAppSource = path.join(installerRoot, "electron-app");
 const payloadDir = path.join(installerRoot, "payload-clean");
 const outputDir = path.join(installerRoot, "output");
-const outputExe = path.join(outputDir, connector.setupName);
+const setupName = process.env.GAJKESARI_INSTALLER_OUTPUT_NAME || connector.setupName;
+const outputExe = path.join(outputDir, setupName);
 const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
 const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
 const localMatchingSource = path.join(bridgeRoot, "src", "local-matching");
@@ -331,7 +332,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.68",
+      version: "0.1.70",
       private: true,
       type: "module",
     },
@@ -341,7 +342,8 @@ fs.writeFileSync(
 );
 
 if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
-execFileSync(innoCompiler, [innoDefinition], {
+const outputBaseName = path.basename(setupName, path.extname(setupName));
+execFileSync(innoCompiler, [innoDefinition, `/F${outputBaseName}`], {
   cwd: installerRoot,
   stdio: "inherit",
 });

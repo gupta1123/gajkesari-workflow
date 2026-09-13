@@ -1,4 +1,5 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { queueTallyCommandAndWake } from "@/lib/tally/queue-command";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { isLocalDbMode } from "@/lib/local/mode";
@@ -189,7 +190,7 @@ export async function POST(
       ? (body.payload as Record<string, unknown>)
       : {};
 
-    if (commandType === "parse_document") {
+    if (commandType === "parse_document" || commandType === "parse_and_suggest") {
       const documentUrl = toNullableText(rawPayload.documentUrl ?? rawPayload.sourceUrl, 4000);
       const base64 = typeof rawPayload.base64 === "string" ? rawPayload.base64.trim() : "";
       const outputValue = toNullableText(rawPayload.output ?? rawPayload.outputFormat, 20)?.toLowerCase() || "markdown";
@@ -211,6 +212,15 @@ export async function POST(
         fileName: toNullableText(rawPayload.fileName, 500),
         format: toNullableText(rawPayload.format, 20),
         output,
+        ...(commandType === "parse_and_suggest"
+          ? {
+              companyName:
+                toNullableText(rawPayload.companyName, 240) ??
+                toNullableText(connection.last_company_name, 240),
+              companyGuid: toNullableText(rawPayload.companyGuid, 240),
+              topK: Math.min(20, Math.max(5, Number(rawPayload.topK ?? 10) || 10)),
+            }
+          : {}),
       };
 
       if (isLocalDbMode()) {
@@ -242,7 +252,9 @@ export async function POST(
         connection_id: id,
         owner_user_id: user.id,
         event_type: "command_queued",
-        message: "Local document parsing queued for connector.",
+        message: commandType === "parse_and_suggest"
+          ? "Local document parsing and vector ledger retrieval queued for connector."
+          : "Local document parsing queued for connector.",
         payload: { commandType, fileName: payload.fileName, output },
       });
       return jsonWithCors(request, {
@@ -344,20 +356,14 @@ export async function POST(
       }
 
       const supabase = createSupabaseAdminClient();
-      const { data, error } = await supabase
-        .from("tally_bridge_commands")
-        .insert({
-          connection_id: id,
-          owner_user_id: user.id,
-          command_type: commandType,
-          status: "queued",
-          priority: 15,
-          payload,
-        })
-        .select("*")
-        .single();
-
-      if (error) throw error;
+      const { command: data } = await queueTallyCommandAndWake<TallyBridgeCommandRow>({
+        supabase,
+        connectionId: id,
+        ownerUserId: user.id,
+        commandType,
+        priority: 15,
+        payload,
+      });
 
       await supabase.from("tally_connection_events").insert({
         connection_id: id,

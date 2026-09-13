@@ -7,6 +7,22 @@ export const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 export const EMBEDDING_DIMENSIONS = 512;
 const VECTOR_VERSION = 3;
 const BATCH_SIZE = 256;
+const openCollections = new Map();
+const openingCollections = new Map();
+const collectionQueues = new Map();
+
+async function withCollectionAccess(target, work) {
+  const previous = collectionQueues.get(target) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  collectionQueues.set(target, current);
+  await previous.catch(() => {});
+  try { return await work(); }
+  finally {
+    release();
+    if (collectionQueues.get(target) === current) collectionQueues.delete(target);
+  }
+}
 
 const packageCandidates = () => [
   path.join(process.cwd(), "node_modules", "@zvec", "zvec", "package.json"),
@@ -109,6 +125,7 @@ async function createCollection(vectorDir, companyKey) {
   const api = apiFrom(await loadZvec());
   if (!api.create || !api.Schema) throw new Error("Installed Zvec API is not compatible with this connector.");
   const target = getCollectionPath(vectorDir, companyKey);
+  await closeCachedCollection(target);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
   const schema = new api.Schema({
@@ -125,14 +142,39 @@ async function createCollection(vectorDir, companyKey) {
   });
   const collection = await api.create(target, schema);
   if (!collection) throw new Error("Zvec could not create the ledger collection.");
+  openCollections.set(target, collection);
   return collection;
 }
 
 async function openCollection(vectorDir, companyKey) {
-  const api = apiFrom(await loadZvec());
   const target = getCollectionPath(vectorDir, companyKey);
-  if (!api.open || !fs.existsSync(target)) return null;
-  try { return await api.open(target); } catch { return null; }
+  if (openCollections.has(target)) return openCollections.get(target);
+  if (openingCollections.has(target)) return openingCollections.get(target);
+  const opening = (async () => {
+    const api = apiFrom(await loadZvec());
+    if (!api.open || !fs.existsSync(target)) return null;
+    try {
+      const collection = await api.open(target);
+      if (collection) openCollections.set(target, collection);
+      return collection;
+    } catch { return null; }
+  })();
+  openingCollections.set(target, opening);
+  try { return await opening; }
+  finally { openingCollections.delete(target); }
+}
+
+async function closeCachedCollection(target) {
+  await openingCollections.get(target)?.catch(() => {});
+  await collectionQueues.get(target)?.catch(() => {});
+  const collection = openCollections.get(target);
+  if (!collection) return;
+  openCollections.delete(target);
+  try { if (collection.closeSync) collection.closeSync(); else await collection.close?.(); } catch {}
+}
+
+export async function closeZvecCollections() {
+  await Promise.all(Array.from(openCollections.keys()).map((target) => closeCachedCollection(target)));
 }
 
 export function getVectorStatus(db, { companyName, companyGuid }) {
@@ -148,10 +190,13 @@ export async function vectoriseCompany({ db, companyName, companyGuid, appUserDa
   if (!isZvecAvailable()) throw new Error("Zvec is unavailable. Reinstall the latest connector.");
   if (typeof embedTexts !== "function") throw new Error("Secure AI embedding service is unavailable. Reconnect the connector and try again.");
   const ledgers = Object.values(entry.ledgers || {}).filter((ledger) => ledger.is_active);
+  const activeMasterKeys = new Set(ledgers.map((ledger) => ledger.master_key));
   const { vectorDir } = getLocalDbPaths({ appUserDataPath, baseDir });
   const startedAt = Date.now();
+  const timings = { collectionOpenMs: 0, embeddingMs: 0, deleteMs: 0, upsertMs: 0, manifestMs: 0, checkpointMs: 0, optimizeMs: 0, finalPersistMs: 0 };
   const target = getCollectionPath(vectorDir, key);
   let manifest = loadManifest(vectorDir, key);
+  const hadExistingManifest = Boolean(manifest);
   let collection;
   if (!manifest && fs.existsSync(target) && ["indexing", "ready"].includes(entry.vector?.status) &&
       entry.vector?.embeddingModel === EMBEDDING_MODEL && entry.vector?.dimensions === EMBEDDING_DIMENSIONS) {
@@ -160,57 +205,101 @@ export async function vectoriseCompany({ db, companyName, companyGuid, appUserDa
     for (const ledger of ledgers.slice(0, completed)) manifest.fingerprints[ledger.master_key] = ledgerFingerprint(ledger);
     saveManifest(vectorDir, key, manifest);
   }
+  const collectionStartedAt = Date.now();
   if (manifest) collection = await openCollection(vectorDir, key);
   if (!collection) {
     manifest = emptyManifest();
     collection = await createCollection(vectorDir, key);
     saveManifest(vectorDir, key, manifest);
   }
+  timings.collectionOpenMs = Date.now() - collectionStartedAt;
+  const deletedMasterKeys = Object.keys(manifest.fingerprints || {}).filter((masterKey) => !activeMasterKeys.has(masterKey));
   const pendingLedgers = ledgers.filter((ledger) => manifest.fingerprints[ledger.master_key] !== ledgerFingerprint(ledger));
   const alreadyDone = ledgers.length - pendingLedgers.length;
+  const needsDurableCheckpoints = pendingLedgers.length > BATCH_SIZE;
   entry.vector = { status: "indexing", engine: "zvec", embeddingModel: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS,
     version: VECTOR_VERSION, vectorCount: alreadyDone, indexedCount: alreadyDone,
     progress: { done: alreadyDone, total: ledgers.length }, error: null };
-  saveLocalDb(db, { appUserDataPath, baseDir });
+  if (needsDurableCheckpoints) {
+    const checkpointStartedAt = Date.now();
+    saveLocalDb(db, { appUserDataPath, baseDir });
+    timings.checkpointMs += Date.now() - checkpointStartedAt;
+  }
   onProgress?.({ phase: "embedding", done: alreadyDone, total: ledgers.length });
   try {
+    if (deletedMasterKeys.length > 0) {
+      const deleteStartedAt = Date.now();
+      await withCollectionAccess(target, async () => {
+        if (!collection.deleteSync) throw new Error("Installed Zvec does not support document deletion.");
+        collection.deleteSync(deletedMasterKeys.map(safeDocumentId));
+      });
+      timings.deleteMs = Date.now() - deleteStartedAt;
+      for (const masterKey of deletedMasterKeys) delete manifest.fingerprints[masterKey];
+      const manifestStartedAt = Date.now();
+      saveManifest(vectorDir, key, manifest);
+      timings.manifestMs += Date.now() - manifestStartedAt;
+    }
     for (let offset = 0; offset < pendingLedgers.length; offset += BATCH_SIZE) {
       const batch = pendingLedgers.slice(offset, offset + BATCH_SIZE);
+      const embeddingStartedAt = Date.now();
       const embeddings = await embedTexts(batch.map(embeddingText), "search_document");
+      timings.embeddingMs += Date.now() - embeddingStartedAt;
       if (!Array.isArray(embeddings) || embeddings.length !== batch.length) throw new Error("Embedding provider returned the wrong number of vectors.");
       const documents = batch.map((ledger, index) => ({
         id: safeDocumentId(ledger.master_key), vectors: { embedding: validateEmbedding(embeddings[index]) },
         fields: { ledgerName: ledger.tally_name, parentGroup: ledger.parent_name || "", isActive: true,
           tallyGuid: ledger.tally_guid || "", masterKey: ledger.master_key },
       }));
-      if (collection.upsert) await collection.upsert(documents);
-      else if (collection.upsertSync) collection.upsertSync(documents);
-      else if (collection.insert) await collection.insert(documents);
-      else if (collection.insertSync) collection.insertSync(documents);
-      else throw new Error("Installed Zvec does not support document insertion.");
+      const upsertStartedAt = Date.now();
+      await withCollectionAccess(target, async () => {
+        if (collection.upsert) await collection.upsert(documents);
+        else if (collection.upsertSync) collection.upsertSync(documents);
+        else if (collection.insert) await collection.insert(documents);
+        else if (collection.insertSync) collection.insertSync(documents);
+        else throw new Error("Installed Zvec does not support document insertion.");
+      });
+      timings.upsertMs += Date.now() - upsertStartedAt;
       for (const ledger of batch) manifest.fingerprints[ledger.master_key] = ledgerFingerprint(ledger);
+      const manifestStartedAt = Date.now();
       saveManifest(vectorDir, key, manifest);
+      timings.manifestMs += Date.now() - manifestStartedAt;
       const done = Math.min(alreadyDone + offset + batch.length, ledgers.length);
       entry.vector.progress = { done, total: ledgers.length };
       entry.vector.indexedCount = done;
       entry.vector.vectorCount = done;
-      saveLocalDb(db, { appUserDataPath, baseDir });
+      if (needsDurableCheckpoints) {
+        const checkpointStartedAt = Date.now();
+        saveLocalDb(db, { appUserDataPath, baseDir });
+        timings.checkpointMs += Date.now() - checkpointStartedAt;
+      }
       onProgress?.({ phase: "embedding", done, total: ledgers.length });
     }
-    try { if (collection.optimize) await collection.optimize(); else collection.optimizeSync?.(); } catch {}
+    // A small incremental FLAT-index upsert is immediately queryable. Full
+    // optimization is valuable after a rebuild or a substantial batch, but it
+    // is disproportionately expensive for a single changed ledger.
+    if (!hadExistingManifest || pendingLedgers.length > BATCH_SIZE) {
+      const optimizeStartedAt = Date.now();
+      try {
+        await withCollectionAccess(target, async () => {
+          if (collection.optimize) await collection.optimize(); else collection.optimizeSync?.();
+        });
+      } catch {}
+      timings.optimizeMs = Date.now() - optimizeStartedAt;
+    }
     entry.vector = { status: "ready", engine: "zvec", embeddingModel: EMBEDDING_MODEL, dimensions: EMBEDDING_DIMENSIONS,
       embeddingSource: "openrouter", version: VECTOR_VERSION, lastVectorisedAt: new Date().toISOString(), vectorCount: ledgers.length,
       indexedCount: ledgers.length, progress: { done: ledgers.length, total: ledgers.length },
-      result: { elapsedMs: Date.now() - startedAt, mode: pendingLedgers.length ? "incremental" : "up-to-date",
-        embeddedCount: pendingLedgers.length, skippedCount: alreadyDone, docCount: ledgers.length }, error: null, zvecVersion: getZvecPackageVersion() };
+      result: { elapsedMs: Date.now() - startedAt, mode: pendingLedgers.length || deletedMasterKeys.length ? "incremental" : "up-to-date",
+        embeddedCount: pendingLedgers.length, deletedCount: deletedMasterKeys.length, skippedCount: alreadyDone, docCount: ledgers.length, timings }, error: null, zvecVersion: getZvecPackageVersion() };
+    const finalPersistStartedAt = Date.now();
     saveLocalDb(db, { appUserDataPath, baseDir });
+    timings.finalPersistMs = Date.now() - finalPersistStartedAt;
+    entry.vector.result.elapsedMs = Date.now() - startedAt;
     return { ...entry.vector, companyKey: key };
   } catch (error) {
     entry.vector = { ...entry.vector, status: "error", vectorCount: 0, error: error instanceof Error ? error.message : String(error) };
     saveLocalDb(db, { appUserDataPath, baseDir });
     throw error;
-  } finally {
-    try { if (collection?.closeSync) collection.closeSync(); else await collection?.close?.(); } catch {}
   }
 }
 
@@ -219,6 +308,7 @@ export async function clearVectorIndex({ db, companyName, companyGuid, appUserDa
   const { vectorDir } = getLocalDbPaths({ appUserDataPath, baseDir });
   const target = getCollectionPath(vectorDir, key);
   const manifest = getManifestPath(vectorDir, key);
+  await closeCachedCollection(target);
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
   if (fs.existsSync(manifest)) fs.rmSync(manifest, { force: true });
   if (db.companies[key]) {
@@ -230,22 +320,16 @@ export async function clearVectorIndex({ db, companyName, companyGuid, appUserDa
 
 export async function queryZvec({ vectorDir, companyKey, embedding, topK = 10 }) {
   const vector = validateEmbedding(embedding);
-  const api = apiFrom(await loadZvec());
   const target = getCollectionPath(vectorDir, companyKey);
   if (!fs.existsSync(target)) throw new Error("Vectorise the ledgers before searching.");
-  let collection;
-  try {
-    collection = api.open ? await api.open(target) : await api.create?.(target);
-    if (!collection?.query) throw new Error("Installed Zvec does not support vector queries.");
-    const response = await collection.query({ fieldName: "embedding", vector, topk: topK });
-    if (Array.isArray(response)) return response;
-    if (Array.isArray(response?.results)) return response.results;
-    if (Array.isArray(response?.docs)) return response.docs;
-    if (Array.isArray(response?.data)) return response.data;
-    return [];
-  } finally {
-    try { if (collection?.closeSync) collection.closeSync(); else await collection?.close?.(); } catch {}
-  }
+  const collection = await openCollection(vectorDir, companyKey);
+  if (!collection?.query) throw new Error("Installed Zvec does not support vector queries.");
+  const response = await withCollectionAccess(target, () => collection.query({ fieldName: "embedding", vector, topk: topK }));
+  if (Array.isArray(response)) return response;
+  if (Array.isArray(response?.results)) return response.results;
+  if (Array.isArray(response?.docs)) return response.docs;
+  if (Array.isArray(response?.data)) return response.data;
+  return [];
 }
 
 export async function queryZvecBatch({ vectorDir, companyKey, embeddings, topK = 10 }) {
@@ -253,20 +337,16 @@ export async function queryZvecBatch({ vectorDir, companyKey, embeddings, topK =
     throw new Error(`Vector batch requires 1-${BATCH_SIZE} embeddings.`);
   }
   const vectors = embeddings.map(validateEmbedding);
-  const api = apiFrom(await loadZvec());
   const target = getCollectionPath(vectorDir, companyKey);
   if (!fs.existsSync(target)) throw new Error("Vectorise the ledgers before searching.");
-  let collection;
-  try {
-    collection = api.open ? await api.open(target) : await api.create?.(target);
-    if (!collection?.query) throw new Error("Installed Zvec does not support vector queries.");
+  const collection = await openCollection(vectorDir, companyKey);
+  if (!collection?.query) throw new Error("Installed Zvec does not support vector queries.");
+  return withCollectionAccess(target, async () => {
     const results = [];
     for (const vector of vectors) {
       const response = await collection.query({ fieldName: "embedding", vector, topk: topK });
       results.push(Array.isArray(response) ? response : response?.results || response?.docs || response?.data || []);
     }
     return results;
-  } finally {
-    try { if (collection?.closeSync) collection.closeSync(); else await collection?.close?.(); } catch {}
-  }
+  });
 }

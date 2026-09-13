@@ -3,11 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
-import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
-import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable } from "./src/local-matching/vector.mjs";
+import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, upsertGroups, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
+import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable, closeZvecCollections } from "./src/local-matching/vector.mjs";
 import { syncLedgersReadOnly } from "./src/local-matching/sync.mjs";
 import { suggestLedgers, suggestLedgersBatch } from "./src/local-matching/suggest.mjs";
 import { parseDocumentLocal } from "./src/document-parsing/parser.mjs";
+import { parseDocumentAndSuggestLedgers } from "./src/document-parsing/parse-and-suggest.mjs";
+import { loadOperationalCache, operationalStatus } from "./src/local-matching/operational-cache.mjs";
 import { exportTallyCollection, fetchAvailableCompanies, testTally } from "./src/bridge.mjs";
 
 const BRAND_NAME = "Gajkesari";
@@ -31,6 +33,7 @@ const nodeFetch = globalThis.fetch.bind(globalThis);
 const ELECTRON_NETWORK_RETRY_MS = 5 * 60 * 1000;
 let preferNodeFetchUntil = 0;
 let directEmbeddingConfig = null;
+let localSyncInFlight = null;
 
 function directEmbeddingConfigPath() {
   return path.join(app.getPath("userData"), "direct-embedding.json");
@@ -244,11 +247,20 @@ function getLocalMatchingStatus() {
     try { activeStatus = getStatusForCompany(db, { companyName: recent.companyName, companyGuid: recent.companyGuid }); } catch {}
   }
   const vectorEngine = getVectorEngine();
+  let voucherStatus = { status: "not_indexed", voucherCount: 0, partitionCount: 0, lastUpdatedAt: null, partitions: [] };
+  try {
+    const operationalDb = loadOperationalCache({ appUserDataPath: app.getPath("userData") });
+    voucherStatus = operationalStatus(operationalDb, {
+      companyGuid: activeEntry?.companyGuid || activeStatus?.companyGuid || null,
+      companyName: tallyCompany || activeStatus?.companyName || null,
+    });
+  } catch {}
   return {
     db: { exists: dbExists, path: paths.dbPath, dir: paths.dir, version: db.version || 1 },
     tally: { companyName: tallyCompany, companyGuid: activeEntry?.companyGuid || activeStatus?.companyGuid || null, tallyUrl },
     ledgers: activeStatus ? { count: activeStatus.ledgerCount, lastSyncAt: activeStatus.lastSyncAt, counts: activeStatus.syncCounts, cursor: activeStatus.syncCursor } : { count: 0, lastSyncAt: null, counts: null, cursor: null },
     vector: activeStatus ? { ...activeStatus.vector, engineDetail: vectorEngine } : { status: "idle", lastVectorisedAt: null, vectorCount: 0, engine: vectorEngine.engine, engineDetail: vectorEngine },
+    vouchers: voucherStatus,
     companies,
     isZvecAvailable: isZvecAvailable(),
     // For UI
@@ -256,7 +268,7 @@ function getLocalMatchingStatus() {
   };
 }
 
-async function handleLocalSync() {
+async function handleLocalSync({ forceFull = false } = {}) {
   const paths = getLocalMatchingPaths();
   let db;
   try { db = loadLocalDb({ appUserDataPath: app.getPath("userData") }); } catch { db = loadLocalDb({}); }
@@ -305,6 +317,13 @@ async function handleLocalSync() {
     },
   };
 
+  const companyKey = normalizeCompanyKey({ companyName, companyGuid });
+  const existing = db.companies?.[companyKey] || null;
+  const lastFullSyncAt = Date.parse(existing?.lastFullSyncAt || "");
+  const fullReconciliationDue = !Number.isFinite(lastFullSyncAt) || Date.now() - lastFullSyncAt >= 7 * 24 * 60 * 60 * 1000;
+  const requestedMode = !forceFull && existing?.syncCursor?.lastLedgerAlterID && existing?.syncCursor?.lastGroupAlterID && !fullReconciliationDue
+    ? "delta"
+    : "full_snapshot";
   const result = await syncLedgersReadOnly({
     tallyUrl,
     companyName,
@@ -312,20 +331,61 @@ async function handleLocalSync() {
     exportTallyCollection,
     helpers,
     getActiveCompany: async () => ({ companyName, companyGuid }),
+    mode: requestedMode,
+    cursor: existing?.syncCursor || null,
   });
 
   // Upsert into persistent store
-  const upsert = upsertLedgers({ db, companyName: result.companyName || companyName, companyGuid: result.companyGuid || companyGuid, ledgers: result.ledgers, cursor: result.cursor });
+  const upsert = upsertLedgers({ db, companyName: result.companyName || companyName, companyGuid: result.companyGuid || companyGuid, ledgers: result.ledgers, cursor: result.cursor, mode: result.mode });
+  const groupUpsert = upsertGroups({ db, companyName: result.companyName || companyName, companyGuid: result.companyGuid || companyGuid, groups: result.groups, cursor: result.cursor, mode: result.mode });
   saveLocalDb(db, { appUserDataPath: app.getPath("userData") });
-  return { companyName: result.companyName || companyName, companyGuid: result.companyGuid || companyGuid, counts: upsert.counts, totalFetched: result.ledgers.length, isReadOnly: true };
+  return { companyName: result.companyName || companyName, companyGuid: result.companyGuid || companyGuid, mode: result.mode, counts: upsert.counts, groupCounts: groupUpsert.counts, totalFetched: result.ledgers.length, groupsFetched: result.groups.length, isReadOnly: true, internalDb: db };
 }
 
-async function handleLocalVectorise() {
-  let db;
-  try { db = loadLocalDb({ appUserDataPath: app.getPath("userData") }); } catch { db = loadLocalDb({}); }
-  const status = getLocalMatchingStatus();
-  const companyName = status.tally.companyName || (status.companies[0] && status.companies[0].companyName);
-  const companyGuid = status.tally.companyGuid || (status.companies[0] && status.companies[0].companyGuid);
+function scheduleLocalSync(options = {}) {
+  if (localSyncInFlight) return localSyncInFlight;
+  const startedAt = Date.now();
+  const execute = () => handleLocalSync(options);
+  localSyncInFlight = (runner && !runner.stopped && typeof runner.runTallyTask === "function"
+    ? runner.runTallyTask(execute, "background")
+    : execute()
+  ).then(async (result) => {
+    const { internalDb, ...publicResult } = result || {};
+    const syncMs = Date.now() - startedAt;
+    const changedLedgerCount = Number(result?.counts?.added || 0) + Number(result?.counts?.updated || 0) + Number(result?.counts?.deleted || 0);
+    if (changedLedgerCount <= 0) {
+      appendLog(logPath, `Local master sync completed mode=${result?.mode || "unknown"} changed=0 fetched=${result?.totalFetched || 0} groupsFetched=${result?.groupsFetched || 0} syncMs=${syncMs} totalMs=${Date.now() - startedAt}`);
+      return { ...publicResult, vectorisation: null, timings: { syncMs, vectorMs: 0, totalMs: Date.now() - startedAt } };
+    }
+    const vectorStartedAt = Date.now();
+    const vectorisation = await handleLocalVectorise({
+      companyName: result?.companyName,
+      companyGuid: result?.companyGuid,
+      db: internalDb,
+    });
+    const vectorMs = Date.now() - vectorStartedAt;
+    const totalMs = Date.now() - startedAt;
+    appendLog(logPath, `Local master sync completed mode=${result?.mode || "unknown"} changed=${changedLedgerCount} fetched=${result?.totalFetched || 0} groupsFetched=${result?.groupsFetched || 0} syncMs=${syncMs} vectorMs=${vectorMs} totalMs=${totalMs} vectorBreakdown=${JSON.stringify(vectorisation?.result?.timings || {})}`);
+    return { ...publicResult, vectorisation, timings: { syncMs, vectorMs, totalMs } };
+  }).finally(() => { localSyncInFlight = null; });
+  return localSyncInFlight;
+}
+
+async function handleLocalVectorise({ companyName: requestedCompanyName, companyGuid: requestedCompanyGuid, db: providedDb } = {}) {
+  let db = providedDb;
+  if (!db) {
+    try { db = loadLocalDb({ appUserDataPath: app.getPath("userData") }); } catch { db = loadLocalDb({}); }
+  }
+  const entries = Object.values(db.companies || {});
+  const requestedKey = requestedCompanyName || requestedCompanyGuid
+    ? normalizeCompanyKey({ companyName: requestedCompanyName, companyGuid: requestedCompanyGuid })
+    : null;
+  const selectedEntry = (requestedKey && db.companies?.[requestedKey])
+    || entries.find((entry) => requestedCompanyGuid && entry.companyGuid === requestedCompanyGuid)
+    || entries.find((entry) => requestedCompanyName && entry.companyName === requestedCompanyName)
+    || entries[0];
+  const companyName = requestedCompanyName || selectedEntry?.companyName || null;
+  const companyGuid = requestedCompanyGuid || selectedEntry?.companyGuid || null;
   if (!companyName) throw new Error("No company with local ledgers. Sync first.");
   const res = await vectoriseCompany({
     db,
@@ -411,7 +471,11 @@ function parseConnectUrl(value) {
 }
 
 function sendStatus(status) {
-  lastStatus = { ...lastStatus, ...status };
+  const nextStatus = { ...lastStatus, ...status };
+  const companyFromTitle = String(nextStatus.title || "").match(/^Connected to\s+(.+)$/i)?.[1]?.trim();
+  if (companyFromTitle) nextStatus.companyName = companyFromTitle;
+  if (["idle", "stopped", "expired", "error"].includes(nextStatus.state)) nextStatus.companyName = null;
+  lastStatus = nextStatus;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("status", lastStatus);
   }
@@ -475,6 +539,8 @@ async function startRunner() {
   if (runner && !runner.stopped) runner.stop("restarting");
 
   runner = createBridgeRunner({
+    appUserDataPath: app.getPath("userData"),
+    embedTexts: requestSemanticEmbeddings,
     renderTallyPrintToPdf,
     onLog(entry) {
       appendLog(entry.level === "error" ? errPath : logPath, entry.message);
@@ -496,6 +562,7 @@ async function startRunner() {
           title: `Connected to ${result.companyName}`,
           detail: "Keep this app open while using Tally.",
           state: "connected",
+          companyName: result.companyName,
         });
       } else if (result.tallyReachable) {
         sendStatus({
@@ -526,7 +593,17 @@ async function handleConnectUrl(value) {
       state: "running",
     });
     await pairBridge(args);
-    sendStatus({ title: "Connector paired", detail: "Starting live sync.", state: "running" });
+    const readiness = await testTally(args["tally-url"]);
+    if (readiness.companyName) {
+      sendStatus({
+        title: `Connected to ${readiness.companyName}`,
+        detail: "Starting live sync.",
+        state: "connected",
+        companyName: readiness.companyName,
+      });
+    } else {
+      sendStatus({ title: "Connector paired", detail: "Starting live sync.", state: "running" });
+    }
     await startRunner();
   } catch (error) {
     const message = formatConnectorError(error);
@@ -549,6 +626,28 @@ async function handleDisconnectUrl(value) {
   }
 }
 
+async function handleConnectionRecheck() {
+  const tallyUrl = runner?.config?.tallyUrl || "http://localhost:9000";
+  sendStatus({ title: "Checking connection", detail: "Checking Tally Prime now.", state: "running" });
+  const result = await testTally(tallyUrl);
+  if (result.companyName) {
+    if (!runner || runner.stopped) await startRunner();
+    const status = {
+      title: `Connected to ${result.companyName}`,
+      detail: "Keep this app open while using Tally.",
+      state: "connected",
+      companyName: result.companyName,
+    };
+    sendStatus(status);
+    return status;
+  }
+  const status = result.tallyReachable
+    ? { title: "Tally reachable", detail: "Open a company in Tally Prime.", state: "warning" }
+    : { title: "Tally not connected", detail: result.error || "Open Tally Prime and try again.", state: "error" };
+  sendStatus(status);
+  return status;
+}
+
 function handleProtocolUrl(value) {
   if (!value || !value.startsWith(`${PROTOCOL_NAME}://`)) return;
   if (value.startsWith(`${PROTOCOL_NAME}://connect`)) {
@@ -563,15 +662,20 @@ function handleProtocolUrl(value) {
 function createWindow() {
   mainWindow = new BrowserWindow({
     title: CONNECTOR_NAME,
-    width: 510,
-    height: 540,
-    minWidth: 440,
-    minHeight: 480,
+    // Keep a 480 x 368 visible shell plus transparent room for rounded corners
+    // and a CSS shadow that can fade before reaching the native window edge.
+    width: 484,
+    height: 372,
+    minWidth: 424,
+    minHeight: 344,
     show: false,
     resizable: true,
     frame: false,
+    transparent: true,
+    hasShadow: false,
+    roundedCorners: true,
     icon: brandLogoPath,
-    backgroundColor: "#f6f1ec",
+    backgroundColor: "#00000000",
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -582,10 +686,11 @@ function createWindow() {
     <html>
       <head>
         <style>
-          :root{--ink:#211916;--muted:#786b65;--line:#e7ddd6;--surface:#fffdfb;--canvas:#f6f1ec;--brand:#74343a;--brand-deep:#5f292e;--accent:#167a50;--accent-soft:#eaf7f0;--danger:#a83a35;--text-xs:11px;--text-sm:12px;--text-md:13px;--text-lg:18px}
+          :root{--ink:#2d2d2d;--muted:#595147;--body-soft:#8b8171;--line:#ddd2c2;--pill-line:#ddd2c2;--pill:#e6ddd1;--surface:#fff;--surface-sunk:#fbf8f3;--canvas:#f4f0e9;--brand:#4ca154;--brand-deep:#2d2d2d;--accent:#4ca154;--accent-soft:#e3f0e3;--amber:#e3a64a;--amber-soft:#fbeeda;--danger:#c1543b;--text-xs:11px;--text-sm:12px;--text-md:12.5px;--text-lg:16.5px}
           *{box-sizing:border-box}
-          html,body{width:100%;min-width:0;overflow-x:hidden}
-          body{font-family:"Aptos","Segoe UI Variable Text",sans-serif;margin:0;background:var(--canvas);color:var(--ink);font-size:var(--text-md);line-height:1.35;letter-spacing:0}
+          html,body{width:100%;height:100%;min-width:0;background:transparent;overflow:hidden}
+          body{position:relative;font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;margin:0;color:var(--ink);font-size:var(--text-md);line-height:1.35;letter-spacing:0}
+          .windowShell{position:absolute;inset:2px;border:1px solid rgba(45,45,45,.10);border-radius:16px;background:var(--canvas);box-shadow:none;overflow:hidden}
           button,input,textarea{font:inherit}
           button{cursor:pointer;font-size:var(--text-sm)}
           button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid rgba(229,21,34,.18);outline-offset:2px}
@@ -595,9 +700,9 @@ function createWindow() {
           .windowControls{display:flex;margin-left:auto;height:100%;-webkit-app-region:no-drag}
           .windowControl{width:46px;height:100%;border:0;background:transparent;color:rgba(255,255,255,.82);display:grid;place-items:center;font-size:16px}
           .windowControl:hover{background:rgba(255,255,255,.1);color:#fff}.windowControl.close:hover{background:#c42b35}
-          #appContent{height:calc(100vh - 38px);overflow:auto}
-          #localPanel{display:none;position:absolute;inset:38px 0 0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 18px 16px}
-          #localPanel.open{display:block}
+          #appContent{height:calc(100% - 38px);overflow:auto}
+          #localPanel,#updatesPanel{display:none;position:absolute;inset:82px 0 0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 14px 16px}
+          #localPanel.open,#updatesPanel.open{display:block}
           .stickyHeader{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:9px;padding:10px 0 5px;background:linear-gradient(var(--canvas) 82%,rgba(246,241,236,0))}
           .pageTitle,.screenTitle{font-family:"Aptos Display","Aptos",sans-serif;font-size:var(--text-lg);font-weight:700;line-height:1.2;letter-spacing:-.02em;margin:0}
           .screenSubtitle{font-size:var(--text-sm);color:var(--muted);line-height:1.3;margin-top:1px}
@@ -637,37 +742,64 @@ function createWindow() {
           .options input[type=number]{width:48px;border:1px solid #dcd4cc;border-radius:7px;padding:5px;background:#fff}
           .resultCard{border:1px solid var(--line);border-radius:11px;background:#fff;padding:11px}
           .resultTitle{font-size:13px;font-weight:700;margin-bottom:4px}
+          .titleBar{height:40px;padding:0 8px 0 14px;border-radius:16px 16px 0 0;background:#fbf8f3;border-bottom:1px solid #ddd2c2;color:var(--ink)}
+          .titleBrand{font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;font-size:12.5px;font-weight:650;color:var(--ink)}
+          .titleMark{width:22px;height:22px;display:grid;place-items:center;flex:0 0 auto;border-radius:7px;background:linear-gradient(150deg,#f1c889 0%,var(--amber) 45%,var(--accent) 100%);color:#fff}
+          .titleMark svg{width:13px;height:13px}
+          .windowControl{color:var(--muted);font-size:13px;width:32px;height:28px;border-radius:7px}
+          .windowControl:hover{background:#e6ddd1;color:var(--ink)}.windowControl.close:hover{background:#f0d8d2;color:var(--danger)}
+          #appContent{height:calc(100% - 40px);overflow:auto;border-radius:0 0 16px 16px;background:var(--canvas)}
+          .globalbar{display:flex;align-items:center;min-height:42px;padding:8px 14px 5px;background:var(--canvas)}
+          .health{display:flex;align-items:center;gap:7px;font-size:12.5px}.health strong{font-weight:650}
+          .connectionBadge{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+          .connectionBadge.warning{background:var(--amber);box-shadow:0 0 0 3px var(--amber-soft)}.connectionBadge.error{background:var(--danger);box-shadow:0 0 0 3px var(--danger-soft)}.connectionBadge.offline{background:var(--body-soft);box-shadow:0 0 0 3px var(--pill)}
+          .moreWrap{position:relative;margin-left:auto}.moreButton{width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--ink);font-size:18px}.moreButton:hover{background:var(--pill)}
+          .menu{display:none;position:absolute;right:0;top:34px;z-index:20;width:180px;padding:6px;background:#fff;border:1px solid var(--pill-line);border-radius:12px;box-shadow:var(--shadow-pop)}.menu.open{display:block}.menu button{display:block;width:100%;padding:8px 9px;border:0;border-radius:8px;background:transparent;text-align:left;font-size:13px}.menu button:hover{background:var(--surface-sunk)}
+          .homeView{padding:3px 14px 16px}.homeView h1{font-family:"Segoe UI Variable Text","Segoe UI",sans-serif;font-size:16.5px;line-height:1.2;margin:0}.homeView>p{max-width:400px;margin:4px 0 13px;color:var(--body-soft);font-size:12.5px;line-height:1.45}.homeStatusGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.homeStatusCard{min-width:0;padding:10px;border:1px solid var(--pill-line);border-radius:11px;background:#fff;text-align:left}.homeStatusCard:hover{border-color:#cbbfaa;background:var(--surface-sunk)}.homeStatusIcon{width:28px;height:28px;display:grid;place-items:center;margin-bottom:8px;border-radius:8px;background:var(--accent-soft);color:var(--ink);font-size:16px;font-weight:700}.homeStatusIcon.ready{background:linear-gradient(150deg,#f1c889 0%,var(--amber) 45%,var(--accent) 100%);color:#fff}.homeStatusCard b{display:block;font-size:12.5px}.homeStatusCard span{display:block;margin-top:3px;color:var(--amber);font-size:11px;font-weight:650}.homeStatusCard span.ready{color:var(--accent)}.homeAction{width:100%;min-height:36px;padding:8px 14px;border:0;border-radius:10px;background:var(--ink);color:#fff;font-size:13px;font-weight:650}.homeAction:hover{background:#1c1c1c}.connectionAction{margin-bottom:9px}.homeTask{margin-bottom:12px;padding:11px 12px;border:1px solid var(--pill-line);border-radius:12px;background:var(--surface-sunk)}.homeTask>div:first-child{display:flex;justify-content:space-between;font-size:12.5px}.homeTask>div:first-child span{color:var(--body-soft)}.homeProgress{height:5px;margin-top:8px;border-radius:99px;background:var(--pill);overflow:hidden}.homeProgress i{display:block;width:0;height:100%;border-radius:inherit;background:var(--accent)}.srOnly{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+          #localPanel{inset:82px 0 0;padding:0 14px 16px;background:var(--canvas)}
+          #localPanel .stickyHeader{padding:8px 0 5px;background:linear-gradient(var(--canvas) 82%,rgba(244,240,233,0))}.iconBtn{border:0;background:transparent}.iconBtn:hover{background:var(--pill)}
+          #localPanel .contextLine{display:none}
+          #localPanel .step{border-color:var(--pill-line);border-radius:13px;box-shadow:none}.stepReady{border-color:#b9dfca;background:linear-gradient(135deg,#fff 45%,#f1faf5)}
+          #localPanel .btnSecondary{min-height:30px;padding:6px 10px;border-radius:8px;background:transparent;font-size:12px;font-weight:600}
+          #localPanel #steadyCheckBtn{min-height:30px;padding:6px 10px;border-radius:8px;background:transparent;font-size:12px;font-weight:600}
+          .steadyHero{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid var(--pill-line);border-radius:12px;background:var(--surface-sunk);margin-bottom:10px}.steadyHeroIcon{width:42px;height:42px;display:grid;place-items:center;flex:0 0 auto;border-radius:11px;background:linear-gradient(150deg,#f1c889 0%,var(--amber) 45%,var(--accent) 100%);color:#fff;font-size:19px}.steadyHeroHead{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.steadyHero h2{margin:0;font-size:14.5px}.steadyHero p{margin:2px 0 0;color:var(--muted);font-size:11.5px}.freshnessPill{padding:2px 9px;border-radius:999px;background:var(--accent-soft);color:#2e6b37;font-size:10.5px;font-weight:700}.freshnessPill.stale{background:var(--amber-soft);color:#8c5e20}.freshnessPill.checking{background:#e6ddd1;color:var(--muted)}.steadyActions{display:flex;align-items:center;gap:9px;margin-bottom:8px}.steadyMeta{display:flex;justify-content:space-between;padding:9px 1px 0;border-top:1px solid var(--line);color:var(--muted);font-size:11.5px}.steadyMeta strong{color:var(--ink);font-weight:650}
+          #updatesPanel .stickyHeader{padding:8px 0 5px;background:linear-gradient(var(--canvas) 82%,rgba(244,240,233,0))}
+          .updateContext{margin:0 0 11px;padding-left:39px;color:var(--body-soft);font-size:11.5px}
+          .updateHero{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid var(--pill-line);border-radius:12px;background:var(--surface-sunk)}
+          .updateTile{width:42px;height:42px;display:grid;place-items:center;flex:0 0 auto;border-radius:11px;background:linear-gradient(150deg,#f1c889 0%,var(--amber) 45%,var(--accent) 100%);color:#fff;font-size:19px}
+          .updateVersion{margin:0 0 2px;color:var(--body-soft);font-size:11px}.updateHero h2{margin:0 0 2px;font-size:14.5px;line-height:1.2}.updateHero p:last-child{margin:0;color:var(--body-soft);font-size:11.5px}
+          .updateAction{width:100%;min-height:34px;margin-top:11px;padding:7px 12px;border:0;border-radius:9px;background:var(--ink);color:#fff;font-size:12.5px;font-weight:650}.updateAction:hover{background:#1c1c1c}.updateAction:disabled{opacity:.65;cursor:wait}
           @media(max-width:460px){#localPanel{padding-left:14px;padding-right:14px}.contextLine{padding-left:0}.searchBar{align-items:stretch;flex-direction:column}.searchBar .btn{width:100%}}
         </style>
       </head>
       <body>
+        <div class="windowShell">
         <header class="titleBar">
-          <div class="titleBrand"><img class="titleLogo" src="${brandLogoDataUrl}" alt=""><span>${CONNECTOR_NAME}</span></div>
+          <div class="titleBrand"><span class="titleMark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 12a8 8 0 0 1 13.66-5.66M20 12a8 8 0 0 1-13.66 5.66" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M17.5 3.5V7H14M6.5 20.5V17H10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span>${CONNECTOR_NAME}</span></div>
           <div class="windowControls">
             <button id="minimizeBtn" class="windowControl" aria-label="Minimize">−</button>
             <button id="maximizeBtn" class="windowControl" aria-label="Maximize">□</button>
             <button id="closeBtn" class="windowControl close" aria-label="Close">×</button>
           </div>
         </header>
-        <main id="appContent"><div style="padding:14px 18px 9px">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
-            <img src="${brandLogoDataUrl}" alt="Gajkesari" style="width:34px;height:34px;object-fit:contain">
-            <div style="flex:1">
-              <h2 class="screenTitle">${CONNECTOR_NAME}</h2>
-              <div class="screenSubtitle">Desktop bridge for Tally Prime</div>
-            </div>
-            <div style="position:relative">
-              <button id="menuBtn" title="More" aria-label="More options" style="width:28px;height:32px;padding:0;border:0;background:transparent;color:var(--ink);font-size:22px;line-height:1">⋮</button>
-              <div id="menu" style="display:none;position:absolute;right:0;top:38px;min-width:180px;background:#fff;border:1px solid #ded1c3;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,0.12);overflow:hidden;z-index:20">
-                <button id="menuLocalMatching" style="width:100%;text-align:left;padding:10px 14px;background:#fff;border:0;font-size:13px">Local Matching</button>
-              </div>
-            </div>
+        <main id="appContent">
+          <div class="globalbar">
+            <div class="health"><strong id="homeCompany">Solution Nyx</strong><span id="homeConnectionBadge" class="connectionBadge" role="status" aria-label="Tally connected" title="Tally connected"></span></div>
+            <div class="moreWrap"><button id="menuBtn" class="moreButton" title="More" aria-label="More options">⋮</button><div id="menu" class="menu"><button id="menuLocalMatching">Ledger matching</button><button id="menuReconcile">Check deleted ledgers</button><button id="menuUpdates">Connector updates</button></div></div>
           </div>
-          <div id="card" style="border:1px solid var(--line);border-radius:11px;background:var(--surface);padding:12px 13px">
-            <div id="title" style="font-size:var(--text-md);font-weight:700">Waiting for connection</div>
-            <div id="detail" style="margin-top:4px;color:var(--muted);font-size:var(--text-sm);line-height:1.35">Open ${BRAND_NAME} and click Connect.</div>
-          </div>
-        </div></main>
+          <section id="homeView" class="homeView">
+            <div id="homeTask" class="homeTask" hidden><div><b id="homeTaskText">Working…</b><span id="homeTaskPercent">0%</span></div><div class="homeProgress"><i id="homeTaskProgress"></i></div></div>
+            <h1 id="homeTitle">Finish ledger setup</h1>
+            <p id="homeCopy">Prepare the company once. The connector keeps both parts up to date after that.</p>
+            <div class="homeStatusGrid">
+              <button class="homeStatusCard" id="homeLedgerCard"><div class="homeStatusIcon" id="homeLedgerIcon">▦</div><b>Ledger data</b><span id="homeLedgerState">Not available</span></button>
+              <button class="homeStatusCard" id="homeVectorCard"><div class="homeStatusIcon" id="homeVectorIcon">◇</div><b>Match preparation</b><span id="homeVectorState">Not available</span></button>
+            </div>
+            <button class="homeAction connectionAction" id="connectionCheckBtn" hidden>Recheck connection</button>
+            <button class="homeAction" id="homeSetupBtn">Set up ledger matching</button>
+            <div id="statusAnnounce" class="srOnly" aria-live="polite">Waiting for connection</div>
+          </section>
+        </main>
 
         <div id="localPanel">
           <div class="stickyHeader">
@@ -688,15 +820,31 @@ function createWindow() {
             <div class="row rowBetween"><div><div id="vectorState" class="statusLine">Waiting for ledgers</div><div id="lastVector" class="meta">Not indexed yet</div></div><button id="vectorBtn" class="btnSecondary">Update index</button></div>
             <div id="vectorCount" style="display:none"></div><div id="vectorProgress" class="resultNote"></div>
           </section>
+          <div id="ledgerSteady" hidden>
+            <div class="steadyHero"><div class="steadyHeroIcon"><iconify-icon id="steadyHeroIcon" icon="ph:check-bold"></iconify-icon></div><div><div class="steadyHeroHead"><h2 id="steadyHeroTitle">12,000 ledgers matched</h2><span class="freshnessPill" id="steadyFreshness">Up to date</span></div><p id="steadyHeroSub">Synced today</p></div></div>
+            <div class="steadyActions"><button id="steadySyncBtn" class="btn" hidden>Sync now</button><button id="steadyCheckBtn" class="btnSecondary">Check for changes</button></div>
+            <div id="steadyProgress" class="resultNote"></div>
+            <div class="steadyMeta"><span>Match preparation</span><strong id="steadyVectorMeta">12,000 of 12,000 vectors ready</strong></div>
+          </div>
 
-          <section class="step">
-            <div class="stepHeader"><div class="stepNumber">3</div><div class="stepTitle">Find a ledger</div><span id="zvecReady" class="pill" style="margin-left:auto">Checking…</span></div>
-            <div class="searchBar"><textarea id="suggestInput" class="field" aria-label="Bank narration or party name" placeholder="Bank narration or party name"></textarea><button id="suggestBtn" class="btn">Search</button></div>
-            <input id="topK" type="hidden" value="5">
-            <div id="suggestStatus" class="statusLine" style="margin-top:10px"></div>
-            <div id="suggestResults" style="margin-top:10px;display:grid;gap:8px;max-height:250px;overflow-y:auto;overflow-x:hidden"></div>
-          </section>
+        </div>
 
+        <div id="updatesPanel">
+          <div class="stickyHeader">
+            <button id="updatesBackBtn" class="iconBtn" aria-label="Back to connector status">←</button>
+            <div class="pageTitle">Connector updates</div>
+          </div>
+          <p class="updateContext">Keep the connector secure and reliable</p>
+          <div class="updateHero">
+            <div class="updateTile" aria-hidden="true">✓</div>
+            <div>
+              <p class="updateVersion">Current version 0.1.70</p>
+              <h2 id="updateTitle">You're up to date</h2>
+              <p id="updateCopy">Last checked a few minutes ago.</p>
+            </div>
+          </div>
+          <button id="checkUpdatesBtn" class="updateAction">Check for updates</button>
+        </div>
         </div>
 
         <script>
@@ -704,21 +852,43 @@ function createWindow() {
           document.getElementById('minimizeBtn').addEventListener('click', () => ipcRenderer.send('window:minimize'));
           document.getElementById('maximizeBtn').addEventListener('click', () => ipcRenderer.send('window:toggle-maximize'));
           document.getElementById('closeBtn').addEventListener('click', () => ipcRenderer.send('window:close'));
-          const card = document.getElementById('card');
           const menuBtn = document.getElementById('menuBtn');
           const menu = document.getElementById('menu');
           const menuLocalMatching = document.getElementById('menuLocalMatching');
+          const menuReconcile = document.getElementById('menuReconcile');
+          const menuUpdates = document.getElementById('menuUpdates');
           const localPanel = document.getElementById('localPanel');
+          const updatesPanel = document.getElementById('updatesPanel');
           const backBtn = document.getElementById('backBtn');
+          const updatesBackBtn = document.getElementById('updatesBackBtn');
+          const checkUpdatesBtn = document.getElementById('checkUpdatesBtn');
           const syncBtn = document.getElementById('syncBtn');
           const vectorBtn = document.getElementById('vectorBtn');
+          const steadySyncBtn = document.getElementById('steadySyncBtn');
+          const steadyCheckBtn = document.getElementById('steadyCheckBtn');
+          const steadyProgress = document.getElementById('steadyProgress');
+          const homeSetupBtn = document.getElementById('homeSetupBtn');
+          const connectionCheckBtn = document.getElementById('connectionCheckBtn');
+          const homeLedgerCard = document.getElementById('homeLedgerCard');
+          const homeVectorCard = document.getElementById('homeVectorCard');
+          const homeBadge = document.getElementById('homeConnectionBadge');
+          let currentConnectionState = 'idle';
+          let matchingReady = false;
 
           function setStatus(data){
-            document.getElementById('title').textContent = data.title || 'Connector';
-            document.getElementById('detail').textContent = data.detail || '';
             const state = data.state || 'idle';
-            card.style.borderColor = state === 'connected' ? '#86efac' : state === 'error' || state === 'expired' ? '#fda4af' : '#ded1c3';
-            card.style.background = state === 'connected' ? '#f0fdf4' : state === 'error' || state === 'expired' ? '#fff1f2' : '#fffaf5';
+            currentConnectionState = state;
+            homeBadge.className = 'connectionBadge ' + (state === 'connected' ? '' : state === 'expired' ? 'warning' : state === 'error' ? 'error' : state === 'stopped' ? 'offline' : 'warning');
+            homeBadge.title = data.detail || data.title || 'Tally status';
+            homeBadge.setAttribute('aria-label', data.detail || data.title || 'Tally status');
+            const connectedCompany = String(data.companyName || '').trim() || String(data.title || '').match(/^Connected to\s+(.+)$/i)?.[1]?.trim();
+            if(connectedCompany) document.getElementById('homeCompany').textContent = connectedCompany;
+            else if(state === 'error' || state === 'stopped' || state === 'idle' || state === 'expired') document.getElementById('homeCompany').textContent = data.title || 'Tally not connected';
+            const needsCheck = state === 'error' || state === 'stopped' || state === 'idle' || state === 'expired' || state === 'warning';
+            connectionCheckBtn.hidden = !needsCheck;
+            connectionCheckBtn.textContent = 'Recheck connection';
+            homeSetupBtn.hidden = matchingReady || state !== 'connected';
+            document.getElementById('statusAnnounce').textContent = (data.title || 'Connector') + ' ' + (data.detail || '');
           }
           ipcRenderer.on('status', (_event, data) => {
             setStatus(data);
@@ -732,12 +902,54 @@ function createWindow() {
           document.addEventListener('click', (e) => {
             if(!menu.contains(e.target) && e.target !== menuBtn) menu.style.display='none';
           });
-          menuLocalMatching.addEventListener('click', () => {
+          function showUpdates(){
             menu.style.display='none';
+            localPanel.classList.remove('open');
+            updatesPanel.classList.add('open');
+          }
+          function showLedgerMatching(){
+            menu.style.display='none';
+            updatesPanel.classList.remove('open');
             localPanel.classList.add('open');
             refreshLocalStatus();
+          }
+          menuLocalMatching.addEventListener('click', () => {
+            showLedgerMatching();
           });
+          menuReconcile.addEventListener('click', () => {
+            showLedgerMatching();
+            runSteadySync({forceFull:true});
+          });
+          menuUpdates.addEventListener('click', showUpdates);
           backBtn.addEventListener('click', () => localPanel.classList.remove('open'));
+          updatesBackBtn.addEventListener('click', () => updatesPanel.classList.remove('open'));
+          homeSetupBtn.addEventListener('click', showLedgerMatching);
+          connectionCheckBtn.addEventListener('click', async () => {
+            connectionCheckBtn.disabled = true;
+            connectionCheckBtn.textContent = 'Checking…';
+            try{
+              const status = await ipcRenderer.invoke('connection:recheck');
+              setStatus(status || {});
+              await refreshLocalStatus();
+            }catch(e){
+              setStatus({ title:'Tally not connected', detail:e.message || String(e), state:'error' });
+            } finally { connectionCheckBtn.disabled = false; }
+          });
+          homeLedgerCard.addEventListener('click', showLedgerMatching);
+          homeVectorCard.addEventListener('click', showLedgerMatching);
+          checkUpdatesBtn.addEventListener('click', () => {
+            checkUpdatesBtn.disabled = true;
+            checkUpdatesBtn.textContent = 'Checking…';
+            document.getElementById('updateTitle').textContent = 'Checking for updates';
+            document.getElementById('updateCopy').textContent = 'This takes only a moment.';
+            setTimeout(() => {
+              document.getElementById('updateTitle').textContent = "You're up to date";
+              document.getElementById('updateCopy').textContent = 'Checked just now.';
+              checkUpdatesBtn.textContent = 'Check again';
+              checkUpdatesBtn.disabled = false;
+            }, 900);
+          });
+          ipcRenderer.on('navigate:updates', showUpdates);
 
           function fmtTime(iso){ if(!iso) return '—'; try{ return new Date(iso).toLocaleString([], {dateStyle:'medium',timeStyle:'short'}); }catch{ return iso; } }
           function escapeHtml(value){ return String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
@@ -749,6 +961,7 @@ function createWindow() {
               document.getElementById('localDbStatus').textContent = s.db.exists ? 'Local data ready' : 'Local data not created';
               document.getElementById('localDbPath').textContent = s.db.path || '';
               document.getElementById('companyIdentity').textContent = s.tally.companyName || 'Open a company in Tally';
+              if(s.tally.companyName) document.getElementById('homeCompany').textContent = s.tally.companyName;
               document.getElementById('companyGuid').textContent = s.tally.companyGuid ? 'GUID: '+s.tally.companyGuid : (s.tally.companyName ? '' : 'Tally not reachable');
               document.getElementById('ledgerCount').textContent = formatCount(s.ledgers.count);
               document.getElementById('lastSync').textContent = s.ledgers.lastSyncAt ? 'Updated '+fmtTime(s.ledgers.lastSyncAt) : 'Not updated yet';
@@ -759,9 +972,30 @@ function createWindow() {
                 syncCountsEl.style.display='block';
                 syncCountsEl.textContent = sc.added+' added · '+sc.updated+' updated · '+sc.deleted+' removed';
               } else { syncCountsEl.style.display='none'; }
+              const homeLedgerState = document.getElementById('homeLedgerState');
+              const homeVectorState = document.getElementById('homeVectorState');
+              const homeLedgerIcon = document.getElementById('homeLedgerIcon');
+              const homeVectorIcon = document.getElementById('homeVectorIcon');
+              homeLedgerState.textContent = s.ledgers.count ? formatCount(s.ledgers.count)+' available' : 'Not available';
+              homeLedgerIcon.classList.toggle('ready', Boolean(s.ledgers.count)); homeLedgerIcon.textContent = s.ledgers.count ? '✓' : '▦';
+              document.getElementById('homeTitle').textContent = s.ledgers.count ? 'Ledger matching is ready' : 'Finish ledger setup';
+              document.getElementById('homeCopy').textContent = s.ledgers.count ? 'Your ledger list and matching index are shown below.' : 'Import ledgers from the company currently open in Tally.';
+              document.getElementById('homeSetupBtn').textContent = s.ledgers.count ? 'Open ledger status' : 'Set up ledger matching';
               // vector
               const v = s.vector;
               const searchReady = v.status==='ready' && (v.vectorCount||0)>0;
+              matchingReady = searchReady;
+              const syncChangeCount = sc ? Number(sc.added||0) + Number(sc.updated||0) + Number(sc.deleted||0) : 0;
+              const vectorCoversLatestSync = Boolean(
+                searchReady &&
+                Number(v.vectorCount||0) >= Number(s.ledgers.count||0) &&
+                Date.parse(v.lastVectorisedAt || '') >= Date.parse(s.ledgers.lastSyncAt || '')
+              );
+              const hasChanges = syncChangeCount > 0 && !vectorCoversLatestSync;
+              const steadyReady = Boolean(s.ledgers.count && (searchReady || (hasChanges && Number(v.vectorCount||0) > 0)));
+              document.getElementById('ledgerStep').hidden = steadyReady;
+              document.getElementById('vectorStep').hidden = steadyReady;
+              document.getElementById('ledgerSteady').hidden = !steadyReady;
               const vectorState = document.getElementById('vectorState');
               const indexed = Number(v.indexedCount || v.vectorCount || v.progress?.done || 0);
               const indexTotal = Number(v.progress?.total || s.ledgers.count || 0);
@@ -773,6 +1007,18 @@ function createWindow() {
                     ? formatCount(indexed)+' of '+formatCount(indexTotal)+' indexed'
                     : s.ledgers.count ? 'Ready to index' : 'Waiting for ledgers';
               vectorState.style.color = v.error ? 'var(--danger)' : '';
+              homeVectorState.textContent = searchReady ? formatCount(indexed)+' ready' : v.status==='indexing' ? formatCount(indexed)+' of '+formatCount(indexTotal) : s.ledgers.count ? 'Needs preparation' : 'Not available';
+              homeVectorIcon.classList.toggle('ready', searchReady); homeVectorIcon.textContent = searchReady ? '✓' : '◇';
+              document.getElementById('homeSetupBtn').hidden = Boolean(searchReady) || currentConnectionState !== 'connected';
+              if(steadyReady){
+                const steadyIcon = document.getElementById('steadyHeroIcon'); const steadyPill = document.getElementById('steadyFreshness');
+                steadyIcon.setAttribute('icon', hasChanges ? 'ph:bell-simple-ringing' : 'ph:check-bold');
+                document.getElementById('steadyHeroTitle').textContent = hasChanges ? (Number(sc.added||0) + Number(sc.updated||0)) + ' new or changed ledgers found' : formatCount(s.ledgers.count)+' ledgers matched';
+                steadyPill.textContent = hasChanges ? 'Sync recommended' : 'Up to date'; steadyPill.className = 'freshnessPill' + (hasChanges ? ' stale' : '');
+                document.getElementById('steadyHeroSub').textContent = hasChanges ? 'Sync again to include them in matching' : (s.ledgers.lastSyncAt ? 'Synced '+fmtTime(s.ledgers.lastSyncAt) : 'Synced recently');
+                document.getElementById('steadyVectorMeta').textContent = formatCount(indexed)+' of '+formatCount(indexTotal)+' vectors ready';
+                steadySyncBtn.hidden = !hasChanges; steadyCheckBtn.hidden = hasChanges; steadyCheckBtn.disabled = false;
+              }
               document.getElementById('vectorCount').textContent = v.vectorCount||0;
               const progressEl = document.getElementById('vectorProgress');
               progressEl.style.display = v.error ? 'block' : 'none';
@@ -832,68 +1078,45 @@ function createWindow() {
             } finally { vectorBtn.disabled=false; vectorBtn.textContent='Update index'; }
           });
 
-          const suggestInput = document.getElementById('suggestInput');
-          const topKInput = document.getElementById('topK');
-          const suggestBtn = document.getElementById('suggestBtn');
-          const suggestStatus = document.getElementById('suggestStatus');
-          const suggestResults = document.getElementById('suggestResults');
-          const zvecReadyEl = document.getElementById('zvecReady');
-
-          async function doSuggest(){
-            const q = suggestInput.value.trim();
-            if(!q){ suggestStatus.textContent='Enter a bank narration or party name first.'; suggestInput.focus(); return; }
-            const topK = parseInt(topKInput.value,10)||10;
-            suggestBtn.disabled=true; suggestBtn.textContent='Searching…';
-            suggestStatus.textContent='Searching ledger vectors…';
-            suggestResults.innerHTML='';
-            const t0=Date.now();
+          async function runSteadySync({includeVectors=false, forceFull=false} = {}){
+            const button = includeVectors ? steadySyncBtn : steadyCheckBtn;
+            button.disabled = true; button.textContent = forceFull ? 'Reconciling…' : includeVectors ? 'Syncing…' : 'Checking…';
+            steadyProgress.style.display = 'block'; steadyProgress.textContent = forceFull ? 'Checking Tally for deleted ledgers…' : includeVectors ? 'Updating ledger data and matching…' : 'Checking Tally for ledger changes…';
             try{
-              const res = await ipcRenderer.invoke('local-matching:suggest', { query: q, narration: q, topK });
-              const elapsed = Date.now()-t0;
-              if(res.isEmpty){
-                suggestStatus.textContent = ['vector_search_not_ready','vector_search_unavailable'].includes(res.emptyReason)
-                  ? 'Vector search is not ready. Vectorise your ledgers first.'
-                  : 'No vector results found.';
-                return;
-              }
-              suggestStatus.textContent = res.suggestions.length+' match'+(res.suggestions.length===1?'':'es');
-              suggestResults.innerHTML = res.suggestions.map(function(s){
-                const confidence = Math.max(0,Math.min(100,Math.round(Number(s.confidence||0)*100)));
-                return '<div class="resultCard">'
-                  + '<div class="row rowBetween"><div class="resultTitle">' + escapeHtml(s.ledgerName) + '</div><span class="pill">' + confidence + '% match</span></div>'
-                  + (s.parentGroup?'<div class="meta">'+escapeHtml(s.parentGroup)+'</div>':'')
-                  + '</div>';
-              }).join('');
-            }catch(e){
-              suggestStatus.textContent=e.message||String(e);
-            } finally { suggestBtn.disabled=false; suggestBtn.textContent='Find matches'; }
+              await ipcRenderer.invoke('local-matching:sync', {forceFull});
+              // The sync IPC automatically embeds only changed ledgers. Do not
+              // reopen Zvec and perform a second no-op vectorisation here.
+              steadyProgress.style.display = 'none';
+              await refreshLocalStatus();
+            }catch(e){ steadyProgress.style.display = 'block'; steadyProgress.textContent = e.message || String(e); }
+            finally { button.disabled=false; button.textContent = includeVectors ? 'Sync now' : 'Check for changes'; }
           }
-          suggestBtn.addEventListener('click', doSuggest);
-          suggestInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter' && (e.ctrlKey||e.metaKey)) doSuggest(); });
+          steadyCheckBtn.addEventListener('click', () => runSteadySync());
+          steadySyncBtn.addEventListener('click', () => runSteadySync({includeVectors:true}));
 
           // initial refresh when panel opened via menu, also on load
           setTimeout(()=>refreshLocalStatus(), 800);
+          if(${process.argv.includes("--show-updates") ? "true" : "false"}) setTimeout(showUpdates, 900);
         </script>
       </body>
     </html>
   `)}`;
 
-  mainWindow.once("ready-to-show", () => {
-    showWindow();
-  });
+  mainWindow.once("ready-to-show", showWindow);
+  mainWindow.webContents.on("did-finish-load", () => sendStatus(lastStatus));
   mainWindow.webContents.on("did-fail-load", (_event, code, description) => {
     appendLog(errPath, `Connector status page failed to load (${code}: ${description}).`);
   });
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
     appendLog(errPath, `Connector renderer stopped (${details.reason || "unknown"}). Reloading status page.`);
-    if (!mainWindow?.isDestroyed()) void mainWindow.loadURL(connectorPage);
+    if (!mainWindow?.isDestroyed()) {
+      void mainWindow.loadURL(connectorPage);
+    }
   });
   void mainWindow.loadURL(connectorPage).catch((error) => {
     appendLog(errPath, `Connector status page could not be opened: ${formatConnectorError(error)}`);
     showWindow();
   });
-
-  mainWindow.webContents.once("did-finish-load", () => sendStatus(lastStatus));
   mainWindow.on("close", (event) => {
     if (quitting) return;
     event.preventDefault();
@@ -905,6 +1128,7 @@ app.setName(CONNECTOR_NAME);
 app.setAppUserModelId(APP_USER_MODEL_ID);
 app.on("before-quit", () => {
   quitting = true;
+  void closeZvecCollections();
   if (runner && !runner.stopped) runner.stop("application quitting");
 });
 
@@ -916,6 +1140,9 @@ if (!gotLock) {
   app.on("second-instance", (_event, argv) => {
     const protocolArg = argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`));
     if (protocolArg) handleProtocolUrl(protocolArg);
+    if (argv.includes("--show-updates") && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("navigate:updates");
+    }
     showWindow();
   });
   app.on("open-url", (event, url) => {
@@ -934,8 +1161,9 @@ if (!gotLock) {
     ipcMain.on("window:close", () => mainWindow?.close());
     // Local Matching IPC (read-only, persistent)
     try {
+      ipcMain.handle("connection:recheck", async () => handleConnectionRecheck());
       ipcMain.handle("local-matching:getStatus", async () => getLocalMatchingStatus());
-      ipcMain.handle("local-matching:sync", async () => handleLocalSync());
+      ipcMain.handle("local-matching:sync", async (_event, payload) => scheduleLocalSync({ forceFull: payload?.forceFull === true }));
       ipcMain.handle("local-matching:vectorise", async () => handleLocalVectorise());
       ipcMain.handle("local-matching:suggest", async (_event, payload) => {
         const topK = payload?.topK || payload?.top_k || 10;
@@ -963,40 +1191,12 @@ if (!gotLock) {
         });
       });
       ipcMain.handle("document-parsing:parse", async (_event, payload) => parseDocumentLocal(payload || {}));
-      ipcMain.handle("document-parsing:parse-and-suggest", async (_event, payload) => {
-        const startedAt = performance.now();
-        const parseStartedAt = performance.now();
-        const parsed = await parseDocumentLocal({ ...(payload || {}), output: "json" });
-        const parseMs = performance.now() - parseStartedAt;
-        const transactions = Array.isArray(parsed?.content?.transactions) ? parsed.content.transactions : [];
-        const queries = transactions.map((transaction) => String(transaction?.description || "").trim());
-        if (!queries.length) throw new Error("The document contains no transactions to match.");
-        if (queries.some((query) => !query)) throw new Error("Every parsed transaction must have a description for vector search.");
-        const searchStartedAt = performance.now();
-        const matches = [];
-        for (let offset = 0; offset < queries.length; offset += 256) {
-          matches.push(...await suggestLedgersBatch({
-            queries: queries.slice(offset, offset + 256),
-            companyId: payload?.companyId || payload?.companyGuid || null,
-            companyName: payload?.companyName || null,
-            companyGuid: payload?.companyGuid || null,
-            topK: payload?.topK || payload?.top_k || 5,
-            appUserDataPath: app.getPath("userData"),
-            embedTexts: requestSemanticEmbeddings,
-          }));
-        }
-        const searchMs = performance.now() - searchStartedAt;
-        return {
-          parsed,
-          transactions: transactions.map((transaction, index) => ({ ...transaction, ledgerSuggestions: matches[index]?.suggestions || [] })),
-          matching: matches,
-          timing: {
-            parseMs: Number(parseMs.toFixed(2)),
-            vectorSearchMs: Number(searchMs.toFixed(2)),
-            totalMs: Number((performance.now() - startedAt).toFixed(2)),
-          },
-        };
-      });
+      ipcMain.handle("document-parsing:parse-and-suggest", async (_event, payload) =>
+        parseDocumentAndSuggestLedgers(payload || {}, {
+          appUserDataPath: app.getPath("userData"),
+          embedTexts: requestSemanticEmbeddings,
+        })
+      );
     } catch (e) { appendLog(errPath, `Local Matching IPC failed: ${formatConnectorError(e)}`); }
     createWindow();
     const protocolArg =

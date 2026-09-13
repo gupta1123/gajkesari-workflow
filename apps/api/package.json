@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@firecrawl/anydoc": "^0.1.9"
+    "@firecrawl/anydoc": "^0.1.9",
+    "pg": "8.23.0"
   },
   "optionalDependencies": {
     "@firecrawl/anydoc-linux-x64-gnu": "0.1.9"
@@ -20,7 +21,7 @@
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "worker": "node --use-system-ca ./worker/process-packet-jobs.mjs",
-    "worker:local": "node --use-system-ca --env-file=.env.local --env-file=.env.development.local ./worker/process-packet-jobs.mjs"
+    "worker:local": "node --use-system-ca --env-file=.env.local --env-file=.env.development.local --env-file-if-exists=.env.listener.local ./worker/process-packet-jobs.mjs"
   },
   "devDependencies": {
     "@types/node": "20.17.6",

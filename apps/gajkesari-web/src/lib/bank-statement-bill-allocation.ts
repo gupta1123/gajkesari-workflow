@@ -84,3 +84,22 @@ export function allocateReceiptByFifo(
     unallocatedAmount: Number(Math.max(0, receiptAmount - totalAllocatedAmount).toFixed(2)),
   };
 }
+
+export function applyFifoAllocationsToBills(
+  openBills: FifoOpenBill[],
+  allocations: FifoBillAllocation[]
+) {
+  const consumed = new Map<string, number>();
+  for (const allocation of allocations) {
+    if (allocation.referenceType !== "Agst Ref") continue;
+    const key = allocation.referenceName.trim().toLocaleLowerCase();
+    consumed.set(key, Number(((consumed.get(key) || 0) + allocation.allocatedAmount).toFixed(2)));
+  }
+  return openBills.flatMap((bill) => {
+    const pendingAmount = Number(Math.max(
+      0,
+      bill.pendingAmount - (consumed.get(bill.referenceName.trim().toLocaleLowerCase()) || 0)
+    ).toFixed(2));
+    return pendingAmount > 0.005 ? [{ ...bill, pendingAmount }] : [];
+  });
+}

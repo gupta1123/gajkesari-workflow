@@ -23,6 +23,7 @@ function setup(fail=false){
     OPENROUTER_ANYDOC_MODEL:'fixture',OPENROUTER_ANYDOC_REASONING_TOKENS:0,OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS:1000,
     readBankStatementPdfPageCount:async()=>2,updateBankJob:async(_,s)=>stages.push(s.stage),
     parseWithAnydoc:async()=>({success:true,markdownText:markdown,executionTimeMs:1,tableCount:1}),
+    deterministicTransactionsFromAnydoc:()=>null,
     hasUsableBankStatementText:()=>true,combinedLedgerCatalogueDecision:()=>({useCombined:true}),
     extractAndMatchBankStatementFromMarkdown:()=>{throw Error('Must not match ledgers before coverage');},
     extractBankStatementFromText:async(_file,pages)=>{calls.push(pages[0].text);return {account:{},transactions:calls.length===1?[tx(rows[0])]:fail?[]:[tx(rows[1])]};},

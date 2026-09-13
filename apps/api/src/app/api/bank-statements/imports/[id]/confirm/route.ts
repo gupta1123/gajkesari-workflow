@@ -15,6 +15,7 @@ import {
   type ParsedBankTransaction,
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { isBankStatementExtractionIncomplete } from "@/lib/bank-statement-extraction-status";
 
 export const runtime = "nodejs";
 
@@ -436,11 +437,14 @@ export async function POST(
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const importProcessingMeta = readRecord(importRow.processing_meta);
     const extractionDiagnostics = readRecord(importProcessingMeta.extractionDiagnostics);
-    const extractionCoverageComplete = extractionDiagnostics.coverageComplete;
-    if (
-      ["processing", "manual_review_required", "failed"].includes(effectiveImportStatus) ||
-      extractionCoverageComplete !== true
-    ) {
+    const extractionIncomplete = isBankStatementExtractionIncomplete({
+      effectiveImportStatus,
+      processing: effectiveImportStatus === "processing",
+      transactionCount: transactions.length,
+      extractionDiagnostics,
+      legacyRequiresManualExtraction: Boolean(importProcessingMeta.requiresManualExtraction),
+    });
+    if (effectiveImportStatus === "processing" || extractionIncomplete) {
       const unresolvedPages = Array.isArray(extractionDiagnostics.unresolvedPages)
         ? extractionDiagnostics.unresolvedPages.map(Number).filter(Number.isFinite)
         : [];

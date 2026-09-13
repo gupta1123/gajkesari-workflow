@@ -9,7 +9,8 @@ import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
 import { PdfSecurityError, unlockPdfIfNeeded } from "@/lib/pdf-security";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createHash } from "node:crypto";
-import { browserDatasetIds, resolveTallyTarget } from "@/lib/tally/browser-scope";
+import { browserDatasetIds, resolveBankStatementUploadTarget } from "@/lib/tally/browser-scope";
+import { queueTallyCommandAndWake } from "@/lib/tally/queue-command";
 
 export const runtime = "nodejs";
 const BANK_STATEMENT_EXTRACTION_VERSION = 2;
@@ -29,26 +30,6 @@ function readJsonField<T>(value: FormDataEntryValue | null, fallback: T): T {
 
 function readTextField(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function readLiveLedgerNames(value: FormDataEntryValue | null) {
-  return Array.from(new Set(
-    readJsonField<unknown[]>(value, [])
-      .map((name) => typeof name === "string" ? name.trim().slice(0, 500) : "")
-      .filter(Boolean)
-  )).slice(0, 20_000);
-}
-
-function readLiveBankCandidates(value: FormDataEntryValue | null) {
-  return readJsonField<unknown[]>(value, []).flatMap((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
-    const row = candidate as Record<string, unknown>;
-    const ledgerName = typeof row.ledgerName === "string" ? row.ledgerName.trim().slice(0, 500) : "";
-    const accountNumber = typeof row.accountNumber === "string"
-      ? row.accountNumber.replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(0, 40)
-      : "";
-    return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
-  }).slice(0, 1_000);
 }
 
 function isPdfUpload(file: File) {
@@ -186,123 +167,21 @@ export async function POST(request: Request) {
     const financialYear = readTextField(formData.get("financialYear"));
     const bankLedgerName = readTextField(formData.get("bankLedgerName"));
     const syncBeforeAnalysis = readTextField(formData.get("syncBeforeAnalysis")) !== "false";
-    const liveTallyLedgerNames = readLiveLedgerNames(formData.get("liveTallyLedgerNames"));
-    const liveTallyBankAccountCandidates = readLiveBankCandidates(
-      formData.get("liveTallyBankAccountCandidates")
-    );
     const statementPasswordValue = formData.get("statementPassword");
     const statementPassword = typeof statementPasswordValue === "string" ? statementPasswordValue : "";
 
     if (!connectionId) {
       return jsonWithCors(request, { error: "Select a Tally company before upload." }, { status: 400 });
     }
-    const target = await resolveTallyTarget(request, user.id, connectionId, companyName);
     const bytes = new Uint8Array(await file.arrayBuffer());
-    const uploadBytes = isPdfUpload(file) ? await unlockPdfIfNeeded(bytes, statementPassword) : bytes;
+    const [target, uploadBytes] = await Promise.all([
+      resolveBankStatementUploadTarget(request, user.id, connectionId, companyName),
+      isPdfUpload(file) ? unlockPdfIfNeeded(bytes, statementPassword) : Promise.resolve(bytes),
+    ]);
     const supabase = createSupabaseAdminClient();
     const sourceSha256 = createHash("sha256").update(uploadBytes).digest("hex");
 
-    const { data: existingImport, error: existingImportError } = await supabase
-      .from("bank_statement_imports")
-      .select("*")
-      .eq("owner_user_id", user.id)
-      .eq("company_dataset_id", target.companyDatasetId)
-      .eq("source_sha256", sourceSha256)
-      .maybeSingle();
-    if (existingImportError) throw existingImportError;
-    if (existingImport) {
-      const existingMeta = readRecord(existingImport.processing_meta);
-      const effectiveStatus = getEffectiveImportStatus(existingImport as Record<string, unknown>);
-      // A duplicate successful statement is safe to reuse. A failed or
-      // incomplete result is not a cache entry: every deliberate re-upload
-      // must get a fresh extraction attempt, even when the parser version did
-      // not change.
-      if (["failed", "manual_review_required", "ready_to_review"].includes(effectiveStatus)) {
-        const now = new Date().toISOString();
-        await supabase
-          .from("bank_statement_import_preview_transactions")
-          .delete()
-          .eq("import_id", existingImport.id)
-          .eq("owner_user_id", user.id);
-        await supabase
-          .from("bank_statement_extraction_jobs")
-          .delete()
-          .eq("import_id", existingImport.id)
-          .eq("owner_user_id", user.id)
-          .in("status", ["succeeded", "failed", "cancelled"]);
-        const { data: refreshedImport, error: refreshError } = await supabase
-          .from("bank_statement_imports")
-          .update({
-            status: "processing",
-            processing_meta: {
-              ...existingMeta,
-              extractionVersion: BANK_STATEMENT_EXTRACTION_VERSION,
-              analysis: {
-                ...readRecord(existingMeta.analysis),
-                status: "queued",
-                progress: 5,
-                stage: "Reanalysing statement",
-                error: null,
-                startedAt: now,
-                updatedAt: now,
-              },
-            },
-          })
-          .eq("id", existingImport.id)
-          .eq("owner_user_id", user.id)
-          .eq("company_dataset_id", target.companyDatasetId)
-          .select("*")
-          .single();
-        if (refreshError) throw refreshError;
-        const { error: retryJobError } = await supabase.from("bank_statement_extraction_jobs").insert({
-          import_id: existingImport.id,
-          owner_user_id: user.id,
-          status: "queued",
-          progress: 5,
-          stage: "Reanalysing statement",
-          result: createBankStatementJobResult(),
-        });
-        if (retryJobError) throw retryJobError;
-        return jsonWithCors(request, {
-          ...serializePreviewFromMeta(refreshedImport as Record<string, unknown>),
-          duplicateUpload: true,
-          reanalysisStarted: true,
-          message: "The previous analysis was incomplete. This statement is being analysed again.",
-        });
-      }
-      return jsonWithCors(request, {
-        ...serializePreviewFromMeta(existingImport as Record<string, unknown>),
-        duplicateUpload: true,
-        message: "This statement was already uploaded. The existing analysis has been opened.",
-      });
-    }
-
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
-
-    // Snapshots retain catalogue identity and the small bank-account context.
-    // The authoritative ledger catalogue already lives in tally_masters; copying
-    // all 10k-50k names into every workflow snapshot wastes storage and makes
-    // every import heavier to read.
-    const ledgerChecksum = createHash("sha256")
-      .update(JSON.stringify(liveTallyLedgerNames.map((name) => name.toLocaleLowerCase()).sort()))
-      .digest("hex");
-    const catalogue = {
-      schemaVersion: 2,
-      ledgerCount: liveTallyLedgerNames.length,
-      ledgerChecksum,
-      bankAccountCandidates: liveTallyBankAccountCandidates,
-      connectionId,
-      companyName,
-      financialYear,
-    };
-    const checksum = createHash("sha256").update(JSON.stringify(catalogue)).digest("hex");
-    const { error: snapshotInsertError } = await supabase.from("tally_catalogue_snapshots").upsert({
-      owner_user_id: user.id, company_dataset_id: target.companyDatasetId, checksum, catalogue,
-    }, { onConflict: "company_dataset_id,checksum", ignoreDuplicates: true });
-    if (snapshotInsertError) throw snapshotInsertError;
-    const { data: snapshot, error: snapshotError } = await supabase.from("tally_catalogue_snapshots")
-      .select("id").eq("company_dataset_id", target.companyDatasetId).eq("checksum", checksum).single();
-    if (snapshotError) throw snapshotError;
 
     const upload = await supabase.storage.from(BANK_STATEMENT_BUCKET).upload(storagePath, uploadBytes, {
       contentType: file.type || "application/octet-stream",
@@ -313,7 +192,9 @@ export async function POST(request: Request) {
     const insertPayload = {
       owner_user_id: user.id,
       company_dataset_id: target.companyDatasetId,
-      catalogue_snapshot_id: snapshot.id,
+      // Connector-first analysis owns the live ledger catalogue locally. A
+      // per-import cloud snapshot would duplicate thousands of ledger names.
+      catalogue_snapshot_id: null,
       bank_account_id: null,
       original_file_name: file.name || "bank-statement",
       storage_bucket: BANK_STATEMENT_BUCKET,
@@ -361,22 +242,50 @@ export async function POST(request: Request) {
 
     if (insertError) {
       await supabase.storage.from(BANK_STATEMENT_BUCKET).remove([storagePath]).catch(() => undefined);
-      if (insertError.code === "23505") {
-        const { data: racedImport, error: racedImportError } = await supabase
-          .from("bank_statement_imports")
-          .select("*")
-          .eq("owner_user_id", user.id)
-          .eq("company_dataset_id", target.companyDatasetId)
-          .eq("source_sha256", sourceSha256)
-          .single();
-        if (racedImportError) throw racedImportError;
-        return jsonWithCors(request, {
-          ...serializePreviewFromMeta(racedImport as Record<string, unknown>),
-          duplicateUpload: true,
-          message: "This statement was already uploaded. The existing analysis has been opened.",
-        });
-      }
       throw insertError;
+    }
+
+    // Start local parsing/vector retrieval immediately after storage succeeds.
+    // The extraction worker is queued afterwards, so connector execution can
+    // overlap the worker's claim and setup instead of waiting behind it.
+    let prequeuedConnectorCommandId: string | null = null;
+    let connectorQueuedAt: string | null = null;
+    if (isPdfUpload(file)) {
+      try {
+        const { data: signed, error: signedUrlError } = await supabase.storage
+          .from(BANK_STATEMENT_BUCKET)
+          .createSignedUrl(storagePath, 5 * 60);
+        if (signedUrlError || !signed?.signedUrl) throw signedUrlError ?? new Error("Signed URL unavailable.");
+
+        const queued = await queueTallyCommandAndWake<{ id: string }>({
+          supabase,
+          connectionId,
+          ownerUserId: user.id,
+          commandType: "parse_and_suggest",
+          priority: 5,
+          companyDatasetId: target.companyDatasetId,
+          select: "id",
+          payload: {
+            documentUrl: signed.signedUrl,
+            fileName: "bank-statement.pdf",
+            output: "json",
+            companyName,
+            companyGuid: target.companyGuid,
+            topK: 10,
+            importId: createdImport.id,
+            target,
+          },
+        });
+        prequeuedConnectorCommandId = queued.command.id;
+        connectorQueuedAt = new Date().toISOString();
+      } catch (connectorError) {
+        // The worker retains the authoritative retry/fallback path. A failed
+        // eager dispatch must never make the upload itself fail.
+        console.warn(
+          "Could not prequeue connector preprocessing; the worker will retry it.",
+          connectorError instanceof Error ? connectorError.message : connectorError
+        );
+      }
     }
 
     const { error: jobInsertError } = await supabase.from("bank_statement_extraction_jobs").insert({
@@ -385,10 +294,21 @@ export async function POST(request: Request) {
       status: "queued",
       progress: 5,
       stage: "Statement uploaded",
-      result: createBankStatementJobResult(),
+      result: {
+        ...createBankStatementJobResult(),
+        connectorCommandId: prequeuedConnectorCommandId,
+        connectorQueuedAt,
+      },
     });
 
     if (jobInsertError) {
+      if (prequeuedConnectorCommandId) {
+        await supabase
+          .from("tally_bridge_commands")
+          .delete()
+          .eq("id", prequeuedConnectorCommandId)
+          .eq("owner_user_id", user.id);
+      }
       await supabase.from("bank_statement_imports").delete().eq("id", createdImport.id);
       await supabase.storage.from(BANK_STATEMENT_BUCKET).remove([storagePath]);
       throw jobInsertError;

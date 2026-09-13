@@ -6,12 +6,18 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { createClient } from "@supabase/supabase-js";
+import {
+  createCoalescingWakeSignal,
+  resolvePostgresWakeUrl,
+  startPostgresJobWake,
+} from "./postgres-job-wake.mjs";
 import sharp from "sharp";
 import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
 import {extractMarkdownBatches} from './bank-statement-markdown-batches.mjs';
 import { deterministicTransactionsFromAnydoc } from "./bank-statement-deterministic.mjs";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
+import { queueTallyCommandAndWake } from "../src/lib/tally/queue-command.ts";
 import {
   bankStatementAccountDiagnostics,
   combinedLedgerCatalogueDecision,
@@ -55,6 +61,11 @@ const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_
 const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE_RUNNING_JOB_MS / 60_000))} minutes`;
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
+const CONNECTOR_PREPROCESS_TIMEOUT_MS = Math.max(
+  10_000,
+  Number(process.env.BANK_STATEMENT_CONNECTOR_TIMEOUT_MS ?? 90_000)
+);
+const CONNECTOR_ONLINE_MAX_AGE_MS = 45_000;
 const BANK_STATEMENT_AI_MAX_PAGES = Number(process.env.BANK_STATEMENT_AI_MAX_PAGES ?? 8);
 const BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES = Number(
   process.env.BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES ?? BANK_STATEMENT_AI_MAX_PAGES
@@ -2188,6 +2199,7 @@ async function addBankLedgerRecommendations({
   accountId,
   companyName,
   ledgerNames,
+  vectorCandidates,
   jobId,
 }) {
   if (rows.length === 0) return rows;
@@ -2198,6 +2210,7 @@ async function addBankLedgerRecommendations({
     connectionId,
     companyName,
     ledgerCatalogue: (ledgerNames || []).map((name) => ({ name })),
+    vectorCandidates,
     onProgress: async (completedBatches, totalBatches) => {
       const progress = 82 + Math.floor((completedBatches / Math.max(1, totalBatches)) * 5);
       try {
@@ -2239,16 +2252,207 @@ async function addBankLedgerRecommendations({
           confidence: suggestion.confidence,
           reason: suggestion.reason,
           model: recommendationCompleted
-            ? suggestion.mappingSource === "ai_match"
+            ? suggestion.mappingSource === "ai_match" || suggestion.mappingSource === "vector_ai_match"
               ? OPENROUTER_BANK_LEDGER_MODEL
               : suggestion.mappingSource
             : null,
           source: suggestion.mappingSource,
           status: recommendationCompleted ? "completed" : "unavailable",
         },
+        vectorLedgerCandidates: (vectorCandidates?.[index] || []).map((candidate) => ({
+          ledgerName: candidate.ledgerName,
+          tallyGuid: candidate.tallyGuid || null,
+          parentGroup: candidate.parentGroup || null,
+          vectorScore: candidate.vectorScore ?? candidate.confidence ?? null,
+          rank: candidate.rank ?? null,
+        })),
       },
     };
   });
+}
+
+function connectorVersionAtLeast(value, minimum = [0, 1, 69]) {
+  const match = String(value || "").trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return false;
+  const actual = match.slice(1).map(Number);
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (actual[index] > minimum[index]) return true;
+    if (actual[index] < minimum[index]) return false;
+  }
+  return true;
+}
+
+async function preprocessBankStatementWithConnector({
+  importRow,
+  ownerUserId,
+  connectionId,
+  companyName,
+  fileName,
+  existingCommandId = null,
+}) {
+  if (!connectionId) return { used: false, reason: "no_connection" };
+
+  // The eager upload path normally passes the command id through the job row.
+  // Also discover it by import id so a worker running across a rolling deploy,
+  // or a legacy claim function that returns a stale job snapshot, cannot queue
+  // a duplicate command and discard an already-completed connector result.
+  if (!existingCommandId && importRow?.id) {
+    const { data: eagerCommand, error: eagerCommandError } = await supabase
+      .from("tally_bridge_commands")
+      .select("id")
+      .eq("connection_id", connectionId)
+      .eq("owner_user_id", ownerUserId)
+      .eq("command_type", "parse_and_suggest")
+      .contains("payload", { importId: importRow.id })
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (eagerCommandError) throw eagerCommandError;
+    if (eagerCommand?.id) existingCommandId = eagerCommand.id;
+  }
+
+  if (existingCommandId) {
+    const { data: existingCommand, error: existingCommandError } = await supabase
+      .from("tally_bridge_commands")
+      .select("id")
+      .eq("id", existingCommandId)
+      .eq("connection_id", connectionId)
+      .eq("owner_user_id", ownerUserId)
+      .eq("command_type", "parse_and_suggest")
+      .maybeSingle();
+    if (existingCommandError) throw existingCommandError;
+    if (!existingCommand) return { used: false, reason: "prequeued_connector_command_missing" };
+
+    return waitForConnectorPreprocessCommand({
+      commandId: existingCommand.id,
+      ownerUserId,
+      prequeued: true,
+    });
+  }
+
+  const { data: connection, error: connectionError } = await supabase
+    .from("tally_connections")
+    .select("id, owner_user_id, revoked_at, bridge_version, last_heartbeat_at, last_company_name, active_company_guid")
+    .eq("id", connectionId)
+    .eq("owner_user_id", ownerUserId)
+    .maybeSingle();
+  if (connectionError) throw connectionError;
+
+  const heartbeatAge = connection?.last_heartbeat_at
+    ? Date.now() - Date.parse(connection.last_heartbeat_at)
+    : Infinity;
+  if (!connection || connection.revoked_at) return { used: false, reason: "connection_unavailable" };
+  if (heartbeatAge > CONNECTOR_ONLINE_MAX_AGE_MS) return { used: false, reason: "connector_offline" };
+  if (!connectorVersionAtLeast(connection.bridge_version)) {
+    return { used: false, reason: "connector_update_required" };
+  }
+
+  const { data: signed, error: signedUrlError } = await supabase.storage
+    .from(importRow.storage_bucket || BANK_STATEMENT_BUCKET)
+    .createSignedUrl(importRow.storage_path, 5 * 60);
+  if (signedUrlError || !signed?.signedUrl) {
+    return { used: false, reason: "signed_url_unavailable", error: diagnosticError(signedUrlError) };
+  }
+
+  let queued;
+  try {
+    queued = await queueTallyCommandAndWake({
+      supabase,
+      connectionId,
+      ownerUserId,
+      commandType: "parse_and_suggest",
+      priority: 5,
+      companyDatasetId: importRow.company_dataset_id,
+      select: "id",
+      payload: {
+        documentUrl: signed.signedUrl,
+        fileName,
+        output: "json",
+        companyName: companyName || connection.last_company_name,
+        companyGuid: connection.active_company_guid || null,
+        topK: 10,
+        importId: importRow.id,
+      },
+    });
+  } catch (error) {
+    return { used: false, reason: "command_queue_failed", error: diagnosticError(error) };
+  }
+  const command = queued.command;
+  if (!queued.wakeDelivered) {
+    console.warn(`[worker] realtime wake was not delivered for connector command ${command.id}; recovery polling remains active`);
+  }
+
+  return waitForConnectorPreprocessCommand({
+    commandId: command.id,
+    ownerUserId,
+    prequeued: false,
+  });
+}
+
+async function waitForConnectorPreprocessCommand({ commandId, ownerUserId, prequeued }) {
+  const deadline = Date.now() + CONNECTOR_PREPROCESS_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const { data: current, error: pollError } = await supabase
+      .from("tally_bridge_commands")
+      .select("status, result, error")
+      .eq("id", commandId)
+      .eq("owner_user_id", ownerUserId)
+      .maybeSingle();
+    if (pollError) throw pollError;
+    if (current?.status === "succeeded") {
+      const result = current.result && typeof current.result === "object" && !Array.isArray(current.result)
+        ? current.result
+        : null;
+      const parsed = result?.parsed?.content;
+      const matching = Array.isArray(result?.matching) ? result.matching : [];
+      if (!parsed || !Array.isArray(parsed.transactions) || parsed.transactions.length === 0) {
+        return { used: false, reason: "connector_result_invalid" };
+      }
+      if (matching.length !== parsed.transactions.length) {
+        return { used: false, reason: "connector_matching_incomplete" };
+      }
+      const vectorCandidates = matching.map((match) =>
+        Array.isArray(match?.suggestions)
+          ? match.suggestions.map((candidate) => ({
+              ledgerName: String(candidate?.ledgerName || "").trim(),
+              tallyGuid: candidate?.tallyGuid || null,
+              parentGroup: candidate?.parentGroup || null,
+              vectorScore: Number.isFinite(Number(candidate?.vectorScore))
+                ? Number(candidate.vectorScore)
+                : Number(candidate?.confidence) || null,
+              rank: Number(candidate?.rank) || null,
+            })).filter((candidate) => candidate.ledgerName)
+          : []
+      );
+      if (vectorCandidates.some((candidates) => candidates.length === 0)) {
+        return { used: false, reason: "vector_candidates_unavailable" };
+      }
+      return {
+        used: true,
+        parsed,
+        vectorCandidates,
+        parserDiagnostics: result?.parsed?.metadata?.diagnostics || {},
+        timing: result?.timing || {},
+        commandId,
+        prequeued,
+      };
+    }
+    if (current?.status === "failed" || current?.status === "canceled") {
+      return {
+        used: false,
+        reason: current.status === "failed" ? "connector_command_failed" : "connector_command_canceled",
+        error: current.error || null,
+      };
+    }
+    await sleep(500);
+  }
+
+  await supabase
+    .from("tally_bridge_commands")
+    .update({ status: "canceled", error: "Connector preprocessing timed out." })
+    .eq("id", commandId)
+    .eq("status", "queued");
+  return { used: false, reason: "connector_timeout" };
 }
 
 function markBankLedgerRecommendationsUnavailable(rows, reason, status = "unavailable") {
@@ -2312,9 +2516,10 @@ function markCombinedLedgerRecommendationsCompleted(rows, ledgerNames = []) {
 }
 
 async function runBankStatementJob(job) {
+  const workerStartedAt = Date.now();
   const { data: importRow, error: importError } = await supabase
     .from("bank_statement_imports")
-    .select("*")
+    .select("id,bank_account_id,catalogue_snapshot_id,company_dataset_id,extracted_account_holder_name,extracted_account_number,extracted_bank_name,extracted_ifsc_code,mime_type,original_file_name,processing_meta,statement_period_end,statement_period_start,storage_bucket,storage_path")
     .eq("id", job.import_id)
     .eq("owner_user_id", job.owner_user_id)
     .maybeSingle();
@@ -2333,18 +2538,8 @@ async function runBankStatementJob(job) {
     return;
   }
 
-  await updateBankJob(job.id, { progress: 15, stage: "Downloading statement" });
-  const { data: storedFile, error: downloadError } = await supabase.storage
-    .from(importRow.storage_bucket || BANK_STATEMENT_BUCKET)
-    .download(importRow.storage_path);
-  if (downloadError) throw downloadError;
-
   const mimeType = importRow.mime_type || "";
   const fileName = importRow.original_file_name || "bank-statement";
-  const bytes = new Uint8Array(await storedFile.arrayBuffer());
-  if (bytes.byteLength === 0) {
-    throw new Error(`Downloaded bank statement file "${fileName}" is empty.`);
-  }
   const processingMeta =
     importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
       ? importRow.processing_meta
@@ -2370,50 +2565,11 @@ async function runBankStatementJob(job) {
         ? analysisContext.companyName
         : null;
   const effectiveTallyConnectionId = tallyConnectionId;
-  // Dataset ownership survives reconnects. Never route a worker by a company
-  // name on the newest connection (which might belong to another PC).
-  if (importRow.catalogue_snapshot_id) {
-    const { data: snapshot, error: snapshotError } = await supabase.from("tally_catalogue_snapshots")
-      .select("catalogue").eq("id", importRow.catalogue_snapshot_id)
-      .eq("owner_user_id", job.owner_user_id).eq("company_dataset_id", importRow.company_dataset_id).single();
-    if (snapshotError) throw snapshotError;
-    analysisContext.liveTallyLedgerNames = snapshot.catalogue?.ledgerNames || [];
-    analysisContext.liveTallyBankAccountCandidates = snapshot.catalogue?.bankAccountCandidates || [];
-  }
-  let liveTallyLedgerNames = Array.isArray(analysisContext.liveTallyLedgerNames)
-    ? Array.from(new Set(analysisContext.liveTallyLedgerNames.map((name) => textCell(name)).filter(Boolean))).slice(0, 20_000)
-    : [];
-  let liveTallyBankAccountCandidates = Array.isArray(analysisContext.liveTallyBankAccountCandidates)
-    ? analysisContext.liveTallyBankAccountCandidates.flatMap((candidate) => {
-        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
-        const ledgerName = textCell(candidate.ledgerName);
-        const accountNumber = textCell(candidate.accountNumber).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-        return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
-      }).slice(0, 1_000)
-    : [];
-  const needsLedgerFallback = liveTallyLedgerNames.length === 0;
-  const needsBankCandidateFallback = liveTallyBankAccountCandidates.length === 0;
-  if (needsLedgerFallback || needsBankCandidateFallback) {
-    const [datasetLedgers, datasetBankCandidates] = await Promise.all([
-      needsLedgerFallback
-        ? getActiveTallyLedgerNames(job.owner_user_id, importRow.company_dataset_id)
-        : Promise.resolve([]),
-      needsBankCandidateFallback
-        ? getTallyBankAccountCandidates(job.owner_user_id, importRow.company_dataset_id)
-        : Promise.resolve([]),
-    ]);
-    if (needsLedgerFallback) liveTallyLedgerNames = datasetLedgers;
-    if (needsBankCandidateFallback) liveTallyBankAccountCandidates = datasetBankCandidates;
-    console.log(
-      `[worker] lightweight catalogue snapshot fallback loaded ${datasetLedgers.length} ledger name(s) and ${datasetBankCandidates.length} bank candidate(s) for dataset ${importRow.company_dataset_id}`
-    );
-  }
-  const bankAccountCandidates = liveTallyBankAccountCandidates;
-  const ledgerNames = liveTallyLedgerNames;
-  console.log(
-    `[worker] using ${ledgerNames.length} Tally ledger name(s) and ${bankAccountCandidates.length} bank candidate(s) for ${fileName}`
-  );
-  await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
+  // The connector owns the authoritative local ledger catalogue and vector
+  // index. Cloud catalogue reads are reserved for the legacy server fallback.
+  let bankAccountCandidates = [];
+  let ledgerNames = [];
+  await updateBankJob(job.id, { progress: 24, stage: "Checking local connector" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
   // AI receives only the already-unlocked stored bytes and a neutral filename.
@@ -2442,19 +2598,122 @@ async function runBankStatementJob(job) {
     }
   };
   let extraction;
-  const workerStartedAt = Date.now();
+  let connectorPreprocess = { used: false, reason: "unsupported_document_type" };
   try {
-    extraction = await extractBankStatementAdaptive({
-      fileName: analysisFileName,
-      mimeType,
-      bytes,
-      isPdf,
-      isImage,
-      jobId: job.id,
-      bankAccountCandidates,
-      ledgerNames,
-      onExtractionSource: updateExtractionSource,
-    });
+    if (isPdf) {
+      const prequeuedConnectorCommandId =
+        job.result && typeof job.result === "object" && !Array.isArray(job.result)
+          && typeof job.result.connectorCommandId === "string"
+          ? job.result.connectorCommandId
+          : null;
+      connectorPreprocess = await preprocessBankStatementWithConnector({
+        importRow,
+        ownerUserId: job.owner_user_id,
+        connectionId: effectiveTallyConnectionId,
+        companyName,
+        fileName: analysisFileName,
+        existingCommandId: prequeuedConnectorCommandId,
+      });
+    }
+    if (connectorPreprocess.used) {
+      await updateExtractionSource("connector_anydoc_vector_v1");
+      extraction = {
+        parsed: connectorPreprocess.parsed,
+        extractionSource: "connector_anydoc_vector_v1",
+        extractionError: null,
+        diagnostics: {
+          ...connectorPreprocess.parserDiagnostics,
+          pipeline: "connector_anydoc_vector_v1",
+          coverageComplete: true,
+          unresolvedPages: [],
+          connectorCommandId: connectorPreprocess.commandId,
+          connectorPrequeued: connectorPreprocess.prequeued === true,
+          connectorTiming: connectorPreprocess.timing,
+          ledgerCandidateSource: "connector_zvec",
+          backendPdfDownloaded: false,
+          cloudCatalogueLoaded: false,
+          vectorCandidateCount: connectorPreprocess.vectorCandidates.reduce(
+            (total, candidates) => total + candidates.length,
+            0
+          ),
+        },
+      };
+      await updateBankJob(job.id, { progress: 76, stage: "Connector prepared transactions and ledger candidates" });
+    } else {
+      console.log(
+        `[worker] connector preprocessing unavailable for ${fileName}: ${connectorPreprocess.reason}${connectorPreprocess.error ? ` (${connectorPreprocess.error})` : ""}; using server fallback`
+      );
+      await updateBankJob(job.id, { progress: 30, stage: "Downloading statement for server fallback" });
+      const [{ data: storedFile, error: downloadError }, legacyCatalogue] = await Promise.all([
+        supabase.storage
+          .from(importRow.storage_bucket || BANK_STATEMENT_BUCKET)
+          .download(importRow.storage_path),
+        (async () => {
+          let snapshotCatalogue = null;
+          if (importRow.catalogue_snapshot_id) {
+            const { data: snapshot, error: snapshotError } = await supabase
+              .from("tally_catalogue_snapshots")
+              .select("catalogue")
+              .eq("id", importRow.catalogue_snapshot_id)
+              .eq("owner_user_id", job.owner_user_id)
+              .eq("company_dataset_id", importRow.company_dataset_id)
+              .maybeSingle();
+            if (snapshotError) throw snapshotError;
+            snapshotCatalogue = snapshot?.catalogue || null;
+          }
+          let fallbackLedgerNames = Array.isArray(snapshotCatalogue?.ledgerNames)
+            ? snapshotCatalogue.ledgerNames.map((name) => textCell(name)).filter(Boolean)
+            : [];
+          let fallbackBankCandidates = Array.isArray(snapshotCatalogue?.bankAccountCandidates)
+            ? snapshotCatalogue.bankAccountCandidates.flatMap((candidate) => {
+                const ledgerName = textCell(candidate?.ledgerName);
+                const accountNumber = textCell(candidate?.accountNumber).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+                return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
+              })
+            : [];
+          const [datasetLedgers, datasetBankCandidates] = await Promise.all([
+            fallbackLedgerNames.length === 0
+              ? getActiveTallyLedgerNames(job.owner_user_id, importRow.company_dataset_id)
+              : Promise.resolve([]),
+            fallbackBankCandidates.length === 0
+              ? getTallyBankAccountCandidates(job.owner_user_id, importRow.company_dataset_id)
+              : Promise.resolve([]),
+          ]);
+          if (fallbackLedgerNames.length === 0) fallbackLedgerNames = datasetLedgers;
+          if (fallbackBankCandidates.length === 0) fallbackBankCandidates = datasetBankCandidates;
+          return { ledgerNames: fallbackLedgerNames, bankAccountCandidates: fallbackBankCandidates };
+        })(),
+      ]);
+      if (downloadError) throw downloadError;
+      const bytes = new Uint8Array(await storedFile.arrayBuffer());
+      if (bytes.byteLength === 0) {
+        throw new Error(`Downloaded bank statement file "${fileName}" is empty.`);
+      }
+      ledgerNames = legacyCatalogue.ledgerNames;
+      bankAccountCandidates = legacyCatalogue.bankAccountCandidates;
+      console.log(
+        `[worker] server fallback loaded ${ledgerNames.length} ledger name(s) and ${bankAccountCandidates.length} bank candidate(s) for ${fileName}`
+      );
+      await updateBankJob(job.id, { progress: 34, stage: "Preparing statement with server fallback" });
+      extraction = await extractBankStatementAdaptive({
+        fileName: analysisFileName,
+        mimeType,
+        bytes,
+        isPdf,
+        isImage,
+        jobId: job.id,
+        bankAccountCandidates,
+        ledgerNames,
+        onExtractionSource: updateExtractionSource,
+      });
+      extraction.diagnostics = {
+        ...(extraction.diagnostics || {}),
+        connectorFallbackReason: connectorPreprocess.reason,
+        connectorFallbackError: connectorPreprocess.error || null,
+        backendPdfDownloaded: true,
+        cloudCatalogueLoaded: true,
+      };
+    }
   } finally {
     stopHeartbeat();
   }
@@ -2536,6 +2795,7 @@ async function runBankStatementJob(job) {
           accountId: String(selectedAccountId || importRow.bank_account_id || ""),
           companyName,
           ledgerNames,
+          vectorCandidates: connectorPreprocess.used ? connectorPreprocess.vectorCandidates : undefined,
           jobId: job.id,
         });
   } catch (error) {
@@ -2560,19 +2820,6 @@ async function runBankStatementJob(job) {
   }
 
   await updateBankJob(job.id, { progress: 88, stage: "Saving preview rows" });
-  await supabase
-    .from("bank_statement_import_preview_transactions")
-    .delete()
-    .eq("import_id", job.import_id)
-    .eq("owner_user_id", job.owner_user_id);
-
-  if (previewRows.length > 0) {
-    const { error: previewInsertError } = await supabase
-      .from("bank_statement_import_preview_transactions")
-      .insert(previewRows);
-    if (previewInsertError) throw previewInsertError;
-  }
-
   const previousAnalysis =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
       ? processingMeta.analysis
@@ -2583,69 +2830,119 @@ async function runBankStatementJob(job) {
     extractionIncomplete ? "Extraction incomplete — review required" : parsed.transactions.length > 0 ? "Statement analyzed" : "Extraction needs attention";
   const finalStatementPeriodStart = parsed.statementPeriodStart || importRow.statement_period_start || null;
   const finalStatementPeriodEnd = parsed.statementPeriodEnd || importRow.statement_period_end || null;
-  const { error: importUpdateError } = await supabase
-    .from("bank_statement_imports")
-    .update({
-      bank_account_id: selectedAccountId,
-      statement_period_start: finalStatementPeriodStart,
-      statement_period_end: finalStatementPeriodEnd,
-      extracted_bank_name: account.bankName,
-      extracted_account_number: account.accountNumber,
-      extracted_account_holder_name: account.accountHolderName,
-      extracted_ifsc_code: account.ifscCode,
-      status: finalStatus,
-      processing_meta: {
-        ...processingMeta,
-        extractionVersion: BANK_STATEMENT_EXTRACTION_VERSION,
-        parser: extractionSource === "anydoc_markdown_v1" ? "anydoc_markdown_v1" : "openrouter_bank_statement_v1",
-        extractionSource,
-        jobStatus: "completed",
-        extractionError,
-        extractionDiagnostics,
-        ledgerRecommendationError,
-        ledgerRecommendationIncompleteCount: incompleteRecommendationCount,
-        normalizedAccountNumber,
-        maskedAccountNumber: maskAccountNumber(account.accountNumber),
-        ifscCode: account.ifscCode,
-        previewTransactionCount: previewRows.length,
-        completedAt,
-        analysis: {
-          ...previousAnalysis,
-          status: "completed",
-          progress: 100,
-          stage: analysisStage,
-          error: null,
-          statementPeriodStart: finalStatementPeriodStart,
-          statementPeriodEnd: finalStatementPeriodEnd,
-          extractedStatementPeriodStart: parsed.statementPeriodStart || null,
-          extractedStatementPeriodEnd: parsed.statementPeriodEnd || null,
-          completedAt,
-          updatedAt: completedAt,
-        },
-      },
-    })
-    .eq("id", job.import_id)
-    .eq("owner_user_id", job.owner_user_id);
-  if (importUpdateError) throw importUpdateError;
-
-  await updateBankJob(job.id, {
-    status: "succeeded",
-    progress: 100,
-    stage: extractionIncomplete ? "Extraction incomplete — review required" : "Completed",
-    error: null,
-    result: {
-      importId: job.import_id,
-      transactionCount: previewRows.length,
-      ledgerRecommendationCount: previewRows.length - incompleteRecommendationCount,
-      ledgerRecommendationIncompleteCount: incompleteRecommendationCount,
-      status: finalStatus,
-      coverageComplete: !extractionIncomplete,
-      unresolvedPages: extractionDiagnostics?.unresolvedPages ?? [],
+  const finalJobStage = extractionIncomplete ? "Extraction incomplete — review required" : "Completed";
+  const finalProcessingMeta = {
+    ...processingMeta,
+    extractionVersion: BANK_STATEMENT_EXTRACTION_VERSION,
+    parser: extractionSource === "connector_anydoc_vector_v1"
+      ? "connector_anydoc_vector_v1"
+      : extractionSource === "anydoc_markdown_v1"
+        ? "anydoc_markdown_v1"
+        : "openrouter_bank_statement_v1",
+    extractionSource,
+    jobStatus: "completed",
+    extractionError,
+    extractionDiagnostics,
+    ledgerRecommendationError,
+    ledgerRecommendationIncompleteCount: incompleteRecommendationCount,
+    normalizedAccountNumber,
+    maskedAccountNumber: maskAccountNumber(account.accountNumber),
+    ifscCode: account.ifscCode,
+    previewTransactionCount: previewRows.length,
+    completedAt,
+    analysis: {
+      ...previousAnalysis,
+      status: "completed",
+      progress: 100,
+      stage: analysisStage,
+      error: null,
+      statementPeriodStart: finalStatementPeriodStart,
+      statementPeriodEnd: finalStatementPeriodEnd,
+      extractedStatementPeriodStart: parsed.statementPeriodStart || null,
+      extractedStatementPeriodEnd: parsed.statementPeriodEnd || null,
+      completedAt,
+      updatedAt: completedAt,
     },
-    locked_at: null,
-    locked_by: null,
-    finished_at: new Date().toISOString(),
+  };
+  const finalJobResult = {
+    importId: job.import_id,
+    transactionCount: previewRows.length,
+    ledgerRecommendationCount: previewRows.length - incompleteRecommendationCount,
+    ledgerRecommendationIncompleteCount: incompleteRecommendationCount,
+    status: finalStatus,
+    coverageComplete: !extractionIncomplete,
+    unresolvedPages: extractionDiagnostics?.unresolvedPages ?? [],
+  };
+
+  const { error: atomicFinalizationError } = await supabase.rpc("complete_bank_statement_analysis", {
+    p_job: job.id,
+    p_import: job.import_id,
+    p_owner: job.owner_user_id,
+    p_preview_rows: previewRows,
+    p_import_patch: {
+      bankAccountId: selectedAccountId,
+      statementPeriodStart: finalStatementPeriodStart,
+      statementPeriodEnd: finalStatementPeriodEnd,
+      extractedBankName: account.bankName,
+      extractedAccountNumber: account.accountNumber,
+      extractedAccountHolderName: account.accountHolderName,
+      extractedIfscCode: account.ifscCode,
+      status: finalStatus,
+      processingMeta: finalProcessingMeta,
+    },
+    p_job_result: finalJobResult,
+    p_job_stage: finalJobStage,
+    p_finished_at: completedAt,
   });
+
+  if (atomicFinalizationError) {
+    const detail = diagnosticError(atomicFinalizationError);
+    const migrationMissing =
+      atomicFinalizationError.code === "PGRST202" ||
+      detail.includes("complete_bank_statement_analysis") && detail.toLowerCase().includes("schema cache");
+    if (!migrationMissing) throw atomicFinalizationError;
+
+    // Keep local development and rolling deploys functional until the operator
+    // applies the migration. Production uses the single transaction above.
+    console.warn("[worker] atomic bank-statement finalization is not installed; using compatibility writes");
+    await supabase
+      .from("bank_statement_import_preview_transactions")
+      .delete()
+      .eq("import_id", job.import_id)
+      .eq("owner_user_id", job.owner_user_id);
+    if (previewRows.length > 0) {
+      const { error: previewInsertError } = await supabase
+        .from("bank_statement_import_preview_transactions")
+        .insert(previewRows);
+      if (previewInsertError) throw previewInsertError;
+    }
+    const { error: importUpdateError } = await supabase
+      .from("bank_statement_imports")
+      .update({
+        bank_account_id: selectedAccountId,
+        statement_period_start: finalStatementPeriodStart,
+        statement_period_end: finalStatementPeriodEnd,
+        extracted_bank_name: account.bankName,
+        extracted_account_number: account.accountNumber,
+        extracted_account_holder_name: account.accountHolderName,
+        extracted_ifsc_code: account.ifscCode,
+        status: finalStatus,
+        processing_meta: finalProcessingMeta,
+      })
+      .eq("id", job.import_id)
+      .eq("owner_user_id", job.owner_user_id);
+    if (importUpdateError) throw importUpdateError;
+    await updateBankJob(job.id, {
+      status: "succeeded",
+      progress: 100,
+      stage: finalJobStage,
+      error: null,
+      result: finalJobResult,
+      locked_at: null,
+      locked_by: null,
+      finished_at: completedAt,
+    });
+  }
 }
 
 async function getJob(jobId) {
@@ -2908,6 +3205,13 @@ async function main() {
   );
   let lastIdleLogAt = 0;
   let lastLeaseCleanupAt = 0;
+  const workerWake = createCoalescingWakeSignal();
+  startPostgresJobWake({
+    connectionString: resolvePostgresWakeUrl(),
+    workerPool: WORKER_POOL,
+    wakeSignal: workerWake,
+    reconnectDelayMs: WORKER_POLL_INTERVAL_MS,
+  });
 
   while (true) {
     try {
@@ -2955,7 +3259,7 @@ async function main() {
           console.log("[worker] idle: no queued Tally, bank statement, or packet jobs claimed");
           lastIdleLogAt = now;
         }
-        await sleep(WORKER_POLL_INTERVAL_MS);
+        await workerWake.wait(WORKER_POLL_INTERVAL_MS);
         continue;
       }
 
@@ -2981,7 +3285,7 @@ async function main() {
     } catch (error) {
       const message = formatError(error);
       console.error(`[worker] polling failed: ${message}`);
-      await sleep(WORKER_POLL_INTERVAL_MS);
+      await workerWake.wait(WORKER_POLL_INTERVAL_MS);
     }
   }
 }

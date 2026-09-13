@@ -10,12 +10,26 @@ import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { parseDocumentLocal } from "./document-parsing/parser.mjs";
+import { parseDocumentAndSuggestLedgers } from "./document-parsing/parse-and-suggest.mjs";
+import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs";
+import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
+import {
+  activeVouchers,
+  ensureVoucherPartition,
+  financialYearRange,
+  getCachedBillBucket,
+  loadOperationalCache,
+  operationalStatus,
+  putCachedBillBucket,
+  saveOperationalCache,
+  upsertVoucherPartition,
+} from "./local-matching/operational-cache.mjs";
 
 const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.68";
+const BRIDGE_VERSION = "0.1.70";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -44,6 +58,30 @@ const PURCHASE_DOCUMENT_UDFS = {
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 let cachedWindowsTlsCertificates;
+
+async function requestBridgeSemanticEmbeddings(config, inputs) {
+  if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > 256) {
+    throw new Error("AI embedding batch requires 1-256 inputs.");
+  }
+  const response = await fetch(`${config.apiBase}/api/tally/bridge/embeddings`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.bridgeToken}`,
+    },
+    body: JSON.stringify({ connectionId: config.connectionId, inputs }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(String(payload?.error || `Secure embedding request failed (${response.status}).`));
+  }
+  const embeddings = payload?.embeddings;
+  if (!Array.isArray(embeddings) || embeddings.length !== inputs.length) {
+    throw new Error("The secure embedding service returned an incomplete batch.");
+  }
+  return embeddings;
+}
 
 function windowsTlsCertificates() {
   if (cachedWindowsTlsCertificates) return cachedWindowsTlsCertificates;
@@ -3318,11 +3356,10 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
   const dates = normalizedTransactions.map((transaction) => transaction.voucherDate).sort();
   const dateFrom = dates[0];
   const dateTo = dates.at(-1);
-  const { vouchers, diagnostics: queryDiagnostics } = await fetchBankReconciliationVouchers(
-    tallyUrl,
-    { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions },
-    dependencies
-  );
+  const voucherRequest = { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions };
+  const { vouchers, diagnostics: queryDiagnostics } = dependencies.voucherProvider
+    ? await dependencies.voucherProvider(tallyUrl, voucherRequest, dependencies)
+    : await fetchBankReconciliationVouchers(tallyUrl, voucherRequest, dependencies);
   const reservedVoucherIndexes = new Set();
   const vouchersByDate = indexBankVouchersByDate(vouchers);
   const results = normalizedTransactions.map((transaction) => {
@@ -4279,19 +4316,53 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
     },
   };
   if (missingLedgerNames.length > 0) {
-    dependencies.onProgress?.(`Voucher check complete. Reading open bills for ${missingLedgerNames.length} unmatched ledgers...`);
-    const billOutcome = await fetchCustomerOpenBillsFromTally(
-      config,
-      {
-        companyName: commandPayload.companyName,
-        ledgerName: missingLedgerNames[0],
-        ledgerNames: missingLedgerNames,
-        asOfDate: commandPayload.asOfDate,
-        queryPurpose: "bank_statement_match",
+    const context = dependencies.operationalContext;
+    const cachedByLedger = {};
+    const liveLedgerNames = [];
+    for (const ledgerName of missingLedgerNames) {
+      const cached = context?.partition ? getCachedBillBucket(context.partition, ledgerName) : null;
+      if (cached) cachedByLedger[ledgerName] = cached;
+      else liveLedgerNames.push(ledgerName);
+    }
+    let liveBillResult = { byLedger: {}, queryDiagnostics: { skipped: true } };
+    if (liveLedgerNames.length > 0) {
+      dependencies.onProgress?.(`Voucher check complete. Reading open bills for ${liveLedgerNames.length} changed ledgers...`);
+      const billOutcome = await fetchCustomerOpenBillsFromTally(
+        config,
+        {
+          companyName: commandPayload.companyName,
+          ledgerName: liveLedgerNames[0],
+          ledgerNames: liveLedgerNames,
+          asOfDate: commandPayload.asOfDate,
+          queryPurpose: "bank_statement_match",
+        },
+        dependencies
+      );
+      liveBillResult = billOutcome.result || billOutcome;
+      if (context?.partition) {
+        for (const ledgerName of liveLedgerNames) {
+          const bucket = liveBillResult.byLedger?.[ledgerName];
+          if (bucket?.complete !== false && !bucket?.error) putCachedBillBucket(context.partition, ledgerName, bucket);
+        }
+        saveOperationalCache(context.db, context.options);
+      }
+    }
+    const byLedger = { ...cachedByLedger, ...(liveBillResult.byLedger || {}) };
+    billResult = {
+      ...liveBillResult,
+      ledgerNames: missingLedgerNames,
+      byLedger,
+      openBills: byLedger[missingLedgerNames[0]]?.openBills || [],
+      existingAdvances: byLedger[missingLedgerNames[0]]?.existingAdvances || [],
+      rawCount: Object.values(byLedger).reduce((total, bucket) => total + Number(bucket?.rawCount || 0), 0),
+      queryDiagnostics: {
+        ...(liveBillResult.queryDiagnostics || {}),
+        requestedLedgerCount: missingLedgerNames.length,
+        cachedLedgerCount: Object.keys(cachedByLedger).length,
+        liveLedgerCount: liveLedgerNames.length,
+        cacheSource: "connector_open_bill_cache",
       },
-      dependencies
-    );
-    billResult = billOutcome.result || billOutcome;
+    };
   }
 
   return {
@@ -4300,6 +4371,11 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
       ...verification,
       billLedgerNames: missingLedgerNames,
       openBillsByLedger: billResult.byLedger || {},
+      connectorBillAllocationPlans: planChronologicalBillAllocations({
+        transactions: transactions.filter((transaction) => billEligibleTransactionIds.has(String(transaction.transactionId || ""))),
+        verificationRows: verification.transactions || [],
+        openBillsByLedger: billResult.byLedger || {},
+      }),
       matchDiagnostics: {
         voucherCheck: verification.queryDiagnostics || null,
         openBillCheck: billResult.queryDiagnostics || null,
@@ -4309,6 +4385,99 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
       },
     },
   };
+}
+
+const VOUCHER_CACHE_FULL_REFRESH_MS = 7 * 24 * 60 * 60 * 1_000;
+const CACHED_VOUCHER_FETCH_FIELDS =
+  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount";
+
+function isCompleteVoucherEnvelope(xml) {
+  return /<\/ENVELOPE\s*>/i.test(xml) && /<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(xml);
+}
+
+async function refreshCachedBankVouchers(
+  tallyUrl,
+  { companyName, dateFrom, dateTo, bankLedgerName, transactions },
+  dependencies = {}
+) {
+  const startedAt = Date.now();
+  const options = {
+    appUserDataPath: dependencies.appUserDataPath,
+    baseDir: dependencies.localMatchingBaseDir,
+  };
+  const db = loadOperationalCache(options);
+  const fy = financialYearRange(dateFrom);
+  const { key, partition } = ensureVoucherPartition(db, {
+    companyGuid: dependencies.companyGuid || null,
+    companyName,
+    bankLedgerGuid: dependencies.bankLedgerGuid || null,
+    bankLedgerName,
+    financialYear: fy.key,
+  });
+  const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
+  const cursor = Number(partition.cursor?.lastAlterId) || 0;
+  const fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
+  const mode = fullRefresh ? "full_snapshot" : "delta";
+  partition.status = "refreshing";
+  saveOperationalCache(db, options);
+
+  const exportStartedAt = Date.now();
+  try {
+    const filterName = "GajkesariChangedOperationalVoucher";
+    const xml = await (dependencies.exportCollection || exportTallyCollection)(tallyUrl, {
+      collectionName: fullRefresh
+        ? "Gajkesari Cached Bank Vouchers"
+        : "Gajkesari Changed Operational Vouchers",
+      tallyType: fullRefresh ? "Vouchers : Ledger" : "Voucher",
+      ...(fullRefresh ? { childOf: tallyFormulaString(bankLedgerName) } : {}),
+      fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
+      companyName,
+      dateFrom: fy.dateFrom,
+      dateTo: fy.dateTo,
+      ...(fullRefresh || cursor <= 0 ? {} : {
+        formulae: [{ name: filterName, formula: `$AlterID > ${Math.trunc(cursor)}` }],
+        filterNames: [filterName],
+      }),
+      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+    });
+    if (!isCompleteVoucherEnvelope(xml)) {
+      throw new Error("Tally did not return a complete voucher collection for the local index.");
+    }
+    const changedVouchers = parseVoucherCollection(xml);
+    const update = upsertVoucherPartition(partition, changedVouchers, { mode, bankLedgerName });
+    partition.lastError = null;
+    saveOperationalCache(db, options);
+    dependencies.operationalContext = { db, key, partition, options };
+
+    const strongReferences = new Set(
+      (transactions || []).map((item) => String(item.referenceNumber || "").trim()).filter(isStrongBankReference)
+    );
+    const vouchers = activeVouchers(partition).filter((voucher) => {
+      const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+      return (date >= dateFrom && date <= dateTo) ||
+        (strongReferences.size > 0 && strongReferences.has(String(voucher.reference || "").trim()));
+    });
+    return {
+      vouchers,
+      diagnostics: {
+        source: "connector_voucher_index",
+        refreshMode: mode,
+        exportMs: Date.now() - exportStartedAt,
+        totalMs: Date.now() - startedAt,
+        changedVoucherCount: changedVouchers.length,
+        scannedVoucherCount: vouchers.length,
+        cachedVoucherCount: partition.voucherCount || 0,
+        counts: update.counts,
+        financialYear: fy.key,
+      },
+    };
+  } catch (error) {
+    partition.status = "error";
+    partition.lastError = error instanceof Error ? error.message : String(error);
+    saveOperationalCache(db, options);
+    throw error;
+  }
 }
 
 async function fetchBankReconciliationVouchers(
@@ -5074,6 +5243,7 @@ async function assertCommandTarget(config, command) {
   }
   // Rendering a previously verified document is not a new Tally read/write.
   if (command.commandType === "parse_document" ||
+      command.commandType === "parse_and_suggest" ||
       command.commandType === "export_debit_note_pdf" ||
       (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf")) return;
   const readiness = await testTally(config.tallyUrl);
@@ -5107,6 +5277,27 @@ async function executeCommand(config, command, options = {}) {
       await sendCommandResult(config, command, {
         success: false,
         result: { processing: "local", ocrUsed: false, code: error?.code || "parse_failed" },
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "parse_and_suggest") {
+    try {
+      const result = await parseDocumentAndSuggestLedgers(command.payload || {}, {
+        appUserDataPath: options.appUserDataPath,
+        baseDir: options.localMatchingBaseDir,
+        embedTexts: options.embedTexts || ((inputs) => requestBridgeSemanticEmbeddings(config, inputs)),
+      });
+      await sendCommandResult(config, command, { success: true, result });
+      console.log(`Command ${command.id} completed: parsed ${result.transactions.length} transaction(s) and retrieved vector candidates.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Document parsing and ledger retrieval failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: { processing: "local", searchMode: "vector_only", code: error?.code || "parse_and_suggest_failed" },
         error: message,
       });
       console.log(`Command ${command.id} failed: ${message}`);
@@ -5698,12 +5889,12 @@ function tallyLiveGatewayUrl(config) {
 function createExclusiveScheduler(options = {}) {
   let active = false;
   let stopped = false;
-  const interactiveQueue = [];
-  const backgroundQueue = [];
+  const priorityOrder = ["posting", "preflight", "matching", "interactive", "manual", "background"];
+  const queues = new Map(priorityOrder.map((name) => [name, []]));
 
   const scheduleNext = () => {
     if (active || stopped) return;
-    const entry = interactiveQueue.shift() || backgroundQueue.shift();
+    const entry = priorityOrder.map((name) => queues.get(name)).find((queue) => queue.length)?.shift();
     if (!entry) return;
     active = true;
     Promise.resolve()
@@ -5720,7 +5911,8 @@ function createExclusiveScheduler(options = {}) {
       reject(new Error("The connector has stopped."));
       return;
     }
-    const queue = priority === "interactive" ? interactiveQueue : backgroundQueue;
+    const normalizedPriority = queues.has(priority) ? priority : "background";
+    const queue = queues.get(normalizedPriority);
     let timer;
     const cleanup = () => {
       clearTimeout(timer);
@@ -5744,7 +5936,7 @@ function createExclusiveScheduler(options = {}) {
     };
     if (lifecycle.signal?.aborted) { entry.reject(new Error("Live Tally request cancelled.")); return; }
     lifecycle.signal?.addEventListener("abort", cancel, { once: true });
-    if (priority === "interactive") {
+    if (normalizedPriority !== "background") {
       timer = setTimeout(() => {
         const index = queue.indexOf(entry);
         if (index < 0) return;
@@ -5759,11 +5951,13 @@ function createExclusiveScheduler(options = {}) {
   execute.stop = () => {
     stopped = true;
     const error = new Error("The connector has stopped.");
-    for (const entry of [...interactiveQueue.splice(0), ...backgroundQueue.splice(0)]) {
+    for (const entry of priorityOrder.flatMap((name) => queues.get(name).splice(0))) {
       entry.reject(error);
     }
   };
-  execute.hasPendingInteractive = () => interactiveQueue.length > 0;
+  execute.hasPendingInteractive = () => priorityOrder
+    .filter((name) => name !== "background")
+    .some((name) => queues.get(name).length > 0);
   execute.isBusy = () => active;
   return execute;
 }
@@ -5826,6 +6020,15 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             throw new Error("The active Tally company changed. Select the intended company and check again.");
           }
         };
+        if (operation === "local_ledger_catalogue") {
+          const db = loadLocalDb({ appUserDataPath: options.appUserDataPath, baseDir: options.localMatchingBaseDir });
+          const catalogue = getLocalMasterCatalogue(db, {
+            companyName: message.companyName,
+            companyGuid: message.target.companyGuid,
+          });
+          if (!catalogue) throw new Error("The connector has no local ledger catalogue for this company. Open Ledger matching and update ledgers first.");
+          return { source: "connector_local_db", ...catalogue };
+        }
         await assertCompany();
         if (operation === "bank_ledgers") {
           const outcome = await fetchBankLedgersFromTally(config, {
@@ -5932,6 +6135,10 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             assertCompany,
             onProgress,
             onPartialResult: (data) => send({ type: "partial_result", requestId, data }),
+            voucherProvider: refreshCachedBankVouchers,
+            appUserDataPath: options.appUserDataPath,
+            localMatchingBaseDir: options.localMatchingBaseDir,
+            companyGuid: message.target?.companyGuid || null,
           });
           await assertCompany();
           return outcome.result || outcome;
@@ -5942,7 +6149,11 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         throw new Error("Unsupported live Tally operation.");
-      }), "interactive", { signal: controller.signal, deadlineAt });
+      }), operation === "verify_bank_transaction"
+        ? "preflight"
+        : operation === "match_bank_statement"
+          ? "matching"
+          : "interactive", { signal: controller.signal, deadlineAt });
       controller.signal.throwIfAborted();
       const executionMs = Date.now() - executionStartedAt;
       if (data && typeof data === "object") {
@@ -6059,8 +6270,8 @@ async function fetchCommandRealtimeConfig(config) {
 }
 
 async function processClaimedCommands(config, commands, options = {}, executeExclusive = null) {
-  const runBackgroundTask = (task) => executeExclusive
-    ? executeExclusive(task, "background")
+  const runBackgroundTask = (task, priority = "background") => executeExclusive
+    ? executeExclusive(task, priority)
     : task();
   const bankVoucherCommands = commands.filter((command) => command.commandType === "post_bank_voucher");
   for (const command of commands) {
@@ -6076,7 +6287,7 @@ async function processClaimedCommands(config, commands, options = {}, executeExc
     }
   }
   if (bankVoucherCommands.length > 0) {
-    await runBackgroundTask(() => runBankVoucherCommandBatch(config, bankVoucherCommands, options));
+    await runBackgroundTask(() => runBankVoucherCommandBatch(config, bankVoucherCommands, options), "posting");
   }
 }
 
@@ -6451,6 +6662,9 @@ function createBridgeRunner(options = {}) {
     stop,
     async runOnce() {
       await runSerially();
+    },
+    runTallyTask(task, priority = "background", lifecycle = {}) {
+      return executeExclusive(task, priority, lifecycle);
     },
   };
 }
@@ -6974,6 +7188,7 @@ export {
   purchaseVoucherReadbackComparison,
   readConfig,
   reconcileBankTransactionsInTally,
+  refreshCachedBankVouchers,
   strictBankTransactionCandidates,
   indexBankVouchersByDate,
   runOnce,

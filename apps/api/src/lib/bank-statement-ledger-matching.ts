@@ -21,7 +21,7 @@ export type BankLedgerSuggestion = {
   ledgerName: string | null;
   confidence: number;
   reason: string | null;
-  mappingSource: "saved_narration" | "category" | "ledger_name" | "close_match" | "ai_match" | "none";
+  mappingSource: "saved_narration" | "category" | "ledger_name" | "close_match" | "ai_match" | "vector_ai_match" | "none";
   matchType?: "direct_match" | "close_match" | "suspense";
   candidateLedgerNames?: string[];
 };
@@ -38,6 +38,15 @@ export type OfflineLedgerCatalogueEntry = {
   id?: string | null;
   name: string;
   parent?: string | null;
+};
+
+export type VectorLedgerCandidate = {
+  ledgerName: string;
+  tallyGuid?: string | null;
+  parentGroup?: string | null;
+  vectorScore?: number | null;
+  confidence?: number | null;
+  rank?: number | null;
 };
 
 type AiLedgerMatch = {
@@ -70,6 +79,7 @@ Allowed ledgers:
 Choose only from the provided tallyLedgers list. Copy every selected ledger name exactly as provided.
 The tallyLedgers list is shared by every transaction in the request.
 When a transaction includes allowedLedgerNames, that transaction may choose and may return candidates only from its own allowedLedgerNames list.
+vectorCandidates are semantic retrieval results, not final decisions. Their score and rank may help you inspect the shortlist, but neither proves identity and neither overrides the collision and safety rules below.
 Never invent, modify, shorten, merge, or create a ledger.
 Never create a new party, expense, tax, bank, transfer, or suspense ledger.
 If no existing ledger is uniquely supported, use suspense.
@@ -523,13 +533,22 @@ async function aiMatchLedgersForTransactions(input: {
   transactions: Array<{
     transaction: MatchableTransaction;
     counterpartyName: string | null;
+    vectorCandidates?: VectorLedgerCandidate[];
   }>;
 }) {
   if (input.transactions.length === 0) return [];
 
-  const allowedLedgersByIndex = input.transactions.map(({ transaction, counterpartyName }) =>
-    shortlistBankLedgersForTransaction(input.ledgers, transaction, counterpartyName)
+  const ledgerByName = new Map(
+    input.ledgers.map((ledger) => [normalizeName(ledger.tally_name), ledger])
   );
+  const allowedLedgersByIndex = input.transactions.map(({ transaction, counterpartyName, vectorCandidates }) => {
+    const vectorLedgers = (vectorCandidates ?? [])
+      .map((candidate) => ledgerByName.get(normalizeName(candidate.ledgerName)))
+      .filter((ledger): ledger is TallyMasterRow => Boolean(ledger));
+    return vectorLedgers.length > 0
+      ? Array.from(new Map(vectorLedgers.map((ledger) => [normalizeName(ledger.tally_name), ledger])).values())
+      : shortlistBankLedgersForTransaction(input.ledgers, transaction, counterpartyName);
+  });
   const candidateLedgerByKey = new Map<string, TallyMasterRow>();
   for (const ledgers of allowedLedgersByIndex) {
     for (const ledger of ledgers) {
@@ -560,6 +579,11 @@ async function aiMatchLedgersForTransactions(input: {
             category: transaction.category,
             counterpartyName: counterpartyName ?? transaction.counterpartyName ?? null,
             allowedLedgerNames: allowedLedgersByIndex[index].map((ledger) => ledger.tally_name),
+            vectorCandidates: (input.transactions[index].vectorCandidates ?? []).map((candidate) => ({
+              ledgerName: candidate.ledgerName,
+              score: candidate.vectorScore ?? candidate.confidence ?? null,
+              rank: candidate.rank ?? null,
+            })),
           })),
           tallyLedgers: candidateLedgers.map((ledger) => ({
             name: ledger.tally_name,
@@ -575,6 +599,10 @@ async function aiMatchLedgersForTransactions(input: {
       reasoning: getBankLedgerMatchingReasoning(),
       maxTokens: getBankLedgerMatchingMaxTokens(),
       timeoutMs: getBankLedgerMatchingTimeoutMs(),
+      // Ledger batches already run concurrently. Retrying each provider call
+      // and then recursively splitting the same batch multiplied one transient
+      // slowdown into several minutes of serial work.
+      maxRetries: Math.max(0, Number(process.env.OPENROUTER_BANK_LEDGER_MAX_RETRIES ?? 0)),
     }
   );
 
@@ -713,6 +741,7 @@ export async function suggestBankLedgersForTransactions(input: {
   connectionId?: string | null;
   companyName?: string | null;
   ledgerCatalogue?: OfflineLedgerCatalogueEntry[];
+  vectorCandidates?: Array<VectorLedgerCandidate[] | undefined>;
   transactions: BankLedgerSuggestionTransaction[];
   onProgress?: (completedBatches: number, totalBatches: number) => void | Promise<void>;
 }): Promise<BankLedgerSuggestion[]> {
@@ -724,8 +753,45 @@ export async function suggestBankLedgersForTransactions(input: {
     counterpartyName:
       item.transaction.counterpartyName ?? extractCounterpartyName(item.transaction.description),
     sourceKey: sourceKeyForNarration(item.accountId, item.transaction.description),
+    vectorCandidates: input.vectorCandidates?.[index] ?? [],
   }));
   const suggestions: Array<BankLedgerSuggestion | undefined> = input.transactions.map(() => undefined);
+  const hasCompleteVectorShortlists = preparedTransactions.every(
+    (item) => item.vectorCandidates.length > 0
+  );
+  const vectorCatalogue = Array.from(
+    new Map(
+      preparedTransactions
+        .flatMap((item) => item.vectorCandidates)
+        .filter((candidate) => candidate.ledgerName.trim())
+        .map((candidate, index) => {
+          const name = candidate.ledgerName.trim();
+          const key = normalizeName(name);
+          const row = {
+            id: candidate.tallyGuid || `vector-ledger-${index + 1}`,
+            connection_id: input.connectionId ?? "connector-vector-index",
+            owner_user_id: input.ownerUserId,
+            company_name: input.companyName ?? "",
+            sync_run_id: null,
+            master_type: "ledger" as const,
+            master_key: normalizeMasterKey({ masterType: "ledger", name }),
+            tally_guid: candidate.tallyGuid ?? null,
+            tally_name: name,
+            parent_name: candidate.parentGroup?.trim() || null,
+            gstin: null,
+            hsn_code: null,
+            unit_name: null,
+            tax_rate: null,
+            raw_payload: { source: "connector_vector_candidate" },
+            is_active: true,
+            last_synced_at: "",
+            created_at: "",
+            updated_at: "",
+          } satisfies TallyMasterRow;
+          return [key, row] as const;
+        })
+    ).values()
+  );
   // Prefer the catalogue fetched live for this exact analysis. A connector can
   // be freshly paired before its masters have been persisted, so querying only
   // tally_masters here can incorrectly produce an empty catalogue and put every
@@ -753,14 +819,18 @@ export async function suggestBankLedgersForTransactions(input: {
       created_at: "",
       updated_at: "",
     } satisfies TallyMasterRow));
-  const ledgers = liveCatalogue.length > 0
-    ? liveCatalogue
-    : await fetchAllActiveTallyLedgers(input);
+  const ledgers = hasCompleteVectorShortlists
+    ? vectorCatalogue
+    : liveCatalogue.length > 0
+      ? liveCatalogue
+      : await fetchAllActiveTallyLedgers(input);
   const activeLedgerByName = new Map(
     ledgers.map((ledger) => [normalizeName(ledger.tally_name), ledger])
   );
 
-  if (input.connectionId) {
+  // Vector-first matching must be decided exclusively from the connector's
+  // semantic shortlist. Saved narration mappings belong to the legacy path.
+  if (input.connectionId && !hasCompleteVectorShortlists) {
     const sourceKeys = Array.from(
       new Set(
         preparedTransactions
@@ -827,7 +897,7 @@ export async function suggestBankLedgersForTransactions(input: {
     let nextChunkIndex = 0;
     let completedChunkCount = 0;
     let progressUpdate = Promise.resolve();
-    const matchChunkWithRecovery = async (chunk: typeof unresolvedTransactions): Promise<void> => {
+    const matchChunk = async (chunk: typeof unresolvedTransactions): Promise<void> => {
       try {
         const aiMatches = await aiMatchLedgersForTransactions({
           ledgers,
@@ -835,6 +905,7 @@ export async function suggestBankLedgersForTransactions(input: {
           transactions: chunk.map((item) => ({
             transaction: item.transaction,
             counterpartyName: item.counterpartyName,
+            vectorCandidates: item.vectorCandidates,
           })),
         });
         chunk.forEach((item, index) => {
@@ -847,24 +918,16 @@ export async function suggestBankLedgersForTransactions(input: {
             reason: aiLedger.reason,
             // A valid AI suspense/close-match decision is still a completed
             // AI result even though it deliberately has no selected ledger.
-            mappingSource: "ai_match",
+            mappingSource: item.vectorCandidates.length > 0 ? "vector_ai_match" : "ai_match",
             matchType: aiLedger.matchType,
             candidateLedgerNames: aiLedger.candidateLedgerNames,
           };
         });
       } catch (error) {
-        if (chunk.length === 1) {
-          console.warn("AI ledger match failed for one transaction; keeping it retryable in Suspense:", error);
-          return;
-        }
-
         console.warn(
-          `AI ledger batch match failed for ${chunk.length} transaction(s); retrying with smaller batches:`,
+          `AI ledger batch match failed for ${chunk.length} transaction(s); keeping the batch in Suspense:`,
           error
         );
-        const midpoint = Math.ceil(chunk.length / 2);
-        await matchChunkWithRecovery(chunk.slice(0, midpoint));
-        await matchChunkWithRecovery(chunk.slice(midpoint));
       }
     };
 
@@ -873,7 +936,7 @@ export async function suggestBankLedgersForTransactions(input: {
         const chunk = chunks[nextChunkIndex];
         nextChunkIndex += 1;
         try {
-          await matchChunkWithRecovery(chunk);
+          await matchChunk(chunk);
         } finally {
           completedChunkCount += 1;
           const completed = completedChunkCount;

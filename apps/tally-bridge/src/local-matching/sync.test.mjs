@@ -3,9 +3,9 @@ import test from "node:test";
 import { syncLedgersReadOnly, isReadOnlySyncOptions } from "./sync.mjs";
 
 test("sync is read-only: only Export Collection, never Import", async () => {
-  let captured = null;
+  const captured = [];
   const fakeExport = async (tallyUrl, opts) => {
-    captured = { tallyUrl, opts };
+    captured.push({ tallyUrl, opts });
     // Return minimal valid ledger XML
     return `<ENVELOPE><LEDGER NAME="Test Ledger"><PARENT>Sundry Debtors</PARENT><GUID>g1</GUID><ALTERID>100</ALTERID><MASTERID>1</MASTERID></LEDGER></ENVELOPE>`;
   };
@@ -29,15 +29,32 @@ test("sync is read-only: only Export Collection, never Import", async () => {
     exportTallyCollection: fakeExport,
     helpers,
   });
-  assert.ok(captured);
-  assert.equal(captured.opts.tallyType, "Ledger");
-  assert.match(captured.opts.fetchFields, /Name.*Parent.*GUID/i);
-  assert.ok(!String(captured.opts.collectionName).toLowerCase().includes("import"));
+  assert.equal(captured.length, 2);
+  assert.equal(captured[0].opts.tallyType, "Ledger");
+  assert.equal(captured[1].opts.tallyType, "Group");
+  assert.match(captured[0].opts.fetchFields, /Name.*Parent.*GUID/i);
+  assert.ok(captured.every((item) => !String(item.opts.collectionName).toLowerCase().includes("import")));
   assert.equal(result.isReadOnly, true);
   assert.equal(result.ledgers.length, 1);
   assert.equal(result.ledgers[0].name, "Test Ledger");
   // Ensure no Import envelope was built
-  assert.ok(isReadOnlySyncOptions(captured.opts));
+  assert.ok(captured.every((item) => isReadOnlySyncOptions(item.opts)));
+});
+
+test("delta sync applies AlterID filters to both local master collections", async () => {
+  const calls = [];
+  const helpers = { extractBlocks: () => [], getTagText: () => null, getAttribute: () => null };
+  const result = await syncLedgersReadOnly({
+    tallyUrl: "http://localhost:9000",
+    companyName: "Co",
+    mode: "delta",
+    cursor: { lastLedgerAlterID: "100", lastGroupAlterID: "50" },
+    exportTallyCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE></ENVELOPE>"; },
+    helpers,
+  });
+  assert.equal(result.mode, "delta");
+  assert.match(calls[0].formulae[0].formula, /AlterID > 100/);
+  assert.match(calls[1].formulae[0].formula, /AlterID > 50/);
 });
 
 test("sync persists cursor AlterID and rejects Import", async () => {

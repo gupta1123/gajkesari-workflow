@@ -48,7 +48,7 @@ export function isTransactionTable(t) {
   const h = t.headers.map((x) => x.toLowerCase());
   const hasDate = h.some((x) => x.includes("date"));
   const hasDesc = h.some((x) => x.includes("description") || x.includes("narration") || x.includes("particular") || x.includes("details") || x.includes("remarks"));
-  const hasAmount = h.some((x) => x.includes("debit") || x.includes("credit") || x.includes("amount") || x.includes("balance") || x === "dr" || x === "cr");
+  const hasAmount = h.some((x) => x.includes("debit") || x.includes("credit") || x.includes("withdrawal") || x.includes("deposit") || x.includes("amount") || x.includes("balance") || x === "dr" || x === "cr");
   return hasDate && hasDesc && hasAmount;
 }
 
@@ -129,6 +129,10 @@ const HEADER_PATTERNS = [
 function headerPart(value) {
   const raw = String(value ?? "").replace(/\s+/g, " ").trim();
   const lower = raw.toLowerCase();
+  // Some PDF converters collapse adjacent withdrawal/deposit columns into one
+  // generic amount column. Preserve that ambiguity here and infer direction
+  // from the narration instead of incorrectly treating every row as a debit.
+  if (lower.includes("withdrawal") && lower.includes("deposit")) return { kind: "amount", label: raw, remainder: "" };
   // AnyDoc occasionally fuses the empty cheque-number heading with the debit
   // heading. The cells below it contain the debit, so the useful semantic is
   // the amount column rather than the empty reference column.
@@ -197,7 +201,7 @@ function normalizedTableSource(table) {
 function semanticIndexes(headers) {
   const kinds = headers.map((header) => {
     const text = String(header || "").toLowerCase().trim();
-    return ["date", "value_date", "description", "reference", "txn_no", "debit", "credit", "balance"].includes(text)
+    return ["date", "value_date", "description", "reference", "txn_no", "debit", "credit", "amount", "balance"].includes(text)
       ? text
       : headerPart(header).kind;
   });
@@ -240,8 +244,10 @@ function normalizeTableTransactions(table, fallbackYear, startIndex) {
         }
       }
     }
-    const balanceMatch = balanceCandidates.sort((a, b) => a.distance - b.distance || b.index - a.index)[0] ||
-      [...row].map((cell, index) => ({ amount: cellAmounts(cell).at(-1) ?? null, index })).filter((item) => item.amount !== null).at(-1) || null;
+    const balanceMatch = indexes.balance >= 0
+      ? balanceCandidates.sort((a, b) => a.distance - b.distance || b.index - a.index)[0] ||
+        [...row].map((cell, index) => ({ amount: cellAmounts(cell).at(-1) ?? null, index })).filter((item) => item.amount !== null).at(-1) || null
+      : null;
     const excluded = new Set([indexes.date, indexes.valueDate, indexes.description, indexes.reference, indexes.txnNo, balanceMatch?.index].filter((value) => value >= 0));
     const exactDebit = indexes.debit >= 0 ? transactionAmount(row[indexes.debit]) : null;
     const exactCredit = indexes.credit >= 0 ? transactionAmount(row[indexes.credit]) : null;

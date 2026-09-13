@@ -14,7 +14,7 @@ const OPENROUTER_BANK_LEDGER_MODEL =
 const OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS = Number(
   process.env.OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS ?? 4096
 );
-const OPENROUTER_BANK_LEDGER_TIMEOUT_MS = Number(process.env.OPENROUTER_BANK_LEDGER_TIMEOUT_MS ?? 45_000);
+const OPENROUTER_BANK_LEDGER_TIMEOUT_MS = Number(process.env.OPENROUTER_BANK_LEDGER_TIMEOUT_MS ?? 30_000);
 const OPENROUTER_REVIEW_MODEL =
   process.env.OPENROUTER_REVIEW_MODEL ||
   process.env.OPENROUTER_EXTRACTION_REVIEW_MODEL ||
@@ -108,6 +108,7 @@ export async function callOpenRouter(
     reasoning?: OpenRouterReasoningOptions;
     maxTokens?: number;
     timeoutMs?: number;
+    maxRetries?: number;
   }
 ) {
   if (!OPENROUTER_API_KEY) {
@@ -119,10 +120,13 @@ export async function callOpenRouter(
   const timeoutMs = Number.isFinite(options?.timeoutMs) && Number(options?.timeoutMs) > 0
     ? Number(options?.timeoutMs)
     : OPENROUTER_TIMEOUT_MS;
+  const maxRetries = Number.isFinite(options?.maxRetries) && Number(options?.maxRetries) >= 0
+    ? Math.floor(Number(options?.maxRetries))
+    : MAX_RETRIES;
   let attempt = 0;
   let lastError = "OpenRouter request failed";
 
-  while (attempt <= MAX_RETRIES) {
+  while (attempt <= maxRetries) {
     const requestStartedAt = Date.now();
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
@@ -163,7 +167,7 @@ export async function callOpenRouter(
           error: errorText,
         });
 
-        if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === MAX_RETRIES) {
+        if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === maxRetries) {
           throw new Error(errorText);
         }
 
@@ -204,7 +208,7 @@ export async function callOpenRouter(
         durationMs: Date.now() - requestStartedAt,
         error: lastError,
       });
-      if (attempt === MAX_RETRIES) {
+      if (attempt === maxRetries) {
         throw new Error(lastError);
       }
       const delayMs = RETRY_BASE_MS * Math.pow(2, attempt);

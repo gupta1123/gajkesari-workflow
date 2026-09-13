@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { allocateReceiptByFifo } from "./bank-statement-bill-allocation.ts";
+import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "./bank-statement-bill-allocation.ts";
 
 const mahavirBills = [
   { referenceName: "MSC/26-27/404", invoiceDate: "2026-08-05", pendingAmount: 95_000 },
@@ -73,4 +73,16 @@ test("uses due date before invoice date and leaves undated bills last", () => {
 
   assert.deepEqual(result.allocations.map((allocation) => allocation.referenceName), ["EARLIER-DUE", "LATER-INVOICE"]);
   assert.deepEqual(result.allocations.map((allocation) => allocation.allocatedAmount), [40_000, 20_000]);
+});
+
+test("subsequent transactions see the remaining bill balance", () => {
+  const bills = [{ referenceName: "INV-1", invoiceDate: "2026-08-01", pendingAmount: 100_000 }];
+  const first = allocateReceiptByFifo(70_000, bills, "ADV-1");
+  const remaining = applyFifoAllocationsToBills(bills, first.allocations);
+  const second = allocateReceiptByFifo(60_000, remaining, "ADV-2");
+  assert.equal(remaining[0].pendingAmount, 30_000);
+  assert.deepEqual(second.allocations.map(({ referenceType, allocatedAmount }) => ({ referenceType, allocatedAmount })), [
+    { referenceType: "Agst Ref", allocatedAmount: 30_000 },
+    { referenceType: "Advance", allocatedAmount: 30_000 },
+  ]);
 });

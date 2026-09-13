@@ -1,6 +1,6 @@
 {
   "name": "@gajkesari/tally-bridge",
-  "version": "0.1.68",
+  "version": "0.1.70",
   "private": true,
   "type": "module",
   "exports": {

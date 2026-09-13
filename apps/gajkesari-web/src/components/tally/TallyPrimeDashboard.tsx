@@ -3,11 +3,12 @@
 import { tallyBrowserStorage } from "@/lib/tally-browser-storage";
 
 
+import Image from "next/image";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowRight,
-  CheckCircle2,
+  Building2,
   FileText,
   Loader2,
   PlugZap,
@@ -15,11 +16,15 @@ import {
   Server,
   Sparkles,
   TriangleAlert,
+  X,
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { useTallyConnectionStatus } from "@/components/tally/TallyConnectionStatusProvider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { CompanyAvatar } from "@/components/ui/company-avatar";
+import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import { Input } from "@/components/ui/input";
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
@@ -50,6 +55,8 @@ type TallyConnection = {
   tallyReachable?: boolean;
   companyLoaded?: boolean;
   heartbeatStale?: boolean;
+  connectorUpdateRequired?: boolean;
+  revoked?: boolean;
 };
 
 type CompanyOption = {
@@ -116,18 +123,6 @@ function getStatusLabel(connection?: TallyConnection | null) {
   return "Not connected";
 }
 
-function getStatusTone(connection?: TallyConnection | null) {
-  if (!connection) return "neutral";
-  if (connection.status === "company_loaded") return "success";
-  if (
-    connection.status === "tally_reachable" ||
-    connection.status === "bridge_connected"
-  )
-    return "warning";
-  if (connection.status === "connection_error") return "error";
-  return "neutral";
-}
-
 const DEFAULT_BRIDGE_API_BASE_URL =
   "https://gajkesari-workflow-b626b81159b6.herokuapp.com";
 
@@ -153,12 +148,6 @@ function getBridgeApiBaseUrl() {
   ).replace(/\/+$/, "");
   if (configuredBaseUrl) return configuredBaseUrl;
   return DEFAULT_BRIDGE_API_BASE_URL;
-}
-
-function formatCompanyOptionLabel(company: CompanyOption) {
-  return [company.companyName, company.financialYear]
-    .filter(Boolean)
-    .join(" - ");
 }
 
 function buildConnectorConnectUrl(
@@ -203,49 +192,6 @@ function openConnectorUrl(value: string) {
   window.location.assign(value);
 }
 
-function StatusCard({
-  title,
-  value,
-  ok,
-  detail,
-}: {
-  title: string;
-  value: string;
-  ok: boolean;
-  detail: string;
-}) {
-  return (
-    <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:shadow-[0_4px_12px_rgba(0,0,0,0.03)]">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
-            {title}
-          </div>
-          <div className="mt-2 text-base font-extrabold text-[#1a1a1a]">
-            {value}
-          </div>
-          <div className="mt-1 text-xs font-semibold text-slate-400 leading-snug">
-            {detail}
-          </div>
-        </div>
-        <div
-          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${
-            ok
-              ? "bg-emerald-50 border-emerald-100 text-emerald-600"
-              : "bg-amber-50 border-amber-100 text-amber-600"
-          }`}
-        >
-          {ok ? (
-            <CheckCircle2 className="h-4.5 w-4.5" />
-          ) : (
-            <TriangleAlert className="h-4.5 w-4.5" />
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function HubCard({
   title,
   description,
@@ -284,12 +230,56 @@ function HubCard({
   );
 }
 
+function FeedbackToast({
+  message,
+  onClose,
+}: {
+  message: { tone: "success" | "error"; text: string } | null;
+  onClose: () => void;
+}) {
+  if (!message) return null;
+
+  const isError = message.tone === "error";
+  return (
+    <div
+      aria-live={isError ? "assertive" : "polite"}
+      className="fixed bottom-5 right-5 z-[100] flex w-[min(360px,calc(100vw-2rem))] items-start gap-3 rounded-xl border border-[#ded7cc] bg-white px-4 py-3 text-[#24211e] shadow-[0_12px_36px_rgba(60,49,36,0.14)] animate-in fade-in slide-in-from-bottom-2 duration-200"
+      role={isError ? "alert" : "status"}
+    >
+      {isError ? (
+        <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-red-50 text-red-700">
+          <TriangleAlert className="h-4 w-4" />
+        </span>
+      ) : (
+        <GradientSuccessMark className="mt-0.5 h-7 w-7" />
+      )}
+      <div className="min-w-0 flex-1 pt-0.5">
+        <p className="text-xs font-bold leading-5">
+          {isError ? "Something needs attention" : "Done"}
+        </p>
+        <p className="text-[11px] font-medium leading-4 text-[#6f675e]">
+          {message.text}
+        </p>
+      </div>
+      <button
+        aria-label="Dismiss notification"
+        className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-[#8a8177] transition-colors hover:bg-[#f5f2ed] hover:text-[#24211e] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#b8ac9e]"
+        onClick={onClose}
+        type="button"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
 interface TallyPrimeDashboardProps {
   initialView?: "home" | "connection";
 }
 
 export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboardProps) {
   const router = useRouter();
+  const { refresh: refreshGlobalTallyStatus } = useTallyConnectionStatus();
   const [view, setView] = useState<"home" | "connection">(initialView);
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
@@ -341,9 +331,6 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 .toLowerCase()),
       ) ?? null)
     : null;
-  const statusTone = connectionBelongsToThisBrowser
-    ? getStatusTone(selectedConnection)
-    : "error";
   const connectorActive =
     connectionBelongsToThisBrowser &&
     Boolean(selectedConnection?.bridgeConnected);
@@ -367,6 +354,90 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       (selectedConnection?.companyLoaded
         ? "Company loaded"
         : "Company not detected yet");
+  const connectionVisualState = !connectionBelongsToThisBrowser || selectedConnection?.revoked
+    ? "replaced"
+    : selectedConnection?.connectorUpdateRequired
+      ? "error"
+      : selectedConnection?.heartbeatStale
+        ? "stale"
+        : selectedConnection?.status === "waiting_for_bridge" &&
+            selectedConnection.lastError?.toLowerCase().includes("disconnected by user")
+          ? "paused"
+    : selectedConnection?.status === "connection_error"
+      ? "error"
+      : !connectorActive
+        ? "waiting"
+        : !tallyReachable
+          ? "needs_tally"
+          : !companyLoaded
+            ? "needs_company"
+            : "ready";
+  const connectionVisual = {
+    ready: {
+      title: `Connected to ${selectedConnection?.lastCompanyName || selectedCompany?.companyName || "Tally"}`,
+      description: "The connector, Tally Prime, and company are ready for Gajkesari workflows.",
+      eyebrow: "Ready",
+      shader: "/images/tally/connection-ready.webp",
+      badge: "Connected",
+      badgeClass: "border-emerald-200 bg-emerald-50 text-emerald-800",
+    },
+    needs_company: {
+      title: "Open a company in Tally",
+      description: "Tally Prime is reachable. Load the company you want Gajkesari to use, then check again.",
+      eyebrow: "One step left",
+      shader: "/images/tally/connection-waiting.webp",
+      badge: "Company needed",
+      badgeClass: "border-amber-200 bg-amber-50 text-amber-800",
+    },
+    needs_tally: {
+      title: "Open Tally Prime",
+      description: "The connector is online, but it cannot reach Tally at the configured address.",
+      eyebrow: "Action needed",
+      shader: "/images/tally/connection-waiting.webp",
+      badge: "Tally unavailable",
+      badgeClass: "border-amber-200 bg-amber-50 text-amber-800",
+    },
+    waiting: {
+      title: "Waiting for Tally Connector",
+      description: "Launch or reconnect the desktop connector on this computer to continue.",
+      eyebrow: "Not connected",
+      shader: "/images/tally/connection-waiting.webp",
+      badge: "Waiting",
+      badgeClass: "border-[#ddd3c5] bg-[#faf8f4] text-[#6f6255]",
+    },
+    paused: {
+      title: "Tally Connector is paused",
+      description: "Reconnect this computer when you are ready to resume Tally workflows.",
+      eyebrow: "Paused",
+      shader: "/images/tally/connection-waiting.webp",
+      badge: "Paused",
+      badgeClass: "border-[#ddd3c5] bg-[#faf8f4] text-[#6f6255]",
+    },
+    stale: {
+      title: "Connector has stopped responding",
+      description: "The last heartbeat is out of date. Check that the connector is still open, then reconnect if needed.",
+      eyebrow: "Status out of date",
+      shader: "/images/tally/connection-waiting.webp",
+      badge: "Offline",
+      badgeClass: "border-amber-200 bg-amber-50 text-amber-800",
+    },
+    error: {
+      title: "Connection needs attention",
+      description: selectedConnection?.lastError || "The connector reported an error. Reconnect it, then check the status again.",
+      eyebrow: "Connection error",
+      shader: "/images/tally/connection-error.webp",
+      badge: "Error",
+      badgeClass: "border-rose-200 bg-rose-50 text-rose-800",
+    },
+    replaced: {
+      title: "Reconnect this computer",
+      description: "Another connector replaced this session. Reconnect here to restore control safely.",
+      eyebrow: "Session replaced",
+      shader: "/images/tally/connection-error.webp",
+      badge: "Reconnect required",
+      badgeClass: "border-rose-200 bg-rose-50 text-rose-800",
+    },
+  }[connectionVisualState];
   async function loadConnections(options?: { quiet?: boolean }) {
     try {
       if (!options?.quiet) {
@@ -544,7 +615,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         text: "Connector launch requested. Approve the browser prompt if it appears.",
       });
       window.setTimeout(
-        () => void refreshStatus(payload.connection?.id || ""),
+        () => {
+          void refreshStatus(payload.connection?.id || "");
+          void refreshGlobalTallyStatus();
+        },
         2500,
       );
     } catch (error) {
@@ -601,9 +675,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`,
       );
       // Keep this browser's binding so a paused installation can be resumed.
+      await refreshGlobalTallyStatus();
       setMessage({
         tone: "success",
-        text: "Connector disconnected.",
+        text: "Tally connector paused.",
       });
     } catch (error) {
       setMessage({
@@ -665,6 +740,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         }
         return nextConnections[0]?.id || "";
       });
+      await refreshGlobalTallyStatus();
       setMessage({
         tone: "success",
         text:
@@ -711,6 +787,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           ),
         );
       }
+
+      await refreshGlobalTallyStatus();
 
       setMessage({
         tone: "success",
@@ -786,37 +864,34 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   }, [message, selectedConnection?.bridgeConnected]);
 
   useEffect(() => {
+    if (!message) return;
+    const timer = window.setTimeout(
+      () => setMessage(null),
+      message.tone === "error" ? 6500 : 4000,
+    );
+    return () => window.clearTimeout(timer);
+  }, [message]);
+
+  useEffect(() => {
     setView(initialView);
   }, [initialView]);
 
   if (view === "home") {
     return (
       <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
-        <div className="mb-8 border-b border-[#e5ddd0] pb-6">
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
+        <div className="mb-5 border-b border-[#e5ddd0] pb-4">
+          <div className="inline-flex items-center gap-1.5 rounded-full border border-amber-200/50 bg-amber-50 px-2.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-800">
             <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
             ERP Sync Bridge
           </div>
-          <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
+          <h1 className="mt-1.5 flex items-center gap-2 text-2xl font-black tracking-tight text-[#1a1a1a]">
             Tally Prime Integration
           </h1>
-          <p className="text-xs font-semibold text-slate-500 mt-1">
+          <p className="mt-0.5 text-[11px] font-semibold text-slate-500">
             Sync your dealer verification workflows directly with Tally Prime
             company ledgers.
           </p>
         </div>
-
-        {message ? (
-          <div
-            className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
-              message.tone === "success"
-                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                : "border-red-200 bg-red-50 text-red-800"
-            }`}
-          >
-            {message.text}
-          </div>
-        ) : null}
 
         <div className="grid gap-5 md:grid-cols-2">
           <HubCard
@@ -836,48 +911,65 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             title="Bank Statements"
           />
         </div>
+        <FeedbackToast message={message} onClose={() => setMessage(null)} />
       </div>
     );
   }
 
   return (
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+      <div className="mb-4 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <h2 className="text-2xl font-black tracking-tight text-[#1a1a1a]">
+          <h2 className="text-xl font-black tracking-tight text-[#1a1a1a]">
             Tally Connection
           </h2>
-          <p className="mt-1 text-xs font-semibold text-slate-500">
+          <p className="mt-0.5 text-[11px] font-semibold text-slate-500">
             Connect Tally Prime to sync workflows and post bank statement ledger
             entries.
           </p>
         </div>
       </div>
 
-      {message ? (
-        <div
-          className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
-            message.tone === "success"
-              ? "border-emerald-255 bg-emerald-50 text-emerald-800"
-              : "border-red-255 bg-red-50 text-red-800"
-          }`}
-        >
-          {message.text}
-        </div>
-      ) : null}
-
-      {!connectorActive ? (
-        <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-          <div className="mb-4">
-            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
-              Tally target
+      {!loading && !selectedConnection ? (
+        <section className="mb-5 max-w-5xl overflow-hidden rounded-2xl border border-[#ddd5c9] bg-white shadow-[0_8px_24px_rgba(64,51,35,0.05)]">
+          <div className="relative h-24 overflow-hidden border-b border-white/70">
+            <Image
+              alt=""
+              aria-hidden="true"
+              className="object-cover"
+              fill
+              priority
+              sizes="(max-width: 1024px) 100vw, 1000px"
+              src="/images/tally/connection-waiting.webp"
+            />
+            <div className="absolute inset-0 flex items-center px-6" aria-hidden="true">
+              <div className="flex items-center gap-2.5">
+                {[PlugZap, Server].map((Icon, index) => (
+                  <div
+                    className="grid h-10 w-10 place-items-center rounded-xl border border-white/80 bg-white/90 text-[#4d463e] shadow-[0_4px_14px_rgba(68,55,40,0.10)] backdrop-blur-sm"
+                    key={index}
+                  >
+                    <Icon className="h-4.5 w-4.5" />
+                  </div>
+                ))}
+              </div>
             </div>
-            <h3 className="mt-2 text-base font-extrabold text-[#1a1a1a]">
-              Connection location
-            </h3>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="p-5 sm:p-6">
+            <div className="mb-4">
+              <div className="text-[9px] font-extrabold uppercase tracking-[0.14em] text-[#8a7f72]">
+                First-time setup
+              </div>
+              <h3 className="mt-2 text-xl font-black tracking-tight text-[#1a1a1a]">
+                Where does Tally run?
+              </h3>
+              <p className="mt-1 text-xs font-semibold text-[#6f6255]">
+                Choose the location once. Gajkesari will remember it for this connector.
+              </p>
+            </div>
+
+          <div className="grid max-w-3xl gap-3 md:grid-cols-2">
             <button
               className={`rounded-2xl border p-4 text-left transition ${
                 setupMode === "same_machine"
@@ -888,6 +980,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 setSetupMode("same_machine");
                 setTallyUrlInput(DEFAULT_TALLY_URL);
               }}
+              aria-pressed={setupMode === "same_machine"}
               type="button"
             >
               <div className="text-sm font-extrabold text-[#1a1a1a]">
@@ -910,6 +1003,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                   getSetupModeForUrl(current) === "same_machine" ? "" : current,
                 );
               }}
+              aria-pressed={setupMode === "lan_server"}
               type="button"
             >
               <div className="text-sm font-extrabold text-[#1a1a1a]">
@@ -942,148 +1036,192 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               </div>
             </div>
           ) : null}
+          <Button
+            className="mt-5 rounded-xl bg-[#2d2d2d] px-5 text-xs font-bold text-white hover:bg-[#1a1a1a]"
+            disabled={creating}
+            onClick={() => void connectConnector()}
+            type="button"
+          >
+            {creating ? (
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <PlugZap className="mr-1.5 h-3.5 w-3.5" />
+            )}
+            Connect Tally
+          </Button>
+          </div>
         </section>
       ) : null}
+      <FeedbackToast message={message} onClose={() => setMessage(null)} />
 
       {loading ? (
-        <div className="grid gap-4 md:grid-cols-3">
-          {Array.from({ length: 3 }).map((_, index) => (
-            <div
-              key={index}
-              className="h-28 animate-pulse rounded-2xl bg-white border border-[#e5ddd0]"
-            />
-          ))}
+        <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white">
+          <div className="h-24 animate-pulse bg-[#eee8de]" />
+          <div className="space-y-3 p-5">
+            <div className="h-4 w-32 animate-pulse rounded bg-[#eee8de]" />
+            <div className="h-7 w-64 max-w-full animate-pulse rounded bg-[#eee8de]" />
+            <div className="h-12 animate-pulse rounded-xl bg-[#f5f1ea]" />
+          </div>
         </div>
       ) : selectedConnection ? (
-        <div className="space-y-5">
-          <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex min-w-0 items-start gap-4">
-                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50 text-amber-700">
-                  <Server className="h-5.5 w-5.5" />
-                </div>
+        <article className="overflow-hidden rounded-2xl border border-[#ddd5c9] bg-white shadow-[0_8px_24px_rgba(64,51,35,0.05)]">
+          <div className="relative h-24 overflow-hidden border-b border-white/70 sm:h-28">
+            <Image
+              alt=""
+              aria-hidden="true"
+              className="object-cover"
+              fill
+              priority
+              sizes="(max-width: 1024px) 100vw, 900px"
+              src={connectionVisual.shader}
+            />
+            <div className="absolute inset-0 flex items-center px-5 sm:px-7" aria-hidden="true">
+              <div className="flex items-center gap-2.5">
+                {[
+                  { done: connectorActive, icon: PlugZap },
+                  { done: tallyReachable, icon: Server },
+                  { done: companyLoaded, icon: Building2 },
+                ].map((stage, index) => {
+                  const Icon = stage.icon;
+                  return (
+                    <div
+                      className={`grid h-10 w-10 place-items-center rounded-xl border border-white/80 bg-white/90 text-[#4d463e] shadow-[0_4px_14px_rgba(68,55,40,0.10)] backdrop-blur-sm ${stage.done ? "opacity-100" : "opacity-55"}`}
+                      key={index}
+                    >
+                      <Icon className="h-4.5 w-4.5" />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="p-5 sm:p-6">
+            <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+              <div className="flex min-w-0 items-start gap-3.5">
+                {selectedCompany?.companyName ? (
+                  <CompanyAvatar
+                    name={selectedCompany.companyName}
+                    size="md"
+                    verified={connectionVisualState === "ready"}
+                  />
+                ) : null}
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-base font-extrabold text-[#1a1a1a]">
-                      {selectedConnection.displayName}
-                    </h3>
-                    <Badge
-                      className={
-                        statusTone === "success"
-                          ? "border-emerald-250 bg-emerald-50 text-emerald-800"
-                          : statusTone === "error"
-                            ? "border-red-255 bg-red-55 text-red-855"
-                            : statusTone === "warning"
-                              ? "border-amber-250 bg-amber-50 text-amber-800"
-                              : "border-[#e5ddd0] bg-white text-slate-500"
-                      }
-                      variant="outline"
-                    >
-                      {connectionBelongsToThisBrowser
-                        ? getStatusLabel(selectedConnection)
-                        : "Reconnect required"}
+                    <span className="text-[9px] font-extrabold uppercase tracking-[0.14em] text-[#8a7f72]">
+                      {connectionVisual.eyebrow}
+                    </span>
+                    <Badge className={connectionVisual.badgeClass} variant="outline">
+                      {connectionVisual.badge}
                     </Badge>
                   </div>
-                  <div className="mt-1 max-w-3xl text-sm font-semibold text-slate-500">
-                    {selectedCompany?.financialYear
-                      ? formatCompanyOptionLabel(selectedCompany)
-                      : companyDetail}
-                  </div>
+                  <h3 className="mt-2 text-xl font-black tracking-tight text-[#1a1a1a]">
+                    {connectionVisual.title}
+                  </h3>
+                  <p className="mt-1.5 max-w-2xl text-xs font-semibold leading-5 text-[#6f6255]">
+                    {connectionVisual.description}
+                  </p>
+                  <p className="mt-2 text-[10px] font-semibold text-[#9a8f82]">
+                    {selectedConnection.displayName} · Last seen {formatTime(selectedConnection.lastHeartbeatAt)}
+                  </p>
                 </div>
               </div>
 
-              <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
-                  {!connectorActive ? (
-                    <Button
-                      className="w-fit whitespace-nowrap rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-bold text-white shadow-md transition-all"
-                      disabled={creating}
-                      onClick={() => void connectConnector()}
-                      type="button"
-                    >
-                      {creating ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                      ) : (
-                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                      )}
-                      Reconnect
-                    </Button>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <Button
+                  className="rounded-xl border-[#ddd3c5] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                  disabled={testing}
+                  onClick={() => void requestTest()}
+                  type="button"
+                  variant="outline"
+                >
+                  {testing ? (
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                   ) : (
-                    <Button
-                      className="w-fit whitespace-nowrap rounded-xl border-amber-250 bg-amber-50 text-xs font-bold text-amber-800 hover:bg-amber-100 hover:text-amber-900 shadow-sm transition-all"
-                      disabled={disconnecting}
-                      onClick={() => void disconnectConnector()}
-                      type="button"
-                      variant="outline"
-                    >
-                      {disconnecting ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                      ) : (
-                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                      )}
-                      Pause connection
-                    </Button>
+                    <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
                   )}
-                {/* This browser cannot disconnect another installation. */}
+                  Check again
+                </Button>
+                {!connectorActive ? (
+                  <Button
+                    className="rounded-xl bg-[#2d2d2d] text-xs font-bold text-white hover:bg-[#1a1a1a]"
+                    disabled={creating}
+                    onClick={() => void connectConnector()}
+                    type="button"
+                  >
+                    {creating ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <PlugZap className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    Reconnect
+                  </Button>
+                ) : (
+                  <Button
+                    className="rounded-xl border-amber-200 bg-amber-50 text-xs font-bold text-amber-900 hover:bg-amber-100"
+                    disabled={disconnecting}
+                    onClick={() => void disconnectConnector()}
+                    type="button"
+                    variant="outline"
+                  >
+                    {disconnecting ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <PlugZap className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    Pause connection
+                  </Button>
+                )}
               </div>
             </div>
-          </div>
 
-          <div className="grid gap-4 md:grid-cols-3">
-            <StatusCard
-              detail={`Last seen: ${formatTime(selectedConnection.lastHeartbeatAt)}`}
-              ok={connectorActive}
-              title="Connector"
-              value={connectorActive ? "Connected" : "Waiting"}
-            />
-            <StatusCard
-              detail={`Last checked: ${formatTime(selectedConnection.lastTestedAt)}`}
-              ok={tallyReachable}
-              title="Tally"
-              value={tallyReachable ? "Reachable" : "Not reachable"}
-            />
-            <StatusCard
-              detail={
-                connectionBelongsToThisBrowser
-                  ? selectedConnection.lastCompanyName ||
-                    selectedConnection.lastError ||
-                    companyDetail
-                  : companyDetail
-              }
-              ok={companyLoaded}
-              title="Company"
-              value={companyLoaded ? "Loaded" : "Not detected"}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="flex min-h-[320px] items-center justify-center rounded-2xl border-2 border-dashed border-[#e5ddd0] bg-white p-8 text-center shadow-sm">
-          <div>
-            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-amber-50 border border-amber-200/50 text-amber-700">
-              <PlugZap className="h-6 w-6 animate-pulse" />
+            <div className="mt-5 grid overflow-hidden rounded-xl border border-[#e8e1d7] bg-[#fbfaf8] sm:grid-cols-3 sm:divide-x sm:divide-[#e8e1d7]">
+              {[
+                {
+                  label: "Connector",
+                  value: connectorActive ? "Connected" : "Waiting",
+                  detail: formatTime(selectedConnection.lastHeartbeatAt),
+                  ok: connectorActive,
+                },
+                {
+                  label: "Tally",
+                  value: tallyReachable ? "Reachable" : "Not reachable",
+                  detail: formatTime(selectedConnection.lastTestedAt),
+                  ok: tallyReachable,
+                },
+                {
+                  label: "Company",
+                  value: companyLoaded ? "Loaded" : "Not detected",
+                  detail: companyLoaded ? companyDetail : "Open a company in Tally",
+                  ok: companyLoaded,
+                },
+              ].map((stage) => (
+                <div className="flex min-w-0 items-start gap-2.5 border-b border-[#e8e1d7] px-3.5 py-3 last:border-b-0 sm:border-b-0" key={stage.label}>
+                  {stage.ok ? (
+                    <GradientSuccessMark
+                      className="h-8 w-8 rounded-lg [&_svg]:h-4.5 [&_svg]:w-4.5"
+                      size="md"
+                    />
+                  ) : (
+                    <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-[#b47a2f]" />
+                  )}
+                  <div className="min-w-0">
+                    <div className="text-[9px] font-extrabold uppercase tracking-wider text-[#9a8f82]">
+                      {stage.label}
+                    </div>
+                    <div className="mt-0.5 truncate text-xs font-extrabold text-[#2d2d2d]">
+                      {stage.value}
+                    </div>
+                    <div className="mt-0.5 truncate text-[10px] font-semibold text-[#8a7f72]" title={stage.detail}>
+                      {stage.detail}
+                    </div>
+                  </div>
+                </div>
+              ))}
             </div>
-            <h3 className="mt-4 text-base font-extrabold text-[#1a1a1a]">
-              No Tally connection found
-            </h3>
-            <p className="mt-1.5 text-xs font-semibold text-slate-400 max-w-sm">
-              Bridge this workstation to start the Tally Prime desktop agent and
-              sync ledgers.
-            </p>
-            <Button
-              className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-bold text-white shadow-md transition-all"
-              disabled={creating}
-              onClick={() => void connectConnector()}
-              type="button"
-            >
-              {creating ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-              ) : (
-                <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-              )}
-              Connect Bridge
-            </Button>
           </div>
-        </div>
-      )}
+        </article>
+      ) : null}
     </div>
   );
 }

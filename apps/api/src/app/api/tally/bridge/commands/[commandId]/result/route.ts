@@ -7,7 +7,6 @@ import { isLocalDbMode } from "@/lib/local/mode";
 import { completeLocalTallyCommand } from "@/lib/local/tally-store";
 import {
   hashSecret,
-  TALLY_CONNECTION_SELECT,
   type TallyConnectionRow,
 } from "@/lib/tally/connections";
 import {
@@ -144,7 +143,7 @@ export async function POST(
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
-      .select(TALLY_CONNECTION_SELECT)
+      .select("id,owner_user_id,bridge_token_hash,revoked_at,session_generation,last_company_name")
       .eq("id", connectionId)
       .maybeSingle();
 
@@ -166,7 +165,7 @@ export async function POST(
 
     const { data: pendingCommandData, error: pendingCommandError } = await supabase
       .from("tally_bridge_commands")
-      .select("*")
+      .select("id,command_type,status,payload,company_dataset_id,queue_job_id")
       .eq("id", commandId)
       .eq("connection_id", connection.id)
       .in("status", ["claimed", "succeeded", "failed"])
@@ -186,20 +185,50 @@ export async function POST(
         : {};
     const isPurchaseVoucher = pendingCommand.command_type === "create_purchase_voucher";
 
-    const { data: commandData, error: updateError } = await supabase.rpc("complete_tally_command", {
+    // Connector result delivery is at-least-once. A lost HTTP acknowledgement
+    // must not turn a successful retry into a 500 "Conflicting command result".
+    // The first completion is authoritative; terminal re-delivery is an
+    // idempotent acknowledgement and deliberately performs no side effects.
+    if (pendingCommand.status === "succeeded" || pendingCommand.status === "failed") {
+      return jsonWithCors(request, {
+        command: { id: commandId, status: pendingCommand.status },
+      });
+    }
+
+    const completionArguments = {
       p_connection: connection.id, p_token_hash: hashSecret(token), p_command: commandId,
       p_claim: body.claimToken, p_success: success,
       p_payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
       p_result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
       p_error: errorMessage,
-    });
+    };
+    let usedCompactCompletion = true;
+    let { data: commandData, error: updateError } = await supabase.rpc(
+      "complete_tally_command_compact",
+      completionArguments
+    );
+
+    if (
+      updateError &&
+      (updateError.code === "PGRST202" ||
+        updateError.message?.includes("complete_tally_command_compact"))
+    ) {
+      // Compatibility for rolling deployments before the migration is applied.
+      usedCompactCompletion = false;
+      ({ data: commandData, error: updateError } = await supabase.rpc(
+        "complete_tally_command",
+        completionArguments
+      ));
+    }
 
     if (updateError) throw updateError;
     if (!commandData) {
       return jsonWithCors(request, { error: "Tally command not found." }, { status: 404 });
     }
 
-    const command = commandData as unknown as TallyBridgeCommandRow;
+    // All post-completion work only needs the immutable values already fetched
+    // above. The RPC acknowledgement intentionally omits the large result.
+    const command = pendingCommand;
 
     if (command.command_type === "post_bank_voucher") {
       const transactionId = toNullableText(commandPayload.transactionId, 80);
@@ -665,17 +694,19 @@ export async function POST(
       }
     }
 
-    await supabase.from("tally_connection_events").insert({
-      connection_id: connection.id,
-      owner_user_id: connection.owner_user_id,
-      event_type: success ? "command_succeeded" : "command_failed",
-      message: success ? "Tally command completed." : "Tally command failed.",
-      payload: {
-        commandId,
-        commandType: command.command_type,
-        error: errorMessage,
-      },
-    });
+    if (!usedCompactCompletion) {
+      await supabase.from("tally_connection_events").insert({
+        connection_id: connection.id,
+        owner_user_id: connection.owner_user_id,
+        event_type: success ? "command_succeeded" : "command_failed",
+        message: success ? "Tally command completed." : "Tally command failed.",
+        payload: {
+          commandId,
+          commandType: command.command_type,
+          error: errorMessage,
+        },
+      });
+    }
 
     const queueJobId = toNullableText(
       (pendingCommandData as Record<string, unknown>).queue_job_id,
@@ -686,7 +717,10 @@ export async function POST(
     }
 
     return jsonWithCors(request, {
-      command: serializeTallyBridgeCommand(command),
+      command: {
+        id: commandId,
+        status: success ? "succeeded" : "failed",
+      },
     });
   } catch (error) {
     console.error("Error in POST /api/tally/bridge/commands/[commandId]/result:", error);

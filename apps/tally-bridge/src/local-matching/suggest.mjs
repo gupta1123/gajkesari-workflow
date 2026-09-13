@@ -23,6 +23,11 @@ function resolveCompany(db, { companyId, companyName, companyGuid }) {
   );
   if (exact) return { key: exact[0], entry: exact[1] };
 
+  // A caller that supplies company identity must never silently search the
+  // most recently synced company. Return no data and let the workflow report
+  // a company/index mismatch instead.
+  if (companyId || companyName || companyGuid) return null;
+
   companies.sort((left, right) =>
     new Date(right[1].lastSyncAt || 0).getTime() - new Date(left[1].lastSyncAt || 0).getTime()
   );

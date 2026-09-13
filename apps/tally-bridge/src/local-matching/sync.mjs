@@ -7,7 +7,7 @@ import { normalizeMasterKey } from "./store.mjs";
  * circular imports.
  */
 
-function ledgerFromTallyBlock(block, getTagText, getAttribute) {
+function masterFromTallyBlock(block, tag, getTagText, getAttribute) {
   const name = getAttribute(block, "NAME") || getTagText(block, "NAME");
   if (!name) return null;
   return {
@@ -17,8 +17,8 @@ function ledgerFromTallyBlock(block, getTagText, getAttribute) {
     alterID: getTagText(block, "ALTERID") ? String(getTagText(block, "ALTERID")).trim() : null,
     masterID: getTagText(block, "MASTERID") ? String(getTagText(block, "MASTERID")).trim() : null,
     raw: {
-      tallyTag: "LEDGER",
-      billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON") || ""),
+      tallyTag: tag,
+      ...(tag === "LEDGER" ? { billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON") || "") } : {}),
     },
   };
 }
@@ -26,7 +26,14 @@ function ledgerFromTallyBlock(block, getTagText, getAttribute) {
 export function parseLedgersFromXml(xml, helpers) {
   const { extractBlocks, getTagText, getAttribute } = helpers;
   const blocks = extractBlocks(xml, "LEDGER");
-  return blocks.map((b) => ledgerFromTallyBlock(b, getTagText, getAttribute)).filter(Boolean);
+  return blocks.map((b) => masterFromTallyBlock(b, "LEDGER", getTagText, getAttribute)).filter(Boolean);
+}
+
+export function parseGroupsFromXml(xml, helpers) {
+  const { extractBlocks, getTagText, getAttribute } = helpers;
+  return extractBlocks(xml, "GROUP")
+    .map((block) => masterFromTallyBlock(block, "GROUP", getTagText, getAttribute))
+    .filter(Boolean);
 }
 
 /**
@@ -40,6 +47,8 @@ export async function syncLedgersReadOnly({
   exportTallyCollection,
   helpers,
   getActiveCompany, // optional () => {companyName, companyGuid}
+  mode = "full_snapshot",
+  cursor = null,
 }) {
   if (!tallyUrl) throw new Error("Tally URL is required for sync.");
   if (!exportTallyCollection) throw new Error("exportTallyCollection is required.");
@@ -61,11 +70,31 @@ export async function syncLedgersReadOnly({
   // Enforce read-only: ensure we never call Import. Verify via options: tallyType must be Ledger/Group etc., not Import.
   const collectionName = "Gajkesari Local Matching Ledgers Sync";
   // Fetch ledgers read-only: Export Collection Type Ledger, fetch Name,Parent,GUID,AlterID,MasterID
+  const delta = mode === "delta";
+  const ledgerAfter = Number(cursor?.lastLedgerAlterID ?? cursor?.lastAlterID);
+  const groupAfter = Number(cursor?.lastGroupAlterID);
+  const ledgerFilter = delta && Number.isFinite(ledgerAfter)
+    ? [{ name: "GajkesariChangedLedger", formula: `$AlterID > ${Math.max(0, Math.trunc(ledgerAfter))}` }]
+    : [];
+  const groupFilter = delta && Number.isFinite(groupAfter)
+    ? [{ name: "GajkesariChangedGroup", formula: `$AlterID > ${Math.max(0, Math.trunc(groupAfter))}` }]
+    : [];
+  const effectiveMode = delta && ledgerFilter.length && groupFilter.length ? "delta" : "full_snapshot";
   const xml = await exportTallyCollection(tallyUrl, {
     collectionName,
     tallyType: "Ledger",
     fetchFields: "Name,Parent,GUID,AlterID,MasterID,IsBillWiseOn",
     companyName: resolvedCompanyName || null,
+    formulae: effectiveMode === "delta" ? ledgerFilter : [],
+    filterNames: effectiveMode === "delta" ? ledgerFilter.map((item) => item.name) : [],
+  });
+  const groupXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Gajkesari Local Matching Groups Sync",
+    tallyType: "Group",
+    fetchFields: "Name,Parent,GUID,AlterID,MasterID",
+    companyName: resolvedCompanyName || null,
+    formulae: effectiveMode === "delta" ? groupFilter : [],
+    filterNames: effectiveMode === "delta" ? groupFilter.map((item) => item.name) : [],
   });
 
   // Validate no Import was used (defensive)
@@ -74,22 +103,30 @@ export async function syncLedgersReadOnly({
   }
 
   const ledgers = parseLedgersFromXml(xml, helpers);
+  const groups = parseGroupsFromXml(groupXml, helpers);
 
   // Also fetch company identity from tally if not provided: use fetchAvailableCompanies pattern
   // Caller should provide companyGuid; if missing, derive from ledgers? but not reliable.
   // Keep what we have.
 
-  const cursor = {};
+  const nextCursor = { ...(cursor || {}) };
   const alterIds = ledgers.map((l) => l.alterID).filter(Boolean).map(Number).filter(Number.isFinite);
-  if (alterIds.length) cursor.lastAlterID = String(Math.max(...alterIds));
+  if (alterIds.length) {
+    nextCursor.lastAlterID = String(Math.max(...alterIds, Number(cursor?.lastAlterID) || 0));
+    nextCursor.lastLedgerAlterID = nextCursor.lastAlterID;
+  }
   const masterIds = ledgers.map((l) => l.masterID).filter(Boolean).map(Number).filter(Number.isFinite);
-  if (masterIds.length) cursor.lastMasterID = String(Math.max(...masterIds));
+  if (masterIds.length) nextCursor.lastMasterID = String(Math.max(...masterIds, Number(cursor?.lastMasterID) || 0));
+  const groupAlterIds = groups.map((group) => Number(group.alterID)).filter(Number.isFinite);
+  if (groupAlterIds.length) nextCursor.lastGroupAlterID = String(Math.max(...groupAlterIds, Number(cursor?.lastGroupAlterID) || 0));
 
   return {
     companyName: resolvedCompanyName,
     companyGuid: resolvedCompanyGuid || null,
     ledgers,
-    cursor: Object.keys(cursor).length ? cursor : null,
+    groups,
+    cursor: Object.keys(nextCursor).length ? nextCursor : null,
+    mode: effectiveMode,
     fetchedAt: new Date().toISOString(),
     isReadOnly: true,
   };

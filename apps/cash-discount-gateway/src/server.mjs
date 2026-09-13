@@ -85,7 +85,7 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
     payload,
     phase: operation === "company_check"
     ? "company_check"
-    : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "verify_bank_transaction" || operation === "match_bank_statement" || operation === "fetch_customer_open_bills"
+    : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "local_ledger_catalogue" || operation === "verify_bank_transaction" || operation === "match_bank_statement" || operation === "fetch_customer_open_bills"
       ? operation
       : operation === "scan"
         ? "scanning"
@@ -151,13 +151,15 @@ async function authenticate(socket, message) {
 }
 
 export function bankMatchingNeedsConnectorUpdate(operation, payload, bridgeVersion) {
+  const requiresLocalCatalogue = operation === "local_ledger_catalogue";
   const scopedRead = operation === "match_bank_statement" ||
     (operation === "fetch_customer_open_bills" && payload?.queryPurpose === "bank_statement_match");
-  if (!scopedRead) return false;
+  if (!scopedRead && !requiresLocalCatalogue) return false;
   const parts = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(bridgeVersion || ""));
   if (!parts) return true;
   const [major, minor, patch] = parts.slice(1).map(Number);
-  return major === 0 && (minor < 1 || (minor === 1 && patch < 59));
+  const minimumPatch = requiresLocalCatalogue ? 70 : 59;
+  return major === 0 && (minor < 1 || (minor === 1 && patch < minimumPatch));
 }
 
 async function handleBrowserRequest(socket, message, meta) {
@@ -167,7 +169,7 @@ async function handleBrowserRequest(socket, message, meta) {
     send(socket, { type: "result", requestId, success: false, error: "Use the durable approval queue for financial writes." });
     return;
   }
-  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'verify_bank_transaction', 'match_bank_statement', 'fetch_customer_open_bills', 'scan'].includes(operation)) {
+  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'local_ledger_catalogue', 'verify_bank_transaction', 'match_bank_statement', 'fetch_customer_open_bills', 'scan'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
   }
@@ -206,7 +208,9 @@ async function handleBrowserRequest(socket, message, meta) {
   // authenticate its socket before its first version heartbeat reaches the DB.
   if (bankMatchingNeedsConnectorUpdate(operation, message.payload, authorized.bridgeVersion)) {
     send(socket, { type: "result", requestId, success: false,
-      error: "Install Gajkesari Tally Connector 0.1.59 or later on the Tally PC before checking matches. Older connectors use a heavy bill scan that can freeze Tally." });
+      error: operation === "local_ledger_catalogue"
+        ? "Install Gajkesari Tally Connector 0.1.70 or later to use the local ledger catalogue."
+        : "Install Gajkesari Tally Connector 0.1.59 or later on the Tally PC before checking matches. Older connectors use a heavy bill scan that can freeze Tally." });
     return;
   }
   if (pending.has(requestId)) {
@@ -253,6 +257,8 @@ async function handleBrowserRequest(socket, message, meta) {
           ? "bank_ledgers"
           : operation === "ledger_masters"
             ? "ledger_masters"
+            : operation === "local_ledger_catalogue"
+              ? "local_ledger_catalogue"
             : operation === "verify_bank_transaction" || operation === "match_bank_statement"
               ? operation
               : operation === "fetch_customer_open_bills"
@@ -292,7 +298,7 @@ async function handleConnectorResult(socket, message, meta) {
     return;
   }
 
-  if (["bank_ledgers", "ledger_masters", "verify_bank_transaction", "match_bank_statement", "fetch_customer_open_bills"].includes(item.phase)) {
+  if (["bank_ledgers", "ledger_masters", "local_ledger_catalogue", "verify_bank_transaction", "match_bank_statement", "fetch_customer_open_bills"].includes(item.phase)) {
     clearPending(requestId);
     send(item.browser, { type: "result", requestId, success: true, data: message.data });
     return;

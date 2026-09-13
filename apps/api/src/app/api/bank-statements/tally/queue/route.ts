@@ -35,6 +35,14 @@ type QueuePayload = {
     ledgerType?: string | null;
   }>;
   outgoingAction?: "verify" | "post";
+  target?: {
+    installationId?: string;
+    companyDatasetId?: string;
+    connectionId?: string;
+    sessionGeneration?: number;
+    companyGuid?: string;
+    companyName?: string;
+  };
   transactions?: Array<{
     transactionId?: string;
     counterpartyLedgerName?: string;
@@ -328,6 +336,8 @@ async function resolveQueueUser(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const preparationStartedAt = Date.now();
+    const preparationTimingsMs: Record<string, number> = {};
     const user = await resolveQueueUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -386,14 +396,38 @@ export async function POST(request: Request) {
 
     const supabase = createSupabaseAdminClient();
     const expectedCompanyName = toText(body.companyName, 240);
-    const target = await resolveTallyTarget(request, user.id, submittedConnectionId, expectedCompanyName);
     if (!expectedCompanyName) {
       return jsonWithCors(request, { error: "Select the Tally company before sending entries." }, { status: 400 });
     }
 
+    const suppliedWorkerSecret = request.headers.get("x-worker-secret");
+    const trustedWorkerRequest = Boolean(
+      suppliedWorkerSecret && process.env.WORKER_SECRET && suppliedWorkerSecret === process.env.WORKER_SECRET
+    );
+    const pinnedTarget = trustedWorkerRequest && body.target &&
+      body.target.connectionId === submittedConnectionId &&
+      body.target.companyDatasetId && body.target.installationId && body.target.companyGuid
+      ? {
+          connectionId: submittedConnectionId,
+          companyDatasetId: String(body.target.companyDatasetId),
+          installationId: String(body.target.installationId),
+          sessionGeneration: Number(body.target.sessionGeneration ?? 0),
+          companyGuid: String(body.target.companyGuid).trim().toLowerCase(),
+          companyName: String(body.target.companyName || expectedCompanyName),
+        }
+      : null;
+    const targetStartedAt = Date.now();
+    const target = pinnedTarget ?? await resolveTallyTarget(
+      request,
+      user.id,
+      submittedConnectionId,
+      expectedCompanyName
+    );
+    preparationTimingsMs.targetResolution = Date.now() - targetStartedAt;
+
     const { data: submittedConnection, error: submittedConnectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id, status, last_company_name, last_heartbeat_at, last_tally_reachable")
+      .select("id, owner_user_id, installation_ref, session_generation, status, last_company_name, last_companies_snapshot, last_heartbeat_at, last_tally_reachable")
       .eq("id", submittedConnectionId)
       .eq("owner_user_id", user.id)
       .is("revoked_at", null)
@@ -402,6 +436,29 @@ export async function POST(request: Request) {
     if (submittedConnectionError) throw submittedConnectionError;
     if (!submittedConnection) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
+    }
+
+    if (pinnedTarget) {
+      const activeCompany = (Array.isArray(submittedConnection.last_companies_snapshot)
+        ? submittedConnection.last_companies_snapshot
+        : []
+      ).filter((company: { companyName?: string; guid?: string }) =>
+        normalizeName(company.companyName) === normalizeName(expectedCompanyName) && company.guid
+      );
+      const activeGuid = activeCompany.length === 1
+        ? String(activeCompany[0].guid).trim().toLowerCase()
+        : "";
+      if (
+        submittedConnection.installation_ref !== pinnedTarget.installationId ||
+        Number(submittedConnection.session_generation ?? 0) !== pinnedTarget.sessionGeneration ||
+        activeGuid !== pinnedTarget.companyGuid
+      ) {
+        return jsonWithCors(
+          request,
+          { error: "The queued Tally target changed. Review the statement and submit it again." },
+          { status: 409 }
+        );
+      }
     }
 
     const heartbeatAgeMs = submittedConnection.last_heartbeat_at
@@ -489,7 +546,9 @@ export async function POST(request: Request) {
       query = query.eq("bank_account_id", accountId);
     }
 
+    const transactionsStartedAt = Date.now();
     const { data: transactionRows, error: transactionError } = await query;
+    preparationTimingsMs.transactions = Date.now() - transactionsStartedAt;
     if (transactionError) throw transactionError;
 
     const transactions = (transactionRows ?? []) as unknown as BankTransactionRow[];
@@ -539,34 +598,50 @@ export async function POST(request: Request) {
     }
 
     const accountIds = Array.from(new Set(transactions.map((transaction) => transaction.bank_account_id)));
-    const { data: accountRows, error: accountError } = await supabase
-      .from("bank_accounts")
-      .select("id, bank_name, account_number_masked, account_holder_name, tally_ledger_name")
-      .eq("owner_user_id", user.id)
-      .eq("company_dataset_id", target.companyDatasetId)
-      .in("id", accountIds);
-
-    if (accountError) throw accountError;
-    const accountsById = new Map(
-      ((accountRows ?? []) as unknown as BankAccountRow[]).map((account) => [account.id, account])
-    );
+    const contextStartedAt = Date.now();
     const importIds = Array.from(
       new Set(
         transactions
+          .filter((transaction) => !transaction.reference_number)
           .map((transaction) => transaction.statement_import_id)
           .filter((value): value is string => typeof value === "string" && value.length > 0)
       )
     );
-    const { data: importRows, error: importRowsError } = importIds.length
-      ? await supabase
+    const fingerprints = transactions.map((transaction) => transaction.fingerprint);
+    const [accountResult, importResult, postingLogResult] = await Promise.all([
+      supabase
+        .from("bank_accounts")
+        .select("id, bank_name, account_number_masked, account_holder_name, tally_ledger_name")
+        .eq("owner_user_id", user.id)
+        .eq("company_dataset_id", target.companyDatasetId)
+        .in("id", accountIds),
+      importIds.length
+        ? supabase
           .from("bank_statement_imports")
           .select("id, extracted_bank_name")
           .eq("owner_user_id", user.id)
-      .eq("company_dataset_id", target.companyDatasetId)
+          .eq("company_dataset_id", target.companyDatasetId)
           .in("id", importIds)
-      : { data: [], error: null };
-
+        : Promise.resolve({ data: [], error: null }),
+      supabase
+        .from("bank_transaction_posting_log")
+        .select("fingerprint, status, command_id")
+        .eq("owner_user_id", user.id)
+        .in("bank_account_id", accountIds)
+        .in("fingerprint", fingerprints)
+        .in("status", ["queued", "posted", "verified", "needs_tally_review"]),
+    ]);
+    const { data: accountRows, error: accountError } = accountResult;
+    const { data: importRows, error: importRowsError } = importResult;
+    const { data: postingLogRows, error: postingLogError } = postingLogResult;
+    if (accountError) throw accountError;
     if (importRowsError) throw importRowsError;
+    if (postingLogError) throw postingLogError;
+    preparationTimingsMs.transactionContext = Date.now() - contextStartedAt;
+
+    const accountsById = new Map(
+      ((accountRows ?? []) as unknown as BankAccountRow[]).map((account) => [account.id, account])
+    );
 
     const importsById = new Map(
       ((importRows ?? []) as unknown as BankStatementImportRow[]).map((importRow) => [
@@ -574,17 +649,6 @@ export async function POST(request: Request) {
         importRow,
       ])
     );
-
-    const fingerprints = transactions.map((transaction) => transaction.fingerprint);
-    const { data: postingLogRows, error: postingLogError } = await supabase
-      .from("bank_transaction_posting_log")
-      .select("fingerprint, status, command_id")
-      .eq("owner_user_id", user.id)
-      .in("bank_account_id", accountIds)
-      .in("fingerprint", fingerprints)
-      .in("status", ["queued", "posted", "verified", "needs_tally_review"]);
-
-    if (postingLogError) throw postingLogError;
 
     const postingLogs = (postingLogRows ?? []) as unknown as PostingLogRow[];
     const queuedCommandIds = postingLogs
@@ -669,7 +733,11 @@ export async function POST(request: Request) {
       });
     }
 
-    const ledgerQueries = chunkValues(Array.from(requestedLedgerNames)).map((names) =>
+    const liveLedgerNames = new Set(liveLedgerContext.map((ledger) => normalizeName(ledger.tally_name)));
+    const missingRequestedLedgerNames = Array.from(requestedLedgerNames).filter(
+      (name) => !liveLedgerNames.has(normalizeName(name))
+    );
+    const ledgerQueries = chunkValues(missingRequestedLedgerNames).map((names) =>
       supabase
         .from("tally_masters")
         .select("tally_name, tally_guid, parent_name, raw_payload")
@@ -679,17 +747,21 @@ export async function POST(request: Request) {
         .eq("is_active", true)
         .in("tally_name", names)
     );
+    const needsSuspenseLookup = Array.from(requestedLedgerNames).some((name) => isSuspenseLedger(name));
+    const mastersStartedAt = Date.now();
     const [ledgerQueryResults, suspenseResult] = await Promise.all([
       Promise.all(ledgerQueries),
-      supabase
-        .from("tally_masters")
-        .select("tally_name, tally_guid, parent_name, raw_payload")
-        .eq("owner_user_id", user.id)
-        .eq("company_dataset_id", target.companyDatasetId)
-        .eq("master_type", "ledger")
-        .eq("is_active", true)
-        .or("tally_name.ilike.%suspense%,parent_name.ilike.%suspense%")
-        .limit(100),
+      needsSuspenseLookup
+        ? supabase
+            .from("tally_masters")
+            .select("tally_name, tally_guid, parent_name, raw_payload")
+            .eq("owner_user_id", user.id)
+            .eq("company_dataset_id", target.companyDatasetId)
+            .eq("master_type", "ledger")
+            .eq("is_active", true)
+            .or("tally_name.ilike.%suspense%,parent_name.ilike.%suspense%")
+            .limit(100)
+        : Promise.resolve({ data: [], error: null }),
     ]);
     for (const result of ledgerQueryResults) {
       if (result.error) throw result.error;
@@ -716,12 +788,20 @@ export async function POST(request: Request) {
     // requests instead of another paginated full-master scan.
     const activeGroups: TallyLedgerRow[] = [];
     const loadedGroupNames = new Set<string>();
+    const rootGroupNames = new Set([
+      "sundry debtors",
+      "sundry creditors",
+      "bank accounts",
+      "bank od ac",
+      "cashinhand",
+      "suspense ac",
+    ].map(normalizeName));
     let pendingGroupNames = Array.from(
       new Set(
         [
           ...activeLedgers.map((ledger) => ledger.parent_name || ""),
           ...Array.from(ledgerSelectionByTransactionId.values()).map((selection) => selection.createLedgerParentName),
-        ].filter(Boolean)
+        ].filter((name) => name && !rootGroupNames.has(normalizeName(name)))
       )
     );
     for (let depth = 0; pendingGroupNames.length > 0 && depth < 20; depth += 1) {
@@ -749,6 +829,7 @@ export async function POST(request: Request) {
       }
       pendingGroupNames = rows.map((row) => row.parent_name || "").filter(Boolean);
     }
+    preparationTimingsMs.ledgerAndGroups = Date.now() - mastersStartedAt;
     const groupIdentities = activeGroups.map((group) => ({
       name: group.tally_name,
       parent: group.parent_name,
@@ -1068,7 +1149,10 @@ export async function POST(request: Request) {
             : "";
       const rows: MappingRow[] = [];
 
-      if (account && bankLedger) {
+      if (
+        account && bankLedger &&
+        normalizeName(account.tally_ledger_name) !== normalizeName(bankLedger)
+      ) {
         rows.push({
           connection_id: connectionId,
           company_name: expectedCompanyName,
@@ -1115,6 +1199,7 @@ export async function POST(request: Request) {
       ).values()
     );
 
+    const mappingStartedAt = Date.now();
     if (uniqueMappingRows.length > 0) {
       const { error: mappingError } = await supabase
         .from("tally_mapping_settings")
@@ -1124,14 +1209,18 @@ export async function POST(request: Request) {
 
       if (mappingError) throw mappingError;
     }
+    preparationTimingsMs.mappingPersistence = Date.now() - mappingStartedAt;
 
     const queueJobId = request.headers.get("x-tally-queue-job-id")?.trim() || null;
+    const enqueueStartedAt = Date.now();
     const { data: createdCommands, error: commandError } = await supabase.rpc("enqueue_bank_tally_commands", {
       p_owner: user.id, p_connection: connectionId, p_dataset: target.companyDatasetId,
       p_generation: target.sessionGeneration,
       p_commands: commands.map((command) => ({ ...command, queue_job_id: queueJobId, payload: { ...command.payload, target } })),
     });
     if (commandError) throw commandError;
+    preparationTimingsMs.commandEnqueue = Date.now() - enqueueStartedAt;
+    preparationTimingsMs.totalToCommandEnqueue = Date.now() - preparationStartedAt;
     const queuedTransactionIds = voucherCommands.map((command) => command.payload.transactionId);
     const verificationTransactionIds = verificationCommands.map((command) => command.payload.transactionId);
 
@@ -1161,6 +1250,7 @@ export async function POST(request: Request) {
       commandCount: commands.length,
       commands: createdCommands ?? [],
       diagnostics: {
+        preparationTimingsMs,
         eligibleTransactionCount: transactions.length,
         expectedReceiptCount,
         expectedPaymentPostCount,

@@ -5,8 +5,8 @@
   display: flex;
   flex-direction: column;
   height: 100vh;
-  width: 224px;
-  background-color: #f5f0e8;
+  width: 208px;
+  background-color: #f6f2eb;
   border-right: 1px solid #e5ddd0;
   position: sticky;
   top: 0;
@@ -18,7 +18,7 @@
 }
 
 .sidebar.collapsed {
-  width: 72px;
+  width: 64px;
 }
 
 /* =========================================
@@ -27,14 +27,14 @@
 .brandRow {
   display: flex;
   align-items: center;
-  padding: 1.125rem 1rem 0.875rem 1rem;
+  padding: 0.8rem 0.75rem 0.7rem;
   border-bottom: 1px solid #e5ddd0;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.3rem;
 }
 
 .brandRow.collapsed {
   justify-content: center;
-  padding: 1.25rem 0.5rem;
+  padding: 0.8rem 0.5rem;
 }
 
 .brandLeft {
@@ -47,20 +47,21 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  background-color: #2d2d2d;
-  border-radius: 7px;
+  width: 26px;
+  height: 26px;
+  background: linear-gradient(145deg, #d29170 0%, #a76570 48%, #586f82 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  border-radius: 8px;
   color: #ffffff;
   font-size: 0.8rem;
-  font-weight: 800;
+  font-weight: 850;
   letter-spacing: -0.02em;
   flex-shrink: 0;
 }
 
 .brandTitle {
-  font-size: 1rem;
-  font-weight: 700;
+  font-size: 0.9rem;
+  font-weight: 750;
   color: #1a1a1a;
   letter-spacing: -0.02em;
   line-height: 1;
@@ -100,22 +101,22 @@
    Navigation Section
    ========================================= */
 .navSection {
-  padding: 0.5rem 0.625rem;
+  padding: 0.35rem 0.5rem;
 }
 
 .sectionGroup {
-  margin-bottom: 1.25rem;
+  margin-bottom: 0.85rem;
 }
 
 .sectionHeader {
-  font-size: 0.65rem;
+  font-size: 0.59rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: #8a7f72;
-  padding: 0.25rem 0.55rem;
-  margin: 0 0 0.35rem 0;
-  opacity: 0.7;
+  padding: 0.2rem 0.5rem;
+  margin: 0 0 0.25rem;
+  opacity: 0.66;
 }
 
 .desktopNav {
@@ -144,13 +145,13 @@
   align-items: center;
   justify-content: space-between;
   position: relative;
-  border-radius: 8px;
-  padding: 0.5rem 0.55rem;
+  border-radius: 9px;
+  padding: 0.42rem 0.5rem;
   text-decoration: none;
   background: transparent;
   transition: background 0.15s ease;
   cursor: pointer;
-  min-height: 36px;
+  min-height: 34px;
 }
 
 .navItemLeft {
@@ -170,8 +171,8 @@
 
 .navTitle {
   color: #5a5046;
-  font-size: 0.875rem;
-  font-weight: 500;
+  font-size: 0.79rem;
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -212,8 +213,8 @@
 
 /* Active */
 .navItemActive {
-  background: linear-gradient(90deg, rgba(34, 197, 94, 0.14), #e8ddd0 38%);
-  box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.12);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: inset 0 0 0 1px #ded5c7;
 }
 
 .navItemActive .navIcon {
@@ -228,11 +229,11 @@
 /* Active indicator bar */
 .activeBar {
   position: absolute;
-  left: 0.25rem;
+  left: 0.2rem;
   top: 50%;
   transform: translateY(-50%);
-  width: 4px;
-  height: 22px;
+  width: 2px;
+  height: 16px;
   border-radius: 2px;
   background-color: #16a34a;
 }
@@ -242,6 +243,73 @@
    ========================================= */
 .spacer {
   flex-grow: 1;
+}
+
+.tallyStatusCard {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0.5rem 0.5rem;
+  padding: 0.55rem 0.6rem;
+  border: 1px solid #ded5c7;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.62);
+  color: #332d28;
+  text-decoration: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.tallyStatusCard:hover {
+  border-color: #cbbfad;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.tallyStatusIcon {
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 auto;
+  color: #9a6b28;
+}
+
+.tallyStatusConnected .tallyStatusIcon {
+  color: #168044;
+}
+
+.tallyStatusCopy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.08rem;
+}
+
+.tallyStatusCopy strong,
+.tallyStatusCopy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tallyStatusCopy strong {
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.tallyStatusCopy small {
+  color: #817668;
+  font-size: 0.6rem;
+  line-height: 1.35;
+}
+
+.sidebar.collapsed .tallyStatusCard {
+  justify-content: center;
+  min-height: 38px;
+  margin-inline: 0.5rem;
+  padding: 0.55rem;
+}
+
+.sidebar.collapsed .tallyStatusCopy {
+  display: none;
 }
 
 /* =========================================
@@ -397,7 +465,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.875rem 1rem;
+  padding: 0.65rem 0.75rem;
   cursor: pointer;
   transition: background 0.15s ease;
   user-select: none;
@@ -415,8 +483,8 @@
 }
 
 .userAvatar {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   background-color: #2d2d2d;
   color: #ffffff;
@@ -436,7 +504,7 @@
 }
 
 .userName {
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   font-weight: 600;
   color: #1a1a1a;
   white-space: nowrap;
@@ -446,7 +514,7 @@
 }
 
 .userEmail {
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   color: #8a7f72;
   white-space: nowrap;
   overflow: hidden;
@@ -500,6 +568,7 @@
 
   .brandRow,
   .spacer,
+  .tallyStatusCard,
   .userRowWrapper {
     display: none;
   }
