@@ -29,7 +29,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.70";
+const BRIDGE_VERSION = "0.1.71";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -4415,29 +4415,23 @@ async function refreshCachedBankVouchers(
     financialYear: fy.key,
   });
   const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
-  const cursor = Number(partition.cursor?.lastAlterId) || 0;
   const fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
-  const mode = fullRefresh ? "full_snapshot" : "delta";
+  const mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
   partition.status = "refreshing";
   saveOperationalCache(db, options);
 
   const exportStartedAt = Date.now();
   try {
-    const filterName = "GajkesariChangedOperationalVoucher";
     const xml = await (dependencies.exportCollection || exportTallyCollection)(tallyUrl, {
       collectionName: fullRefresh
         ? "Gajkesari Cached Bank Vouchers"
-        : "Gajkesari Changed Operational Vouchers",
-      tallyType: fullRefresh ? "Vouchers : Ledger" : "Voucher",
-      ...(fullRefresh ? { childOf: tallyFormulaString(bankLedgerName) } : {}),
+        : "Gajkesari Statement Bank Vouchers",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(bankLedgerName),
       fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
       companyName,
-      dateFrom: fy.dateFrom,
-      dateTo: fy.dateTo,
-      ...(fullRefresh || cursor <= 0 ? {} : {
-        formulae: [{ name: filterName, formula: `$AlterID > ${Math.trunc(cursor)}` }],
-        filterNames: [filterName],
-      }),
+      dateFrom: fullRefresh ? fy.dateFrom : dateFrom,
+      dateTo: fullRefresh ? fy.dateTo : dateTo,
       timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
       maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
     });
@@ -4445,7 +4439,9 @@ async function refreshCachedBankVouchers(
       throw new Error("Tally did not return a complete voucher collection for the local index.");
     }
     const changedVouchers = parseVoucherCollection(xml);
-    const update = upsertVoucherPartition(partition, changedVouchers, { mode, bankLedgerName });
+    const update = upsertVoucherPartition(partition, changedVouchers, {
+      mode, bankLedgerName, dateFrom, dateTo,
+    });
     partition.lastError = null;
     saveOperationalCache(db, options);
     dependencies.operationalContext = { db, key, partition, options };

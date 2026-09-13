@@ -112,7 +112,17 @@ function voucherTouchesLedger(voucher, ledgerName) {
   return Boolean(target) && [voucher.partyLedgerName, ...(voucher.ledgerNames || [])].some((name) => normalize(name) === target);
 }
 
-export function upsertVoucherPartition(partition, vouchers, { mode = "delta", bankLedgerName } = {}) {
+function voucherDate(voucher) {
+  return String(voucher?.effectiveDate || voucher?.date || "")
+    .replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3")
+    .slice(0, 10);
+}
+
+export function upsertVoucherPartition(
+  partition,
+  vouchers,
+  { mode = "delta", bankLedgerName, dateFrom, dateTo } = {}
+) {
   const now = new Date().toISOString();
   const seen = new Set();
   const affectedPartyNames = new Set();
@@ -158,8 +168,21 @@ export function upsertVoucherPartition(partition, vouchers, { mode = "delta", ba
       if (voucher.isActive && !seen.has(key)) { voucher.isActive = false; voucher.deletedAt = now; deleted += 1; }
     }
     partition.lastFullRefreshAt = now;
+  } else if (mode === "scoped_snapshot" && dateFrom && dateTo) {
+    for (const [key, voucher] of Object.entries(partition.vouchers)) {
+      const date = voucherDate(voucher);
+      if (voucher.isActive && date >= dateFrom && date <= dateTo && !seen.has(key)) {
+        voucher.isActive = false;
+        voucher.deletedAt = now;
+        deleted += 1;
+      }
+    }
   }
-  partition.cursor = { lastAlterId: String(maxAlterId), lastMasterId: String(maxMasterId) };
+  // A scoped snapshot has not observed other company dates, so it must not
+  // advance the global cursor and hide unrelated changes from a later refresh.
+  if (mode !== "scoped_snapshot") {
+    partition.cursor = { lastAlterId: String(maxAlterId), lastMasterId: String(maxMasterId) };
+  }
   partition.lastRefreshAt = now;
   partition.status = "ready";
   for (const name of affectedPartyNames) invalidateBillCache(partition, name, now);

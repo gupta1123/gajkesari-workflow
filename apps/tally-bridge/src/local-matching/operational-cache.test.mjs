@@ -62,3 +62,21 @@ test("a sparse cancellation invalidates the previous party bill cache", () => {
   assert.deepEqual(result.affectedPartyNames, ["Customer A"]);
   assert.equal(getCachedBillBucket(partition, "Customer A"), null);
 });
+
+test("scoped snapshot retires only missing in-range vouchers and preserves the global cursor", () => {
+  const db = loadOperationalCache({ baseDir: temp() });
+  const { partition } = ensureVoucherPartition(db, { companyGuid: "c1", bankLedgerName: "Bank A", financialYear: "2026-27" });
+  upsertVoucherPartition(partition, [
+    voucher({ guid: "in-range", date: "20260901", alterId: "20" }),
+    voucher({ guid: "outside", date: "20260902", alterId: "30" }),
+  ], { mode: "full_snapshot", bankLedgerName: "Bank A" });
+  partition.cursor = { lastAlterId: "50", lastMasterId: "40" };
+
+  const result = upsertVoucherPartition(partition, [], {
+    mode: "scoped_snapshot", bankLedgerName: "Bank A", dateFrom: "2026-09-01", dateTo: "2026-09-01",
+  });
+
+  assert.equal(result.counts.deleted, 1);
+  assert.equal(partition.vouchers["voucher:outside"].isActive, true);
+  assert.deepEqual(partition.cursor, { lastAlterId: "50", lastMasterId: "40" });
+});

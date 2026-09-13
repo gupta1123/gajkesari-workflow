@@ -32,7 +32,7 @@ import {
   testTally,
 } from "./bridge.mjs";
 
-test("operational voucher provider bootstraps once then requests only changed vouchers", async (t) => {
+test("operational voucher provider bootstraps once then requests a statement-scoped bank snapshot", async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-provider-"));
   t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   const calls = [];
@@ -50,8 +50,11 @@ test("operational voucher provider bootstraps once then requests only changed vo
   assert.equal(first.diagnostics.refreshMode, "full_snapshot");
   assert.equal(first.vouchers.length, 1);
   const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
-  assert.equal(second.diagnostics.refreshMode, "delta");
-  assert.match(calls[1].formulae[0].formula, /AlterID > 20/);
+  assert.equal(second.diagnostics.refreshMode, "scoped_snapshot");
+  assert.equal(calls[1].tallyType, "Vouchers : Ledger");
+  assert.equal(calls[1].dateFrom, request.dateFrom);
+  assert.equal(calls[1].dateTo, request.dateTo);
+  assert.equal(calls[1].formulae, undefined);
 });
 
 test("Tally response decoding preserves Unicode ledger punctuation", () => {
