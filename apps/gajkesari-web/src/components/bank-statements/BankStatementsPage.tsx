@@ -3328,6 +3328,7 @@ export function BankStatementsPage() {
   const [ledgerCatalogueError, setLedgerCatalogueError] = useState("");
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
+  const [bankLedgerCatalogue, setBankLedgerCatalogue] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
@@ -3578,7 +3579,9 @@ export function BankStatementsPage() {
       billWiseEnabled: null,
       ledgerType: "other",
     } satisfies TallyMaster));
-    const merged = [...localBankLedgers, ...ledgerMasters.filter(isBankLedgerMaster)];
+    // Transaction vector candidates also live in `ledgerMasters`; they are not
+    // a bank-ledger catalogue and must never flash in the account selector.
+    const merged = [...localBankLedgers, ...bankLedgerCatalogue.filter(isBankLedgerMaster)];
     const seen = new Set<string>();
     return merged.filter((ledger) => {
       const key = ledger.name.trim().toLowerCase();
@@ -3586,7 +3589,7 @@ export function BankStatementsPage() {
       seen.add(key);
       return true;
     });
-  }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
+  }, [bankLedgerCatalogue, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
   const bankLedgerPickerGroups = useMemo<LedgerSearchGroup[]>(() => {
     const identifiedNames = new Set(bankLedgerOptions.map((ledger) => normalizeName(ledger.name)));
     const identifiedBankLedgers = [...bankLedgerOptions]
@@ -3599,7 +3602,7 @@ export function BankStatementsPage() {
         ].filter(Boolean).join(" - "),
         ...ledgerBalanceFields(ledger),
       }));
-    const allOtherLedgers = ledgerMasters
+    const allOtherLedgers = bankLedgerCatalogue
       .filter((ledger) => ledger.name.trim() && !identifiedNames.has(normalizeName(ledger.name)))
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((ledger) => ({
@@ -3612,7 +3615,7 @@ export function BankStatementsPage() {
       { label: "Identified bank account ledgers", options: identifiedBankLedgers },
       { label: "All other Tally ledgers", options: allOtherLedgers },
     ];
-  }, [bankLedgerOptions, ledgerMasters]);
+  }, [bankLedgerCatalogue, bankLedgerOptions]);
   const exactBankLedgerMatch = useMemo(() => {
     const statementAccountNumber = normalizeBankAccountNumber(account.accountNumber);
     if (!statementAccountNumber) return null;
@@ -4423,6 +4426,7 @@ export function BankStatementsPage() {
       if (loadSeq === ledgerLoadSeqRef.current) {
         fullLedgerCatalogueConnectionRef.current = "";
         setLedgerMasters([]);
+        setBankLedgerCatalogue([]);
       }
       return [];
     }
@@ -4449,6 +4453,7 @@ export function BankStatementsPage() {
       const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
       if (loadSeq === ledgerLoadSeqRef.current) {
         setLedgerMasters(masters);
+        setBankLedgerCatalogue(masters);
       }
       return masters;
     } finally {
@@ -5157,6 +5162,7 @@ export function BankStatementsPage() {
         ledgerLoadSeqRef.current += 1;
         fullLedgerCatalogueConnectionRef.current = "";
         setLedgerMasters([]);
+        setBankLedgerCatalogue([]);
       }
       showToast("success", "Tally connection refreshed.");
     } catch (error) {
@@ -5178,6 +5184,7 @@ export function BankStatementsPage() {
       setAccount(EMPTY_ACCOUNT);
       fullLedgerCatalogueConnectionRef.current = "";
       setLedgerMasters([]);
+      setBankLedgerCatalogue([]);
       clearStatementReview();
       return;
     }
@@ -5193,6 +5200,7 @@ export function BankStatementsPage() {
     setAccount(EMPTY_ACCOUNT);
     fullLedgerCatalogueConnectionRef.current = "";
     setLedgerMasters([]);
+    setBankLedgerCatalogue([]);
     clearStatementReview();
   }
 
