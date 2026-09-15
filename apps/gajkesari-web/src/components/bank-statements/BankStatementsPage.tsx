@@ -4558,11 +4558,11 @@ export function BankStatementsPage() {
     return null;
   }, []);
 
-  async function fetchTallyBankLedgersForCompanies(
+  const fetchTallyBankLedgersForCompanies = useCallback(async (
     connectionId: string,
     companyNames: string[],
     options?: { quiet?: boolean }
-  ) {
+  ) => {
     const cleanCompanyNames = Array.from(
       new Set(companyNames.map((name) => name.trim()).filter(Boolean))
     );
@@ -4610,7 +4610,41 @@ export function BankStatementsPage() {
     } finally {
       setLoadingBankLedgers(false);
     }
-  }
+  }, [selectedCompanyName]);
+
+  useEffect(() => {
+    if (!tallyCompanyContextVerified || !tallyConnectionId || !selectedCompanyName) {
+      bankLedgerLoadKeyRef.current = "";
+      return;
+    }
+
+    const loadKey = `${tallyConnectionId}:${normalizeName(selectedCompanyName)}`;
+    const alreadyLoaded = Object.prototype.hasOwnProperty.call(
+      tallyBankLedgersByCompany,
+      selectedCompanyName
+    );
+    if (bankLedgerLoadKeyRef.current === loadKey || alreadyLoaded) return;
+
+    // Warm the small bank-account list as soon as the active Tally company is
+    // verified. The full catalogue remains lazy and is only needed for manual
+    // searches across every ledger.
+    bankLedgerLoadKeyRef.current = loadKey;
+    void fetchTallyBankLedgersForCompanies(
+      tallyConnectionId,
+      [selectedCompanyName],
+      { quiet: true }
+    ).then((result) => {
+      if (!result && bankLedgerLoadKeyRef.current === loadKey) {
+        bankLedgerLoadKeyRef.current = "";
+      }
+    });
+  }, [
+    fetchTallyBankLedgersForCompanies,
+    selectedCompanyName,
+    tallyBankLedgersByCompany,
+    tallyCompanyContextVerified,
+    tallyConnectionId,
+  ]);
 
   const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
