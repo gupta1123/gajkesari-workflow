@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { getLocalDbPaths, normalizeCompanyKey, saveLocalDb } from "./store.mjs";
+import { getLocalDbPaths, loadLocalDb, normalizeCompanyKey, saveLocalDb } from "./store.mjs";
 
 export const EMBEDDING_MODEL = "openai/text-embedding-3-small";
 export const EMBEDDING_DIMENSIONS = 512;
@@ -162,6 +162,32 @@ async function openCollection(vectorDir, companyKey) {
   openingCollections.set(target, opening);
   try { return await opening; }
   finally { openingCollections.delete(target); }
+}
+
+export async function warmZvecCollection({ companyName, companyGuid, appUserDataPath, baseDir } = {}) {
+  const db = loadLocalDb({ appUserDataPath, baseDir });
+  const companies = Object.entries(db.companies || {});
+  const requestedKey = normalizeCompanyKey({ companyGuid, companyName });
+  let selected = companies.find(([key, entry]) =>
+    key === requestedKey ||
+    (companyGuid && String(entry.companyGuid || "").toLowerCase() === String(companyGuid).toLowerCase()) ||
+    (companyName && String(entry.companyName || "").toLowerCase() === String(companyName).toLowerCase())
+  );
+  if (!selected && !companyGuid && !companyName) {
+    selected = companies
+      .filter(([, entry]) => entry.vector?.status === "ready")
+      .sort((left, right) => new Date(right[1].lastSyncAt || 0) - new Date(left[1].lastSyncAt || 0))[0];
+  }
+  if (!selected || selected[1].vector?.status !== "ready") {
+    return { ready: false, reason: "no_ready_company_index" };
+  }
+  const { vectorDir } = getLocalDbPaths({ appUserDataPath, baseDir });
+  const collection = await openCollection(vectorDir, selected[0]);
+  return {
+    ready: Boolean(collection?.query),
+    companyKey: selected[0],
+    companyName: selected[1].companyName || null,
+  };
 }
 
 async function closeCachedCollection(target) {

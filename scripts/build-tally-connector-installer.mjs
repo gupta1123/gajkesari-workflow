@@ -332,7 +332,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.71",
+      version: "0.1.73",
       private: true,
       type: "module",
     },

@@ -11,6 +11,7 @@ export const SUPPORTED_DOCUMENT_EXTENSIONS = [
 ];
 
 let bankStatementModulesPromise = null;
+let documentParserWarmupPromise = null;
 
 async function loadBankStatementModules() {
   if (bankStatementModulesPromise) return bankStatementModulesPromise;
@@ -34,6 +35,36 @@ async function loadBankStatementModules() {
     deterministic, account, amounts, runningBalance, resilience, pdfColumns,
   }));
   return bankStatementModulesPromise;
+}
+
+function createWarmupPdf() {
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "<< /Length 35 >>\nstream\nBT /F1 8 Tf 5 36 Td (Warmup) Tj ET\nendstream",
+  ];
+  let source = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(source, "ascii"));
+    source += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = Buffer.byteLength(source, "ascii");
+  source += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  source += offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  source += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(source, "ascii");
+}
+
+export function warmDocumentParser() {
+  if (documentParserWarmupPromise) return documentParserWarmupPromise;
+  documentParserWarmupPromise = Promise.all([
+    loadBankStatementModules(),
+    toMarkdownBytes(createWarmupPdf(), "pdf"),
+  ]).then(() => ({ ready: true }));
+  return documentParserWarmupPromise;
 }
 
 function normalizeOutput(value) {

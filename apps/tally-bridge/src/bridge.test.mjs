@@ -26,6 +26,7 @@ import {
   reconcileBankTransactionsInTally,
   refreshCachedBankVouchers,
   resolveBankVoucherLedgerIdentities,
+  partitionBankVoucherLedgerIdentities,
   strictBankTransactionCandidates,
   indexBankVouchersByDate,
   fetchAvailableCompanies,
@@ -79,6 +80,17 @@ test("bank posting resolves a stale cached name by stable Tally GUID", () => {
     bankLedgerName: "HDFC Bank", bankLedgerGuid: "bank-guid",
     counterpartyLedgerName: "Missing", counterpartyLedgerGuid: "missing-guid",
   }], [{ name: "HDFC Bank", guid: "bank-guid" }]), /not present in the active Tally company/);
+});
+
+test("one missing ledger does not reject other bank posting rows", () => {
+  const results = partitionBankVoucherLedgerIdentities([
+    { bankLedgerName: "Bank", counterpartyLedgerName: "Suspense" },
+    { bankLedgerName: "Bank", counterpartyLedgerName: "Missing" },
+    { bankLedgerName: "Bank", counterpartyLedgerName: "Customer" },
+  ], [{ name: "Bank" }, { name: "Suspense" }, { name: "Customer" }]);
+  assert.equal(results[0].error, null);
+  assert.match(results[1].error, /Counterparty ledger 'Missing'/);
+  assert.equal(results[2].error, null);
 });
 
 test("direct receipt and payment XML contain no bill reference or Advance allocation", () => {

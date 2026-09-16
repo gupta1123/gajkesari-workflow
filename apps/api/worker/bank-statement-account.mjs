@@ -5,6 +5,10 @@ function cleanText(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
+function plainMarkdownText(value) {
+  return cleanText(String(value ?? "").replace(/[*_`#]/g, " ").replace(/\|/g, " "));
+}
+
 function markdownCells(line) {
   const text = String(line ?? "").trim();
   if (!text.includes("|")) return [];
@@ -42,6 +46,55 @@ function parseStatementAccount(value) {
   return { bankName, accountNumber };
 }
 
+function headerMarkdown(markdown) {
+  const lines = String(markdown ?? "").split(/\r?\n/);
+  const transactionHeaderIndex = lines.findIndex((line) => {
+    const normalized = normalizeHeader(line);
+    return /(?:transaction|txn|post) date/.test(normalized) &&
+      /(?:debit|withdrawal|dr amount)/.test(normalized) &&
+      /(?:credit|deposit|cr amount)/.test(normalized);
+  });
+  return lines.slice(0, transactionHeaderIndex >= 0 ? transactionHeaderIndex : Math.min(lines.length, 30)).join("\n");
+}
+
+function bankNameFromHeader(markdown) {
+  const header = plainMarkdownText(headerMarkdown(markdown));
+  if (!header) return "";
+
+  const ledgerMatch = header.match(/(?:statement ledger|bank\s*\/\s*tally ledger)\s*:\s*(.+?\b(?:bank|india))\s*-\s*[0-9*Xx]/i);
+  if (ledgerMatch?.[1]) return cleanText(ledgerMatch[1]);
+
+  const knownBanks = [
+    [/\bPunjab National Bank\b/i, "Punjab National Bank"],
+    [/\bCentral Bank of India\b/i, "Central Bank of India"],
+    [/\bState Bank of India\b/i, "State Bank of India"],
+    [/\bBank of Baroda\b/i, "Bank of Baroda"],
+    [/\bICICI Bank\b/i, "ICICI Bank"],
+    [/\bHDFC Bank\b/i, "HDFC Bank"],
+    [/\bAxis Bank\b/i, "Axis Bank"],
+  ];
+  for (const [pattern, bankName] of knownBanks) {
+    if (pattern.test(header)) return bankName;
+  }
+
+  const ifsc = header.match(/\b(?:IFSC(?:\s+CODE)?\s*:?\s*)?([A-Z]{4}0[A-Z0-9]{6})\b/i)?.[1]?.toUpperCase();
+  const bankByIfscPrefix = {
+    PUNB: "Punjab National Bank",
+    CBIN: "Central Bank of India",
+    SBIN: "State Bank of India",
+    BARB: "Bank of Baroda",
+    ICIC: "ICICI Bank",
+    HDFC: "HDFC Bank",
+    UTIB: "Axis Bank",
+  };
+  if (ifsc && bankByIfscPrefix[ifsc.slice(0, 4)]) return bankByIfscPrefix[ifsc.slice(0, 4)];
+
+  // Some HDFC exports render the logo as an image and expose the bank's name
+  // only in the legal footer after the transaction table.
+  if (/\bHDFC BANK LIMITED\b/i.test(plainMarkdownText(markdown))) return "HDFC Bank";
+  return "";
+}
+
 /**
  * Recover visible account identity from AnyDoc Markdown before relying on AI.
  * Bank statement headers are usually simple key/value tables and are safer to
@@ -54,6 +107,25 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
   for (let index = 0; index < lines.length; index += 1) {
     const headers = markdownCells(lines[index]);
     if (headers.length === 0 || isMarkdownSeparator(lines[index])) continue;
+
+    for (let cellIndex = 0; cellIndex < headers.length - 1; cellIndex += 1) {
+      const normalized = normalizeHeader(headers[cellIndex]);
+      const value = headers[cellIndex + 1];
+      if (!value) continue;
+      if (/^(account holder|account holder name|customer name|account name)$/.test(normalized)) {
+        result.accountHolderName ||= cleanText(value);
+      } else if (/^(bank name|bank)$/.test(normalized)) {
+        result.bankName ||= cleanText(value);
+      } else if (/^(account number|account no|a c number|a c no)$/.test(normalized)) {
+        result.accountNumber ||= cleanAccountNumber(value);
+      } else if (/^(ifsc|ifsc code)$/.test(normalized)) {
+        result.ifscCode ||= cleanText(value).toUpperCase().replace(/\s+/g, "");
+      } else if (/^(statement account|bank account|account)$/.test(normalized)) {
+        const statementAccount = parseStatementAccount(value);
+        result.bankName ||= statementAccount.bankName;
+        result.accountNumber ||= statementAccount.accountNumber || cleanAccountNumber(value);
+      }
+    }
 
     let valueIndex = index + 1;
     while (valueIndex < lines.length && (!lines[valueIndex].trim() || isMarkdownSeparator(lines[valueIndex]))) {
@@ -83,11 +155,12 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
     });
   }
 
-  const fullText = cleanText(markdown);
+  const fullText = plainMarkdownText(markdown);
   result.accountNumber ||= cleanAccountNumber(
-    fullText.match(/(?:account|a\/?c)\s*(?:number|no\.?|#)\s*[:\-]?\s*([0-9*Xx][0-9*Xx .-]{5,33})/i)?.[1]
+    fullText.match(/(?:account|a\/?c)\s*(?:(?:number|no\.?|#)\s*)?[:\-]?\s*([0-9*Xx][0-9*Xx .-]{5,33})/i)?.[1]
   );
   result.ifscCode ||= cleanText(fullText.match(/\bIFSC(?:\s+CODE)?\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})\b/i)?.[1]).toUpperCase();
+  result.bankName ||= bankNameFromHeader(markdown);
 
   return result;
 }

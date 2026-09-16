@@ -65,3 +65,40 @@ test("reports missing identity separately from optional holder and IFSC fields",
   });
 });
 
+test("extracts identity from same-row AnyDoc key/value cells", () => {
+  const markdown = `# STATE BANK OF INDIA
+|Account holder|Solution Nyx|Statement date|16 Aug 2026|
+|Account number|42861007319|Statement period|16 Aug 2026 to 16 Aug 2026|
+|Account type|Current Account|Branch / IFSC|Nagpur MIDC / SBIN0000456|
+|Txn date|Description|Debit|Credit|Balance|`;
+  const result = extractAccountFromBankStatementMarkdown(markdown);
+  assert.equal(result.bankName, "State Bank of India");
+  assert.equal(result.accountNumber, "42861007319");
+  assert.equal(result.accountHolderName, "Solution Nyx");
+});
+
+test("extracts bank title and a bare Account label", () => {
+  const markdown = `## State Bank of India - Current Account Statement
+Account holder: Solution Nyx Account: 42861007319 IFSC: SBIN0000456 Page 1 of 1`;
+  const result = extractAccountFromBankStatementMarkdown(markdown);
+  assert.equal(result.bankName, "State Bank of India");
+  assert.equal(result.accountNumber, "42861007319");
+});
+
+test("prefers an explicit ledger over a mimicked layout name", () => {
+  const markdown = `# PNB-STYLE LAYOUT | SYNTHETIC TEST STATEMENT
+Bank / Tally Ledger: Axis Bank - 7440012233
+Account Statement for Account Number 7440012233`;
+  const result = extractAccountFromBankStatementMarkdown(markdown);
+  assert.equal(result.bankName, "Axis Bank");
+  assert.equal(result.accountNumber, "7440012233");
+});
+
+test("uses the IFSC prefix when the logo name is absent from Markdown", () => {
+  const markdown = `# Account Statement for Account Number 0981008700020850
+Branch Name: AURANGABAD IFSC Code: PUNB0098100
+|Txn Date|Description|Dr Amount|Cr Amount|Balance|`;
+  const result = extractAccountFromBankStatementMarkdown(markdown);
+  assert.equal(result.bankName, "Punjab National Bank");
+  assert.equal(result.accountNumber, "0981008700020850");
+});

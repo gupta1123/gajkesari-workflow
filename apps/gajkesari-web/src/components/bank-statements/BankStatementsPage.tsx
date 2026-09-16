@@ -535,6 +535,7 @@ type TallyPostingStatus = {
 };
 
 type QueueLedgerContext = {
+  guid: string | null;
   name: string;
   parent: string | null;
   billWiseEnabled: boolean | null;
@@ -548,6 +549,7 @@ function buildQueueLedgerContext(ledgerMasters: TallyMaster[], names: Array<stri
     .slice(0, 100)
     .map((ledger): QueueLedgerContext => ({
       name: ledger.name,
+      guid: ledger.guid ?? null,
       parent: ledger.parent ?? null,
       billWiseEnabled: typeof ledger.billWiseEnabled === "boolean" ? ledger.billWiseEnabled : null,
       ledgerType: ledger.ledgerType ?? null,

@@ -9,9 +9,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { parseDocumentLocal } from "./document-parsing/parser.mjs";
+import { parseDocumentLocal, warmDocumentParser } from "./document-parsing/parser.mjs";
 import { parseDocumentAndSuggestLedgers } from "./document-parsing/parse-and-suggest.mjs";
 import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs";
+import { warmZvecCollection } from "./local-matching/vector.mjs";
 import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
 import {
   activeVouchers,
@@ -29,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.71";
+const BRIDGE_VERSION = "0.1.73";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -58,6 +59,8 @@ const PURCHASE_DOCUMENT_UDFS = {
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 let cachedWindowsTlsCertificates;
+let connectorPipelineWarmupPromise = null;
+const CONNECTOR_PIPELINE_WARMUP_DELAY_MS = 2_000;
 
 async function requestBridgeSemanticEmbeddings(config, inputs) {
   if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > 256) {
@@ -81,6 +84,38 @@ async function requestBridgeSemanticEmbeddings(config, inputs) {
     throw new Error("The secure embedding service returned an incomplete batch.");
   }
   return embeddings;
+}
+
+function warmConnectorPipeline(config, options = {}) {
+  if (connectorPipelineWarmupPromise) return connectorPipelineWarmupPromise;
+  // Let Electron finish painting the window before native PDF/Zvec startup
+  // work begins. A document command arriving in this interval awaits the same
+  // promise, so it can never race the warm-up.
+  connectorPipelineWarmupPromise = new Promise((resolve) => {
+    setTimeout(resolve, Number(options.pipelineWarmupDelayMs ?? CONNECTOR_PIPELINE_WARMUP_DELAY_MS));
+  }).then(async () => {
+    const startedAt = Date.now();
+    const results = await Promise.allSettled([
+      warmDocumentParser(),
+      warmZvecCollection({
+        companyName: config.companyName || null,
+        companyGuid: config.companyGuid || null,
+        appUserDataPath: options.appUserDataPath,
+        baseDir: options.localMatchingBaseDir,
+      }),
+      requestBridgeSemanticEmbeddings(config, ["Connector startup warm-up"]),
+    ]);
+    const failures = results.filter((result) => result.status === "rejected");
+    const elapsed = Date.now() - startedAt;
+    if (failures.length) {
+      const detail = failures.map((result) => result.reason?.message || String(result.reason)).join("; ");
+      emitLog(options, "error", `Connector pipeline warm-up completed with ${failures.length} unavailable component(s) in ${elapsed} ms: ${detail}`);
+    } else {
+      emitLog(options, "info", `Connector document pipeline warmed in ${elapsed} ms.`);
+    }
+    return { ready: failures.length === 0, elapsed, results };
+  });
+  return connectorPipelineWarmupPromise;
 }
 
 function windowsTlsCertificates() {
@@ -2062,7 +2097,17 @@ export function resolveBankVoucherLedgerIdentities(payloads, liveMasters) {
   });
 }
 
-async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName) {
+export function partitionBankVoucherLedgerIdentities(payloads, liveMasters) {
+  return (payloads || []).map((payload) => {
+    try {
+      return { payload: resolveBankVoucherLedgerIdentities([payload], liveMasters)[0], error: null };
+    } catch (error) {
+      return { payload, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
+
+async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName, isolateRows = false) {
   const identities = (payloads || []).flatMap((payload) => [
     { name: payload?.bankLedgerName, guid: payload?.bankLedgerGuid },
     { name: payload?.counterpartyLedgerName, guid: payload?.counterpartyLedgerGuid },
@@ -2085,7 +2130,10 @@ async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName)
     timeoutMs: 20_000,
     maxResponseBytes: 1024 * 1024,
   });
-  return resolveBankVoucherLedgerIdentities(payloads, parseBankStatementMasterCollection(xml, "LEDGER"));
+  const masters = parseBankStatementMasterCollection(xml, "LEDGER");
+  return isolateRows
+    ? partitionBankVoucherLedgerIdentities(payloads, masters)
+    : resolveBankVoucherLedgerIdentities(payloads, masters);
 }
 
 async function validateBankVoucherBillAllocationsLive(config, payloads, companyName) {
@@ -2172,22 +2220,44 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
 
   for (const unresolvedGroup of groups.values()) {
     let group;
+    let validationCommands = unresolvedGroup;
     try {
       const companyName = unresolvedGroup[0]?.payload?.companyName || config.companyName || null;
-      const resolvedPayloads = await resolveBankVoucherLedgerPayloads(
+      const resolutions = await resolveBankVoucherLedgerPayloads(
         config.tallyUrl,
         unresolvedGroup.map((command) => command.payload || {}),
-        companyName
+        companyName,
+        true
       );
+      const rejected = unresolvedGroup.filter((_, index) => resolutions[index].error);
+      if (rejected.length) {
+        await sendCommandResults(config, rejected.map((command) => ({
+          command,
+          outcome: {
+            success: false,
+            error: resolutions[unresolvedGroup.indexOf(command)].error,
+            result: {
+              transactionId: command.payload?.transactionId,
+              sourceBankTransactionId: command.payload?.transactionId,
+              beforeExecution: true,
+              liveMasterValidationFailed: true,
+            },
+          },
+        })));
+      }
+      const validCommands = unresolvedGroup.filter((_, index) => !resolutions[index].error);
+      validationCommands = validCommands;
+      const resolvedPayloads = resolutions.filter((resolution) => !resolution.error).map((resolution) => resolution.payload);
+      if (!validCommands.length) continue;
       const validatedPayloads = await validateBankVoucherBillAllocationsLive(
         config,
         resolvedPayloads,
         companyName
       );
-      group = unresolvedGroup.map((command, index) => ({ ...command, payload: validatedPayloads[index] }));
+      group = validCommands.map((command, index) => ({ ...command, payload: validatedPayloads[index] }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await sendCommandResults(config, unresolvedGroup.map((command) => ({
+      await sendCommandResults(config, validationCommands.map((command) => ({
         command,
         outcome: {
           success: false,
@@ -5282,6 +5352,7 @@ async function executeCommand(config, command, options = {}) {
 
   if (command.commandType === "parse_and_suggest") {
     try {
+      await connectorPipelineWarmupPromise?.catch(() => {});
       const result = await parseDocumentAndSuggestLedgers(command.payload || {}, {
         appUserDataPath: options.appUserDataPath,
         baseDir: options.localMatchingBaseDir,
@@ -6604,6 +6675,7 @@ function createBridgeRunner(options = {}) {
         ...options, onWakeHealth: (healthy) => { wakeHealthy = healthy; },
       });
       stopTallyLiveChannel = startTallyLiveChannel(config, executeExclusive, options);
+      void warmConnectorPipeline(config, options);
       leaseTimer = setInterval(async () => {
         const claims = [...commandLeases.values()].filter((claim) => claim.connectionId === config.connectionId).map(({ id, token }) => ({ id, token }));
         if (stopped || renewingLeases || !claims.length) return;
