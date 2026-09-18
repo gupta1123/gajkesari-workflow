@@ -27,7 +27,6 @@ export function buildBankBookRows(bank: string, period: string, entries: BankBoo
   if (balances) {
     const opening = Math.round(balances.opening * 100);
     debit += Math.max(opening, 0); credit += Math.max(-opening, 0);
-    rows.push([entries[0]?.date || "", opening >= 0 ? "To" : "By", "Opening Balance", "", "", "", "", money(Math.max(opening, 0)), money(Math.max(-opening, 0))]);
   }
   // Stable partition preserves statement order within each voucher type.
   for (const row of [...entries.filter(r => r.receipt > 0), ...entries.filter(r => r.payment > 0)]) {
@@ -37,6 +36,8 @@ export function buildBankBookRows(bank: string, period: string, entries: BankBoo
   }
   rows.push(["", "", "Total", "", "", "", "", money(debit), money(credit)]);
   if (balances) {
+    const opening = Math.round(balances.opening * 100);
+    rows.push(["", opening >= 0 ? "To" : "By", "Opening Balance", "", "", "", "", money(Math.max(opening, 0)), money(Math.max(-opening, 0))]);
     const closing = Math.round(balances.closing * 100);
     rows.push(["", closing >= 0 ? "By" : "To", "Closing Balance", "", "", "", "", money(Math.max(-closing, 0)), money(Math.max(closing, 0))]);
     rows.push(["", "", "Grand Total", "", "", "", "", money(debit + Math.max(-closing, 0)), money(credit + Math.max(closing, 0))]);

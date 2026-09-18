@@ -10,6 +10,8 @@ test('bank book orders receipts first, leaves two columns blank and balances tot
   assert.ok(csv.indexOf('"Receipt"') < csv.indexOf('"Payment"'));
   assert.ok(csv.includes('"Buyer","","","Receipt","R1","50.00",""'));
   assert.ok(csv.includes('"Grand Total","","","","","150.00","150.00"'));
+  assert.ok(csv.indexOf('"Total"') < csv.indexOf('"Opening Balance"'));
+  assert.ok(csv.indexOf('"Opening Balance"') < csv.indexOf('"Closing Balance"'));
 });
 
 test('partial export omits balances and escapes CSV and spreadsheet formulas', () => {
