@@ -516,6 +516,7 @@ type StatementDoneSummary = {
 type TallyPostingStatus = {
   connectionId: string;
   commandIds: string[];
+  commands: TallyCommand[];
   total: number;
   waiting: number;
   sent: number;
@@ -2895,6 +2896,10 @@ function buildTallyPostingStatus(
   return {
     connectionId,
     commandIds,
+    commands: commandIds.flatMap((commandId) => {
+      const command = commandById.get(commandId);
+      return command ? [command] : [];
+    }),
     total: commandIds.length,
     waiting,
     sent,
@@ -6711,6 +6716,44 @@ export function BankStatementsPage() {
             if (finalStatus.failed > 0 || finalStatus.canceled > 0 || !commandConnection) return;
             setBanner({ tone: "info", text: "Tally actions completed. Verifying the statement against live Tally..." });
             const { drafts, balanceProof } = await verifyBankStatementPresence(commandConnection, validTransactions);
+            // A successful post_bank_voucher command already includes the connector's
+            // per-voucher Tally read-back. The immediate bulk statement lookup can lag
+            // behind Tally and must not turn those verified posts into false failures.
+            const connectorVerifiedPosts = finalStatus.commands.flatMap((command) => {
+              if (
+                command.status !== "succeeded" ||
+                (command.commandType || command.command_type) !== "post_bank_voucher"
+              ) {
+                return [];
+              }
+              const result = command.result ?? {};
+              const transactionId = typeof result.transactionId === "string" ? result.transactionId : "";
+              const verificationStatus = String(result.verificationStatus ?? "").toLowerCase();
+              const duplicateCheck = result.duplicateCheck && typeof result.duplicateCheck === "object"
+                ? result.duplicateCheck as Record<string, unknown>
+                : null;
+              const duplicateStatus = String(duplicateCheck?.verificationStatus ?? "").toLowerCase();
+              const verified = verificationStatus === "verified" || ["found", "matched", "verified"].includes(duplicateStatus);
+              if (!transactionId || !verified) return [];
+              const voucherNumber = typeof result.voucherNumber === "string"
+                ? result.voucherNumber
+                : typeof duplicateCheck?.voucherNumber === "string"
+                  ? duplicateCheck.voucherNumber
+                  : null;
+              return [[transactionId, voucherNumber] as const];
+            });
+            for (const [transactionId, voucherNumber] of connectorVerifiedPosts) {
+              drafts[transactionId] = {
+                ...drafts[transactionId],
+                status: "found",
+                label: "Posted and verified",
+                reason: "The connector created this voucher and verified it by reading it back from Tally.",
+                voucherNumber: voucherNumber ?? drafts[transactionId]?.voucherNumber ?? null,
+              };
+            }
+            setTallyPresenceByTransactionId(drafts);
+            setTallyBalanceProof(balanceProof);
+            setTallyCheckAttempted(true);
             const selectedIds = new Set(selectedTallyWorkTransactions.map((transaction) => transaction.id));
             if (finalStatus.voucherTotal > 0) {
               setPostedTransactionIds((current) => {
