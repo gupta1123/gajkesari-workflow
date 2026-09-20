@@ -3389,6 +3389,7 @@ export function BankStatementsPage() {
   const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
   const fullLedgerCatalogueConnectionRef = useRef("");
+  const nonEmptyLedgerCataloguesRef = useRef<Map<string, TallyMaster[]>>(new Map());
   const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
@@ -4443,8 +4444,14 @@ export function BankStatementsPage() {
     try {
       const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
       const liveCompanyName = selectedCompanyName || connectionCompany?.companyName || "";
+      const catalogueKey = `${connectionId}:${normalizeName(liveCompanyName)}`;
+      const cachedCatalogue = nonEmptyLedgerCataloguesRef.current.get(catalogueKey) ?? [];
+      if (cachedCatalogue.length > 0 && loadSeq === ledgerLoadSeqRef.current) {
+        setLedgerMasters(cachedCatalogue);
+        setBankLedgerCatalogue(cachedCatalogue);
+      }
       // This catalogue comes from the connector's local database only when the
-      // user opens a manual picker. Matching uses the local vector index; never
+      // active company is verified. Matching uses the local vector index; never
       // mirror the complete ledger list into Supabase from this page.
       const payload = await runCashDiscountLiveRequest<{
         ledgers?: TallyMaster[];
@@ -4458,9 +4465,14 @@ export function BankStatementsPage() {
         },
       });
       const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
+      if (masters.length === 0) {
+        throw new Error("The connector returned an empty ledger catalogue. Open Ledger matching and update ledgers, then retry.");
+      }
+      nonEmptyLedgerCataloguesRef.current.set(catalogueKey, masters);
       if (loadSeq === ledgerLoadSeqRef.current) {
         setLedgerMasters(masters);
         setBankLedgerCatalogue(masters);
+        setLedgerCatalogueError("");
       }
       return masters;
     } finally {
@@ -4854,30 +4866,38 @@ export function BankStatementsPage() {
   }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
 
   useEffect(() => {
-    // The connector already returned the relevant vector candidates. Fetch its
-    // complete local catalogue only when a user opens either manual ledger picker.
-    if (
-      (!bankLedgerChangeMode && editingLedgerIds.size === 0) ||
-      !tallyConnectionId ||
-      fullLedgerCatalogueConnectionRef.current === tallyConnectionId
-    ) return;
+    // Preload the connector-local catalogue as soon as the company is verified.
+    // Vector suggestions remain usable while this runs. Supabase masters are not
+    // involved in this path.
+    if (!tallyCompanyContextVerified || !tallyConnectionId || !selectedCompanyName) return;
+    const catalogueKey = `${tallyConnectionId}:${normalizeName(selectedCompanyName)}`;
+    if (fullLedgerCatalogueConnectionRef.current === catalogueKey) return;
 
     let cancelled = false;
-    loadLedgerMasters(tallyConnectionId)
-      .then(() => {
-        if (!cancelled) fullLedgerCatalogueConnectionRef.current = tallyConnectionId;
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setLedgerCatalogueError(
-            error instanceof Error ? error.message : "Could not load the connector ledger catalogue."
-          );
+    let retryTimer: number | null = null;
+    let attempt = 0;
+    const preload = async () => {
+      attempt += 1;
+      try {
+        const masters = await loadLedgerMasters(tallyConnectionId);
+        if (cancelled) return;
+        if (masters.length > 0) fullLedgerCatalogueConnectionRef.current = catalogueKey;
+      } catch (error) {
+        if (cancelled) return;
+        setLedgerCatalogueError(
+          error instanceof Error ? error.message : "Could not load the connector ledger catalogue."
+        );
+        if (attempt < 3) {
+          retryTimer = window.setTimeout(preload, attempt * 1500);
         }
-      });
+      }
+    };
+    void preload();
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
-  }, [bankLedgerChangeMode, editingLedgerIds.size, loadLedgerMasters, tallyConnectionId]);
+  }, [bankLedgerChangeMode, editingLedgerIds.size, loadLedgerMasters, selectedCompanyName, tallyCompanyContextVerified, tallyConnectionId]);
 
   useEffect(() => {
     if ((loading || sending || matchingBills || syncingMasters || postUploadSyncImportId) && selectedCompanyId) {
@@ -5202,8 +5222,6 @@ export function BankStatementsPage() {
         bankLedgerLoadKeyRef.current = "";
         ledgerLoadSeqRef.current += 1;
         fullLedgerCatalogueConnectionRef.current = "";
-        setLedgerMasters([]);
-        setBankLedgerCatalogue([]);
       }
       showToast("success", "Tally connection refreshed.");
     } catch (error) {

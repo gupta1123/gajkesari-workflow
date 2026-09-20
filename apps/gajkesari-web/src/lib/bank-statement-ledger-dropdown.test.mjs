@@ -53,9 +53,11 @@ test("large ledger lookup structures are cached instead of rebuilt per row", () 
   assert.match(page, /useDeferredValue\(query\)/);
 });
 
-test("opening the top bank-ledger replacement picker loads the full connector catalogue", () => {
-  assert.match(page, /\(!bankLedgerChangeMode && editingLedgerIds\.size === 0\)/);
+test("the verified company preloads and retains the full connector catalogue", () => {
+  assert.match(page, /if \(!tallyCompanyContextVerified \|\| !tallyConnectionId \|\| !selectedCompanyName\) return/);
   assert.match(page, /operation: "local_ledger_catalogue"/);
+  assert.match(page, /nonEmptyLedgerCataloguesRef/);
+  assert.match(page, /The connector returned an empty ledger catalogue/);
   assert.match(page, /Loading all ledgers from the connector/);
   assert.match(page, /bankLedgerVerified \? "Matched" : bankLedgerManuallyConfirmed \? "Selected" : "Chosen"/);
 });
