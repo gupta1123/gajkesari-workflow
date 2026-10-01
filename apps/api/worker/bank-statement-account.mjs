@@ -28,6 +28,10 @@ function normalizeHeader(value) {
   return cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+function isAccountFieldLabel(value) {
+  return /^(account holder|account holder name|customer name|account name|bank name|bank|account number|account no|a c number|a c no|ifsc|ifsc code|statement account|bank account|account)$/.test(normalizeHeader(value));
+}
+
 function cleanAccountNumber(value) {
   const compact = cleanText(value).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
   return /\d/.test(compact) && compact.length >= 6 && compact.length <= 34 ? compact : "";
@@ -111,7 +115,9 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
     for (let cellIndex = 0; cellIndex < headers.length - 1; cellIndex += 1) {
       const normalized = normalizeHeader(headers[cellIndex]);
       const value = headers[cellIndex + 1];
-      if (!value) continue;
+      // Adjacent labels belong to a column-header row, not a key/value row.
+      // Let the row below supply values instead of saving another field name.
+      if (!value || isAccountFieldLabel(value)) continue;
       if (/^(account holder|account holder name|customer name|account name)$/.test(normalized)) {
         result.accountHolderName ||= cleanText(value);
       } else if (/^(bank name|bank)$/.test(normalized)) {
@@ -137,7 +143,7 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
     headers.forEach((header, cellIndex) => {
       const normalized = normalizeHeader(header);
       const value = values[cellIndex];
-      if (!value) return;
+      if (!value || isAccountFieldLabel(value)) return;
 
       if (/^(account holder|account holder name|customer name|account name)$/.test(normalized)) {
         result.accountHolderName ||= cleanText(value);

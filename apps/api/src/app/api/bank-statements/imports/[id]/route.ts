@@ -217,11 +217,11 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
   };
 }
 
-function readPostedVoucherNumber(result: unknown, fallback: unknown) {
+function readPostedVoucherNumber(result: unknown) {
   const record = readRecord(result);
   const duplicateCheck = readRecord(record.duplicateCheck);
   return String(
-    record.voucherNumber ?? duplicateCheck.voucherNumber ?? fallback ?? ""
+    record.voucherNumber ?? duplicateCheck.voucherNumber ?? ""
   ).trim();
 }
 
@@ -341,11 +341,10 @@ export async function GET(
 
     const { data: postedRows, error: postedRowsError } = await supabase
       .from("bank_transactions")
-      .select("id,fingerprint,transaction_date,description,reference_number,debit_amount,credit_amount,confirmed_ledger_name,suggested_ledger_name,tally_voucher_id,tally_posted_at")
+      .select("id,fingerprint,transaction_date,description,reference_number,debit_amount,credit_amount,confirmed_ledger_name,suggested_ledger_name,tally_voucher_id,tally_posted_at,tally_status")
       .eq("statement_import_id", id)
       .eq("owner_user_id", user.id)
       .eq("company_dataset_id", importRow.company_dataset_id)
-      .eq("tally_status", "verified")
       .order("transaction_date", { ascending: true });
     if (postedRowsError) throw postedRowsError;
 
@@ -355,10 +354,9 @@ export async function GET(
     const { data: postedLogs, error: postedLogsError } = postedFingerprints.length
       ? await supabase
           .from("bank_transaction_posting_log")
-          .select("fingerprint,result,tally_voucher_id,tally_posted_at")
+          .select("fingerprint,result,tally_voucher_id,tally_posted_at,status,command_id,voucher_type")
           .eq("owner_user_id", user.id)
           .eq("company_dataset_id", importRow.company_dataset_id)
-          .eq("status", "verified")
           .in("fingerprint", postedFingerprints)
       : { data: [], error: null };
     if (postedLogsError) throw postedLogsError;
@@ -375,8 +373,12 @@ export async function GET(
         debitAmount: row.debit_amount ?? null,
         creditAmount: row.credit_amount ?? null,
         ledgerName: String(row.confirmed_ledger_name ?? row.suggested_ledger_name ?? "").trim(),
-        voucherNumber: readPostedVoucherNumber(log?.result, log?.tally_voucher_id ?? row.tally_voucher_id),
+        voucherNumber: row.tally_status === "verified" ? readPostedVoucherNumber(log?.result) : "",
         postedAt: log?.tally_posted_at ?? row.tally_posted_at ?? null,
+        postingStatus: log?.status ?? row.tally_status,
+        postingCommandId: log?.command_id ?? null,
+        postingResult: log?.result ?? null,
+        voucherType: log?.voucher_type ?? null,
       };
     });
 
