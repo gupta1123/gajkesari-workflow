@@ -3963,12 +3963,16 @@ export function BankStatementsPage() {
       : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
   const bankBookTransactions = buildStatementBankBook(validTransactions, persistedPostedTransactions);
+  const hasPostedEntries = persistedPostedTransactions.some(row =>
+    ["confirmed", "needs_check"].includes(savedPostingOutcome(row).status)
+  ) || validTransactions.some(row => postedTransactionIds.has(row.id) && tallyPresenceByTransactionId[row.id]?.status === "found");
+  const canDownloadBankBook = hasPostedEntries && bankBookTransactions.length > 0 && !tallyPostingInProgress && !previewExtractionIncomplete;
   const needsPostingCheck = persistedPostedTransactions.filter(row => savedPostingOutcome(row).status === "needs_check");
   const [bankBookFormat, setBankBookFormat] = useState<"pdf" | "csv">("pdf");
   const [downloadingBankBook, setDownloadingBankBook] = useState(false);
   const [recheckingPostings, setRecheckingPostings] = useState(false);
   async function downloadPostedBankBook() {
-    if (!preview || !bankBookTransactions.length) return;
+    if (!preview || !canDownloadBankBook) return;
     setDownloadingBankBook(true);
     try {
       const balances = statementBalances(validTransactions);
@@ -7012,7 +7016,7 @@ export function BankStatementsPage() {
               </h1>
             </div>
             <div className="flex min-w-0 items-center gap-2">
-            {bankBookTransactions.length > 0 && !tallyPostingInProgress && !previewExtractionIncomplete ? (
+            {canDownloadBankBook ? (
               <div className="flex shrink-0 items-center">
                 <Button type="button" variant="outline" disabled={downloadingBankBook} onClick={downloadPostedBankBook} className="h-8 rounded-l-lg rounded-r-none px-3 text-[10px] font-bold">
                   {downloadingBankBook ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />} Download {bankBookFormat.toUpperCase()}
