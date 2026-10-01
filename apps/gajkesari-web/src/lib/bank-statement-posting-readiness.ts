@@ -5,6 +5,7 @@ type PostingReadiness = {
   billRequired: boolean;
   amount: number;
   directPosting?: boolean;
+  postingRecorded?: boolean;
   allocation?: {
     status: string;
     requiresUserReview: boolean;
@@ -18,6 +19,7 @@ type PostingReadiness = {
 // Direct posting relies on the connector's live duplicate preflight and sends no
 // bill allocations. It must not bypass a failed/ambiguous check or become Advance.
 export function isReadyForTallyPosting(row: PostingReadiness): boolean {
+  if (row.postingRecorded) return false;
   if (!row.ledgerName.trim() || row.ledgerNeedsReview) return false;
   if (row.presence?.duplicateInTally) return false;
   if (row.directPosting) {

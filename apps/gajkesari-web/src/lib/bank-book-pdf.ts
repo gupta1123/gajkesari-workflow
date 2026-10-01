@@ -5,11 +5,11 @@ import { buildBankBookRows, type BankBookRow } from "./bank-book-csv";
 export function buildBankBookPdf(bank: string, period: string, entries: BankBookRow[], balances?: { opening: number; closing: number }) {
   const rows = buildBankBookRows(bank, period, entries, balances);
   const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
-  doc.setProperties({ title: `${bank} Book`, subject: period });
+  doc.setProperties({ title: `${bank} Statement Book`, subject: period });
   autoTable(doc, {
     head: [
-      [{ content: `${bank} Book`, colSpan: 9, styles: { fontSize: 11 } }],
-      [{ content: period, colSpan: 9 }],
+      [{ content: `${bank} Statement Book`, colSpan: 9, styles: { fontSize: 11 } }],
+      [{ content: `${period} | Full statement; balances are from the statement.`, colSpan: 9 }],
       rows[2],
     ],
     body: rows.slice(3),

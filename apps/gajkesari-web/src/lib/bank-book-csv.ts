@@ -4,6 +4,8 @@ export type BankBookRow = {
   voucherNumber: string;
   receipt: number;
   payment: number;
+  postingStatus?: string;
+  voucherType?: string;
 };
 
 export function buildBankBookCsv(bank: string, period: string, entries: BankBookRow[], balances?: { opening: number; closing: number }) {
@@ -19,7 +21,7 @@ export function buildBankBookCsv(bank: string, period: string, entries: BankBook
 export function buildBankBookRows(bank: string, period: string, entries: BankBookRow[], balances?: { opening: number; closing: number }) {
   const money = (cents: number) => cents ? (cents / 100).toFixed(2) : "";
   const rows: (string | number)[][] = [
-    [`${bank} Book`, "", "", "", "", "", "", "", ""],
+    [`${bank} Statement Book`, "", "", "", "", "", "", "", ""],
     [period, "", "", "", "", "", "", "", ""],
     ["Date", "To/By", "Particulars", "", "", "Vch Type", "Vch No.", "Debit", "Credit"],
   ];
@@ -32,7 +34,7 @@ export function buildBankBookRows(bank: string, period: string, entries: BankBoo
   for (const row of [...entries.filter(r => r.receipt > 0), ...entries.filter(r => r.payment > 0)]) {
     const dr = Math.round(row.receipt * 100), cr = Math.round(row.payment * 100);
     debit += dr; credit += cr;
-    rows.push([row.date, dr ? "To" : "By", row.party, "", "", dr ? "Receipt" : "Payment", row.voucherNumber, money(dr), money(cr)]);
+    rows.push([row.date, dr ? "To" : "By", row.party, "", "", row.voucherType || (dr ? "Receipt" : "Payment"), row.voucherNumber, money(dr), money(cr)]);
   }
   rows.push(["", "", "Total", "", "", "", "", money(debit), money(credit)]);
   if (balances) {
