@@ -4773,24 +4773,27 @@ export function BankStatementsPage() {
           );
         } else {
           const checksOnly = nextStatus.voucherTotal === 0 && nextStatus.paymentCheckTotal > 0;
+          const completionMessage = bankPostingMessage(summarizeBankPostings(nextStatus.commands.filter(
+            command => (command.commandType || command.command_type) === "post_bank_voucher"
+          )));
           setStatementDoneSummary({
             tone: "success",
             title: checksOnly ? "Payment checks completed" : "Entries confirmed in Tally",
             text: checksOnly
               ? `${nextStatus.paymentCheckCompleted} payments checked in Tally.`
-              : `${nextStatus.voucherCompleted} entries posted and confirmed in Tally.`,
+              : completionMessage,
           });
           setBanner({
             tone: "success",
             text: checksOnly
               ? `${nextStatus.paymentCheckCompleted} payments checked in Tally.`
-              : `${nextStatus.voucherCompleted} entries posted and confirmed in Tally.`,
+              : completionMessage,
           });
           showToast(
             "success",
             checksOnly
               ? `${nextStatus.paymentCheckCompleted} payments checked in Tally.`
-              : `${nextStatus.voucherCompleted} entries confirmed in Tally.`
+              : completionMessage
           );
         }
         return nextStatus;
@@ -6798,14 +6801,14 @@ export function BankStatementsPage() {
                 : typeof duplicateCheck?.voucherNumber === "string"
                   ? duplicateCheck.voucherNumber
                   : null;
-              return [[transactionId, voucherNumber] as const];
+              return [[transactionId, voucherNumber, result.alreadyInTally === true] as const];
             });
-            for (const [transactionId, voucherNumber] of connectorVerifiedPosts) {
+            for (const [transactionId, voucherNumber, alreadyInTally] of connectorVerifiedPosts) {
               drafts[transactionId] = {
                 ...drafts[transactionId],
                 status: "found",
-                label: "Confirmed in Tally",
-                reason: "This entry was posted and confirmed in Tally.",
+                label: alreadyInTally ? "Already entered in Tally" : "Confirmed in Tally",
+                reason: alreadyInTally ? "This entry was already in Tally. No new entry was posted." : "This entry was posted and confirmed in Tally.",
                 voucherNumber: voucherNumber ?? drafts[transactionId]?.voucherNumber ?? null,
               };
             }

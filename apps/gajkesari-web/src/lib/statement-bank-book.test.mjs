@@ -45,3 +45,20 @@ test('a statement can be exported before posting without inventing source balanc
   assert.equal(statementBalances([{ ...rows[0], balanceAmount: null }]), undefined);
   assert.equal(statementBalances([{ ...rows[0] }, { ...rows[1], balanceAmount: 4 }]), undefined);
 });
+
+test('reopening a statement keeps manual entries labeled as already entered', () => {
+  const saved = [{ ...postings[0], postingResult: { alreadyInTally: true, created: 0 } }];
+  assert.equal(summarizeSavedPostings(saved).alreadyExisting, 1);
+  const presence = savedPostingPresence([rows[0]], saved);
+  assert.equal(presence['preview-0'].label, 'Already entered in Tally');
+  assert.match(presence['preview-0'].reason, /No new entry was posted/);
+  assert.equal(buildStatementBankBook([rows[0]], saved).length, 1);
+});
+
+test('held manual duplicates explain that nothing was posted', () => {
+  const saved = [{ ...postings[0], postingStatus: 'needs_tally_review',
+    postingResult: { possibleDuplicateInTally: true } }];
+  const presence = savedPostingPresence([rows[0]], saved);
+  assert.equal(presence['preview-0'].status, 'verification_pending');
+  assert.match(presence['preview-0'].reason, /Possible existing entry.*Nothing was posted/);
+});

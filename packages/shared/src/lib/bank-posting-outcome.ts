@@ -27,11 +27,14 @@ export function bankPostingOutcome(command: BankPostingCommand) {
 }
 
 export function summarizeBankPostings(commands: BankPostingCommand[]) {
-  const summary = { total: commands.length, confirmed: 0, needsCheck: 0, failed: 0, pending: 0, accepted: 0 };
+  const summary = { total: commands.length, confirmed: 0, needsCheck: 0, failed: 0, pending: 0, accepted: 0, alreadyExisting: 0 };
   for (const command of commands) {
     const outcome = bankPostingOutcome(command);
     if (outcome.accepted) summary.accepted++;
-    if (outcome.status === "confirmed") summary.confirmed++;
+    if (outcome.status === "confirmed") {
+      summary.confirmed++;
+      if (command.result?.alreadyInTally === true) summary.alreadyExisting++;
+    }
     else if (outcome.status === "needs_check") summary.needsCheck++;
     else if (outcome.status === "failed") summary.failed++;
     else summary.pending++;
@@ -41,7 +44,12 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
 
 export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>) {
   if (summary.pending) return `${summary.confirmed} entries confirmed. Tally is still processing ${summary.pending}.`;
-  if (summary.needsCheck) return `${summary.accepted === summary.total ? `Tally accepted ${summary.total} entries. ` : ""}${summary.confirmed} confirmed; ${summary.needsCheck} ${summary.needsCheck === 1 ? "needs" : "need"} checking.${summary.failed ? ` ${summary.failed} couldn't be posted.` : ""}`;
+  if (summary.needsCheck) return `${summary.accepted === summary.total && summary.alreadyExisting === 0 ? `Tally accepted ${summary.total} entries. ` : ""}${summary.confirmed} confirmed; ${summary.needsCheck} ${summary.needsCheck === 1 ? "needs" : "need"} checking.${summary.failed ? ` ${summary.failed} couldn't be posted.` : ""}`;
   if (summary.failed) return `${summary.confirmed} entries confirmed; ${summary.failed} couldn't be posted.`;
+  if (summary.alreadyExisting === summary.total && summary.total > 0) return `${summary.alreadyExisting} ${summary.alreadyExisting === 1 ? "entry was" : "entries were"} already entered in Tally. No new entries were posted.`;
+  if (summary.alreadyExisting > 0) {
+    const posted = summary.confirmed - summary.alreadyExisting;
+    return `${posted} ${posted === 1 ? "entry" : "entries"} posted and confirmed in Tally. ${summary.alreadyExisting} already entered in Tally; skipped.`;
+  }
   return `${summary.confirmed} entries posted and confirmed in Tally.`;
 }

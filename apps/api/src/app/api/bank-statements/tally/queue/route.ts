@@ -965,6 +965,10 @@ export async function POST(request: Request) {
         );
         const referenceNumber =
           transaction.reference_number || buildVoucherReference(transaction, referenceBankCode);
+        // The voucher tracking reference must not replace the bank's identity
+        // when checking for vouchers that were entered manually.
+        const bankReferenceNumber = transaction.reference_number || null;
+        const referenceSource = bankReferenceNumber ? "bank" : "generated";
         const review = transaction.raw_payload?.review && typeof transaction.raw_payload.review === "object"
           ? transaction.raw_payload.review as Record<string, unknown>
           : {};
@@ -989,6 +993,8 @@ export async function POST(request: Request) {
               amount,
               narration: transaction.description,
               referenceNumber,
+              bankReferenceNumber,
+              referenceSource,
               transactionType: transaction.transaction_type,
               category: transaction.category,
               counterpartyName: transaction.counterparty_name,
@@ -1092,6 +1098,8 @@ export async function POST(request: Request) {
             amount,
             narration: buildVoucherNarration(transaction.description, referenceNumber),
             referenceNumber,
+            bankReferenceNumber,
+            referenceSource,
             transactionType: transaction.transaction_type,
             category: transaction.category,
             counterpartyName: transaction.counterparty_name,
