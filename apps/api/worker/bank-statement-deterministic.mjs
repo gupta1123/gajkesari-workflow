@@ -117,6 +117,9 @@ function parseAmountValue(v) {
 }
 
 const HEADER_PATTERNS = [
+  ["bank reference number", "reference"], ["bank reference no.", "reference"], ["bank reference no", "reference"], ["bank reference", "reference"],
+  ["transaction reference number", "reference"], ["transaction reference no.", "reference"], ["transaction reference", "reference"],
+  ["transaction id", "reference"], ["utr number", "reference"], ["utr no.", "reference"], ["utr no", "reference"], ["utr", "reference"],
   ["transaction date", "date"], ["txn date", "date"], ["post date", "date"], ["posting date", "date"], ["value date", "value_date"], ["date", "date"],
   ["transaction description", "description"], ["description / particulars", "description"], ["transaction details", "description"], ["narration / description", "description"], ["narration", "description"], ["description", "description"], ["particulars", "description"],
   ["reference / utr", "reference"], ["reference no.", "reference"], ["reference no", "reference"], ["reference", "reference"], ["cheque number", "reference"], ["cheque no.", "reference"], ["cheque no", "reference"],
@@ -231,7 +234,8 @@ function normalizeTableTransactions(table, fallbackYear, startIndex) {
     const description = String(row[indexes.description] || "").replace(/\s+/g, " ").trim();
     if (!transactionDate || !description || headerScore(row) >= 3) continue;
     const txnNo = indexes.txnNo >= 0 ? String(row[indexes.txnNo] || "").trim() : "";
-    const reference = indexes.reference >= 0 ? String(row[indexes.reference] || "").trim() : txnNo;
+    const referenceCell = indexes.reference >= 0 ? String(row[indexes.reference] || "").trim() : txnNo;
+    const reference = /^(?:[-\u2013\u2014]+|n\/?a|nil|none)$/i.test(referenceCell) ? "" : referenceCell;
     const balanceCandidates = [];
     if (indexes.balance >= 0) {
       const exactBalance = cellAmounts(row[indexes.balance]).at(-1);

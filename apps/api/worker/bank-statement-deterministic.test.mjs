@@ -3,6 +3,16 @@ import test from "node:test";
 
 import { deterministicTransactionsFromAnydoc } from "./bank-statement-deterministic.mjs";
 
+test('qualified bank reference headings preserve UTRs and numeric identifiers', () => {
+  for (const heading of ['Bank reference', 'Bank Reference No.', 'Bank Reference Number', 'Transaction reference', 'Transaction Reference Number', 'Transaction ID', 'UTR', 'UTR No.']) {
+    const table = `| Date | Transaction description | ${heading} | Debit (INR) | Credit (INR) | Balance (INR) |\n|---|---|---|---|---|---|\n| 08-Oct-26 | Payment to Deccan Sponge and Minerals | UTRAX261009006 | 506.66 | | 1500.00 |\n| 08-Oct-26 | Credit from Suspense | 123261009001 | | 607.77 | 2107.77 |\n| 09-Oct-26 | Bank charges | - | 19.90 | | 2087.87 |`;
+    const rows = deterministicTransactionsFromAnydoc(table).transactions;
+    assert.equal(rows[0].reference_number, 'UTRAX261009006', heading);
+    assert.equal(rows[1].reference_number, '123261009001', heading);
+    assert.equal(rows[2].reference_number, null, heading);
+  }
+});
+
 test("recognizes an AnyDoc table with fused withdrawal and deposit headings", () => {
   const markdown = `
 Account statement-controlled open-bill workflow test 01 Sep 2026

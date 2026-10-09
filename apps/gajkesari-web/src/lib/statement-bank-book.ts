@@ -22,7 +22,8 @@ export type SavedPostingRow = StatementRow & {
 
 export function statementRowKey(row: StatementRow) {
   return JSON.stringify([row.transactionDate, row.referenceNumber || "", row.description || "",
-    Number(row.debitAmount || 0), Number(row.creditAmount || 0)]);
+    Number(row.debitAmount || 0), Number(row.creditAmount || 0),
+    row.balanceAmount == null || row.balanceAmount === "" ? null : Number(row.balanceAmount)]);
 }
 
 export function savedPostingOutcome(row: SavedPostingRow) {
@@ -41,14 +42,15 @@ export function summarizeSavedPostings(rows: SavedPostingRow[]) {
 
 export function savedPostingPresence(rows: Array<StatementRow & { id: string }>, postings: SavedPostingRow[]) {
   const saved = new Map(postings.map(row => [statementRowKey(row), row]));
-  type Presence = { status: "found" | "verification_pending"; label: string; reason: string; voucherNumber: string | null };
+  type Presence = { status: "found" | "verification_pending"; label: string; reason: string; voucherNumber: string | null; alreadyInTally?: boolean };
   return Object.fromEntries(rows.flatMap<[string, Presence]>(row => {
     const posting = saved.get(statementRowKey(row));
     if (!posting) return [];
     const outcome = savedPostingOutcome(posting);
     if (outcome.status === "confirmed") return [[row.id, { status: "found" as const,
       label: posting.postingResult?.alreadyInTally === true ? "Already entered in Tally" : "Confirmed in Tally",
-      reason: posting.postingResult?.alreadyInTally === true ? "This entry was already in Tally. No new entry was posted." : "This entry was confirmed in Tally.", voucherNumber: posting.voucherNumber || null }]];
+      reason: posting.postingResult?.alreadyInTally === true ? "This entry was already in Tally. No new entry was posted." : "This entry was confirmed in Tally.", voucherNumber: posting.voucherNumber || null,
+      alreadyInTally: posting.postingResult?.alreadyInTally === true }]];
     if (outcome.status === "needs_check") return [[row.id, { status: "verification_pending" as const, label: "Needs checking in Tally",
       reason: posting.postingResult?.possibleDuplicateInTally === true ? "Possible existing entry in Tally. Nothing was posted for this row. Please review."
         : outcome.accepted ? "Tally accepted the entries, but this entry still needs checking. Do not send it again." : "We couldn't confirm this entry in Tally. Check again before sending it again.", voucherNumber: null }]];

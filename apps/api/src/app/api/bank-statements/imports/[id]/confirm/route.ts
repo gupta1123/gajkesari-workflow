@@ -437,6 +437,30 @@ export async function POST(
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const importProcessingMeta = readRecord(importRow.processing_meta);
     const extractionDiagnostics = readRecord(importProcessingMeta.extractionDiagnostics);
+    // Hold conflicting references per row. Do not rely on the browser retaining
+    // the source identity metadata when it submits the reviewed statement.
+    if (Number(readRecord(extractionDiagnostics.referenceValidation).needsReview || 0) > 0) {
+      const sourceRows: Array<Record<string, unknown>> = [];
+      for (let offset = 0; ; offset += 1000) {
+        const { data, error } = await supabase.from("bank_statement_import_preview_transactions")
+          .select("transaction_date,description,debit_amount,credit_amount,balance_amount,raw_payload")
+          .eq("import_id", id).eq("owner_user_id", user.id).order("row_index")
+          .range(offset, offset + 999);
+        if (error) throw error;
+        sourceRows.push(...(data || []));
+        if ((data || []).length < 1000) break;
+      }
+      for (const transaction of transactions) {
+        const matches = sourceRows.filter(row => row.transaction_date === transaction.transactionDate &&
+          row.description === transaction.description && Number(row.debit_amount || 0) === Number(transaction.debitAmount || 0) &&
+          Number(row.credit_amount || 0) === Number(transaction.creditAmount || 0) && Number(row.balance_amount) === Number(transaction.balanceAmount));
+        if (matches.length === 1) {
+          const source = readRecord(matches[0].raw_payload);
+          if (source.sourceBankReference) transaction.rawPayload = { ...transaction.rawPayload,
+            sourceBankReference: source.sourceBankReference, referenceNeedsReview: source.referenceNeedsReview };
+        }
+      }
+    }
     const extractionIncomplete = isBankStatementExtractionIncomplete({
       effectiveImportStatus,
       processing: effectiveImportStatus === "processing",

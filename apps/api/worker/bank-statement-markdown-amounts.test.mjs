@@ -5,7 +5,24 @@ import {
   extractBankStatementMarkdownAmounts,
   parseBankStatementMoney,
   reconcileBankStatementMarkdownAmounts,
+  restoreSourceBankReferences,
 } from "./bank-statement-markdown-amounts.mjs";
+
+test('source references are recovered per complete row without collapsing repeated amounts', () => {
+  const source = extractBankStatementMarkdownAmounts(`| Date | Description | Bank reference | Debit | Credit | Balance |\n|---|---|---|---|---|---|\n| 08-Oct-26 | Credit from Arvind | UTRAX261009003 | | 303.33 | 1303.33 |\n| 08-Oct-26 | Credit from Arvind | UTRAX261009103 | | 303.33 | 1606.66 |\n| 08-Oct-26 | Credit from Arvind | - | | 303.33 | 1909.99 |`).rows;
+  const transactions = source.map(row => ({ transaction_date: '2026-10-08', description: row.narration,
+    reference_number: null, debit_amount: null, credit_amount: 303.33, balance_amount: row.balanceAmount }));
+  const result = restoreSourceBankReferences(transactions, source);
+  assert.deepEqual(result.transactions.map(row => row.reference_number), ['UTRAX261009003', 'UTRAX261009103', null]);
+  assert.deepEqual(result.diagnostics, { recovered: 2, needsReview: 0 });
+  assert.deepEqual(result.transactions.map(row => row.balance_amount), [1303.33, 1606.66, 1909.99]);
+  transactions[0].reference_number = 'WRONG123';
+  const conflict = restoreSourceBankReferences(transactions, source);
+  assert.equal(conflict.transactions[0].reference_number, 'WRONG123');
+  assert.equal(conflict.transactions[0].raw_payload.sourceBankReference, 'UTRAX261009003');
+  assert.equal(conflict.transactions[0].raw_payload.referenceNeedsReview, true);
+  assert.equal(conflict.diagnostics.needsReview, 1);
+});
 
 test("parses Indian-grouped statement amounts without changing magnitude", () => {
   assert.equal(parseBankStatementMoney("5,00,20,000.00"), 50020000);

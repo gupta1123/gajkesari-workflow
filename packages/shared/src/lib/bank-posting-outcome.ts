@@ -43,9 +43,10 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
 }
 
 export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>) {
-  if (summary.pending) return `${summary.confirmed} entries confirmed. Tally is still processing ${summary.pending}.`;
-  if (summary.needsCheck) return `${summary.accepted === summary.total && summary.alreadyExisting === 0 ? `Tally accepted ${summary.total} entries. ` : ""}${summary.confirmed} confirmed; ${summary.needsCheck} ${summary.needsCheck === 1 ? "needs" : "need"} checking.${summary.failed ? ` ${summary.failed} couldn't be posted.` : ""}`;
-  if (summary.failed) return `${summary.confirmed} entries confirmed; ${summary.failed} couldn't be posted.`;
+  const progress = `${summary.confirmed - summary.alreadyExisting} newly posted; ${summary.alreadyExisting} already entered in Tally; ${summary.needsCheck} need review`;
+  if (summary.pending) return `${progress}. ${summary.pending} still processing.${summary.failed ? ` ${summary.failed} couldn't be posted.` : ""}`;
+  if (summary.needsCheck) return `${progress}.${summary.failed ? ` ${summary.failed} couldn't be posted.` : ""}`;
+  if (summary.failed) return `${progress}. ${summary.failed} couldn't be posted.`;
   if (summary.alreadyExisting === summary.total && summary.total > 0) return `${summary.alreadyExisting} ${summary.alreadyExisting === 1 ? "entry was" : "entries were"} already entered in Tally. No new entries were posted.`;
   if (summary.alreadyExisting > 0) {
     const posted = summary.confirmed - summary.alreadyExisting;

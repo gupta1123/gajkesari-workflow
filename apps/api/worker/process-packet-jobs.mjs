@@ -28,7 +28,7 @@ import {
   correctRowsFromRunningBalance,
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
-import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts } from "./bank-statement-markdown-amounts.mjs";
+import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts, restoreSourceBankReferences } from "./bank-statement-markdown-amounts.mjs";
 import { auditSourceCoverage, recoverSourceCoverage, sourceDate } from "./bank-statement-source-coverage.mjs";
 import { readBankStatementPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
@@ -1705,10 +1705,32 @@ async function extractBankStatementAdaptive({
         hasUsableBankStatementText(markdownPages)
       ) {
         // --- DETERMINISTIC FAST PATH: no LLM for table, use parseAllTables (handles PNB fused header + multipage) ---
-        const deterministic = deterministicTransactionsFromAnydoc(anydocResult.markdownText);
+        let deterministic = deterministicTransactionsFromAnydoc(anydocResult.markdownText);
+        const initialSource = extractBankStatementMarkdownAmounts(anydocResult.markdownText);
+        if (deterministic?.transactions?.length &&
+          validateRunningBalanceContinuity(deterministic.transactions, initialSource.openingBalance).status === "failed") {
+          const physical = await readBankStatementPhysicalColumns(bytes, PDFJS_WORKER_SRC, BANK_STATEMENT_MAX_TOTAL_PAGES);
+          const identity = (date, description, reference) => JSON.stringify([sourceDate(date),
+            String(description || '').toLowerCase().replace(/\s+/g, ' ').trim(),
+            String(reference || '').toUpperCase().replace(/[^A-Z0-9]/g, '')]);
+          const sourceIdentities = deterministic.transactions.filter(row => !/^(?:opening balance|closing balance)$/i.test(row.description))
+            .map(row => identity(row.transaction_date, row.description, row.reference_number)).sort();
+          const physicalIdentities = physical.rows.map(row => identity(row.sourceDate, row.narration, row.reference)).sort();
+          if (physical.detected && JSON.stringify(sourceIdentities) === JSON.stringify(physicalIdentities)) {
+            deterministic = { headers: [`physical:${physical.layout}`], transactions: physical.rows.map((row, index) => ({
+              transaction_date: sourceDate(row.sourceDate), value_date: sourceDate(row.sourceDate), description: row.narration,
+              reference_number: row.reference || null, debit_amount: row.debitAmount, credit_amount: row.creditAmount,
+              balance_amount: row.balanceAmount, category: row.creditAmount > 0 ? "receipt" : "payment", transaction_type: "unknown",
+              raw_payload: { rowNumber: index + 1, source: "physical_pdf_columns", extractionProvenance: { startPage: row.page, endPage: row.page, sourceIndex: index, method: "physical_pdf_columns" } }
+            })) };
+            diagnostics.anydoc.physicalColumns = { layout: physical.layout, rowCount: physical.rows.length };
+          }
+        }
         if (deterministic && deterministic.transactions.length > 0) {
           const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
           const deterministicSource = extractBankStatementMarkdownAmounts(anydocResult.markdownText);
+          const referenceCheck = restoreSourceBankReferences(deterministic.transactions, deterministicSource.rows);
+          deterministic.transactions = referenceCheck.transactions;
           const deterministicBalance = validateRunningBalanceContinuity(
             deterministic.transactions,
             deterministicSource.openingBalance,
@@ -1717,6 +1739,7 @@ async function extractBankStatementAdaptive({
             rowCount: deterministic.transactions.length,
             headers: deterministic.headers,
             normalized: true,
+            referenceValidation: referenceCheck.diagnostics,
             balanceValidation: deterministicBalance,
             used: deterministicBalance.status !== "failed",
           };
@@ -1820,6 +1843,10 @@ async function extractBankStatementAdaptive({
           };
         }
         parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
+        const sourceReferences = restoreSourceBankReferences(parsed.transactions,
+          physicalColumns?.rows || extractBankStatementMarkdownAmounts(anydocResult.markdownText).rows);
+        parsed.transactions = sourceReferences.transactions;
+        diagnostics.anydoc.referenceValidation = sourceReferences.diagnostics;
         diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
         let coverageComplete = Boolean(physicalColumns);
         if (BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED && physicalColumns && physicalColumns.layout !== 'pnb') {
@@ -1883,6 +1910,9 @@ async function extractBankStatementAdaptive({
             extractedRowCount: parsed.transactions.length,
           };
         }
+        const finalReferences = restoreSourceBankReferences(parsed.transactions,
+          physicalColumns?.rows || extractBankStatementMarkdownAmounts(anydocResult.markdownText).rows);
+        parsed.transactions = finalReferences.transactions;
         parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
         diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
         if (parsed.transactions.length > 0 || !coverageComplete) {
@@ -2271,7 +2301,7 @@ async function addBankLedgerRecommendations({
   });
 }
 
-function connectorVersionAtLeast(value, minimum = [0, 1, 69]) {
+function connectorVersionAtLeast(value, minimum = [0, 1, 78]) {
   const match = String(value || "").trim().match(/^(\d+)\.(\d+)\.(\d+)/);
   if (!match) return false;
   const actual = match.slice(1).map(Number);
@@ -2394,12 +2424,18 @@ async function waitForConnectorPreprocessCommand({ commandId, ownerUserId, prequ
   while (Date.now() < deadline) {
     const { data: current, error: pollError } = await supabase
       .from("tally_bridge_commands")
-      .select("status, result, error")
+      .select("status, result, error, bridge_version")
       .eq("id", commandId)
       .eq("owner_user_id", ownerUserId)
       .maybeSingle();
     if (pollError) throw pollError;
+    if (current?.bridge_version && !connectorVersionAtLeast(current.bridge_version)) {
+      return { used: false, reason: "connector_update_required" };
+    }
     if (current?.status === "succeeded") {
+      if (!connectorVersionAtLeast(current.bridge_version)) {
+        return { used: false, reason: "connector_update_required" };
+      }
       const result = current.result && typeof current.result === "object" && !Array.isArray(current.result)
         ? current.result
         : null;
@@ -2721,6 +2757,9 @@ async function runBankStatementJob(job) {
   const extractionSource = extraction.extractionSource;
   let extractionError = extraction.extractionError;
   const extractionDiagnostics = extraction.diagnostics;
+  extractionDiagnostics.referenceValidation = {
+    needsReview: parsed.transactions.filter(row => row.raw_payload?.referenceNeedsReview === true).length,
+  };
   extractionDiagnostics.extractionMs = Date.now() - workerStartedAt;
   const balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
   extractionDiagnostics.balanceValidation = balanceValidation;

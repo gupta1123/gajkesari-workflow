@@ -5,6 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import { parseDocumentLocal, processBankStatementMarkdownLocal } from "./parser.mjs";
 
+test('Bank reference preserves cross-date UTR and numeric Suspense identity in normalized connector output', async () => {
+ const markdown = `Opening balance 1000.00\n| Date | Transaction description | Bank reference | Debit (INR) | Credit (INR) | Balance (INR) |\n|---|---|---|---|---|---|\n|08-Oct-26|Payment to Deccan Sponge and Minerals|UTRAX261009006|506.66||493.34|\n|08-Oct-26|Credit from Suspense|123261009001||607.77|1101.11|`;
+ const result = await processBankStatementMarkdownLocal(markdown);
+ assert.deepEqual(result.parsed.transactions.map(row => row.reference_number), ['UTRAX261009006','123261009001']);
+ assert.equal(result.parsed.transactions[0].raw_payload.sourceBankReference, 'UTRAX261009006');
+ assert.equal(result.diagnostics.balanceValidation.status, 'verified');
+});
+
 test("parses CSV to Markdown by default", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-anydoc-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

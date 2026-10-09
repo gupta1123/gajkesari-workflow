@@ -5,6 +5,18 @@ import {buildBankVoucherXml} from '../../tally-bridge/src/bridge.mjs';
 const item=(str,x,y,width=40)=>({str,width,transform:[1,0,0,1,x,y]});
 const headers=[item('Txn No.',80,700),item('Txn Date',180,700),item('Description',380,700),item('Dr Amount',680,700),item('Cr Amount',780,700),item('Balance',880,700)];
 const row=(ref,y,debit,credit,balance)=>[item(ref,65,y,70),item('03-09-2026',165,y,70),item(`Narration ${ref}`,350,y,180),...(debit?[item(debit,660,y,85)]:[]),...(credit?[item(credit,760,y,85)]:[]),item(balance,860,y,85)];
+
+test('currency headings, month-name dates and bank reference columns survive sparse continuation pages', () => {
+ const head=[item('Date',47,790,17),item('Transaction description',98,790,90),item('Bank reference',244,790,58),item('Debit (INR)',348,790,41),item('Credit (INR)',418,790,44),item('Balance (INR)',488,790,52)];
+ const rows=[item('09-Oct-26',47,765,32),item('Bank commission / service charge',98,764,121),item('-',244,765,2),item('20.05',389,765,19),item('1362428.17',516,765,44),
+ item('09-Oct-26',47,740,32),item('Credit from Suspense',98,739,78),item('123261009018',244,740,48),item('50.01',459,740,19),item('1362478.18',516,740,44),
+ item('Transactions: 2 | Total debit',42,705,170)];
+ const physical=extractBankStatementPhysicalColumns([{pageNumber:2,width:595,items:[...head,...rows]}]);
+ assert.deepEqual(physical.rows.map(row=>[row.reference,row.sourceDate,row.narration,row.debitAmount,row.creditAmount,row.balanceAmount]),[
+  ['', '09-Oct-26', 'Bank commission / service charge',20.05,null,1362428.17],
+  ['123261009018','09-Oct-26','Credit from Suspense',null,50.01,1362478.18]
+ ]);
+});
 test('headerless continuation preserves physical columns and wrapped decimals through XML',()=>{
  const pages=[{pageNumber:1,width:1000,items:[...headers,...row('T123456',600,'20,98,696.00',null,'9,65,64,682.49Dr.')]},
  {pageNumber:2,width:1000,items:[...row('T29161971',1100,null,null,'9,44,65,986.49Dr.'),item('1,00,00,000.0',660,1108,85),item('0',737,1092,8),...row('T24969455',1020,null,'2,50,000.00','8,44,65,986.49Dr.')]}];

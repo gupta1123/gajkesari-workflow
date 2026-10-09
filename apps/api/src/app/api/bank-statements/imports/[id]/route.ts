@@ -341,7 +341,7 @@ export async function GET(
 
     const { data: postedRows, error: postedRowsError } = await supabase
       .from("bank_transactions")
-      .select("id,fingerprint,transaction_date,description,reference_number,debit_amount,credit_amount,confirmed_ledger_name,suggested_ledger_name,tally_voucher_id,tally_posted_at,tally_status")
+      .select("id,fingerprint,transaction_date,description,reference_number,debit_amount,credit_amount,balance_amount,confirmed_ledger_name,suggested_ledger_name,tally_voucher_id,tally_posted_at,tally_status")
       .eq("statement_import_id", id)
       .eq("owner_user_id", user.id)
       .eq("company_dataset_id", importRow.company_dataset_id)
@@ -372,6 +372,7 @@ export async function GET(
         referenceNumber: row.reference_number ? String(row.reference_number) : null,
         debitAmount: row.debit_amount ?? null,
         creditAmount: row.credit_amount ?? null,
+        balanceAmount: row.balance_amount ?? null,
         ledgerName: String(row.confirmed_ledger_name ?? row.suggested_ledger_name ?? "").trim(),
         voucherNumber: row.tally_status === "verified" ? readPostedVoucherNumber(log?.result) : "",
         postedAt: log?.tally_posted_at ?? row.tally_posted_at ?? null,

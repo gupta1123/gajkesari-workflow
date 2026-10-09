@@ -171,8 +171,12 @@ function approximatePdfPageCount(bytes) {
 }
 
 function physicalDate(value) {
-  const match = String(value || "").match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
-  return match ? `${match[3]}-${match[2].padStart(2, "0")}-${match[1].padStart(2, "0")}` : null;
+  const match = String(value || "").match(/^(\d{1,2})[-/ ](\d{1,2}|[A-Za-z]{3})[-/ ](\d{2,4})/);
+  if (!match) return null;
+  const month = /^[A-Za-z]/.test(match[2])
+    ? String(['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(match[2].toLowerCase()) + 1)
+    : match[2];
+  return `${match[3].length === 2 ? '20' : ''}${match[3]}-${month.padStart(2, '0')}-${match[1].padStart(2, '0')}`;
 }
 
 function transactionsFromPhysicalRows(rows) {
@@ -228,11 +232,27 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
     throw error;
   }
   const source = amounts.extractBankStatementMarkdownAmounts(markdown);
+  const references = amounts.restoreSourceBankReferences(normalized.transactions, source.rows);
+  normalized.transactions = references.transactions;
   const accountFromMarkdown = account.extractAccountFromBankStatementMarkdown(markdown);
-  const balanceValidation = runningBalance.validateRunningBalanceContinuity(
+  let balanceValidation = runningBalance.validateRunningBalanceContinuity(
     normalized.transactions,
     source.openingBalance,
   );
+  if (balanceValidation.status === "failed" && pdfBytes && !physical) {
+    physical = await pdfColumns.readBankStatementPhysicalColumns(pdfBytes);
+    const identity = (date, description, reference) => JSON.stringify([date,
+      String(description || '').toLowerCase().replace(/\s+/g, ' ').trim(),
+      String(reference || '').toUpperCase().replace(/[^A-Z0-9]/g, '')]);
+    const sourceIdentities = normalized.transactions.filter(row => !/^(?:opening balance|closing balance)$/i.test(row.description))
+      .map(row => identity(row.transaction_date, row.description, row.reference_number)).sort();
+    const physicalIdentities = physical.rows.map(row => identity(physicalDate(row.sourceDate), row.narration, row.reference)).sort();
+    if (physical.detected && physical.rows.length && JSON.stringify(sourceIdentities) === JSON.stringify(physicalIdentities)) {
+      normalized.transactions = transactionsFromPhysicalRows(physical.rows);
+      pipeline = "physical_pdf_columns";
+      balanceValidation = runningBalance.validateRunningBalanceContinuity(normalized.transactions, source.openingBalance);
+    }
+  }
   if (balanceValidation.status === "failed") {
     const error = new Error(`Running-balance validation failed at ${balanceValidation.breaks.length} transaction${balanceValidation.breaks.length === 1 ? "" : "s"}.`);
     error.code = "running_balance_failed";
@@ -260,6 +280,7 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
       rowCount: normalized.transactions.length,
       headers: normalized.headers,
       normalized: true,
+      referenceValidation: references.diagnostics,
       balanceValidation,
       used: true,
     },

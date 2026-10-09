@@ -79,9 +79,10 @@ function detectPnbLayout(items, page) {
 function detectCentralBankLayout(items, page) {
   const postDate = header(items, "post date", "posting date", "transaction date", "txn date", "date");
   const valueDate = header(items, "value", "value date");
-  const debit = header(items, "debit", "dr amount", "withdrawal", "paid out");
-  const credit = header(items, "credit", "cr amount", "deposit", "paid in");
-  const balance = header(items, "balance");
+  const debit = header(items, "debit", "debit (inr)", "dr amount", "withdrawal", "paid out");
+  const credit = header(items, "credit", "credit (inr)", "cr amount", "deposit", "paid in");
+  const balance = header(items, "balance", "balance (inr)");
+  const reference = header(items, "bank reference", "reference", "reference no.", "utr");
   const description = header(items, "transaction description", "description", "particular", "particulars", "narration", "details");
   if (!postDate || !debit || !credit || !balance || !description) return null;
   const headerY = [postDate, debit, credit, balance, description].map((item) => item.y);
@@ -92,6 +93,8 @@ function detectCentralBankLayout(items, page) {
     postDate: center(postDate),
     valueDate: valueDate ? center(valueDate) : null,
     description: center(description),
+    reference: reference ? center(reference) : null,
+    descriptionRight: reference ? reference.x - 4 : null,
     debit: center(debit),
     credit: center(credit),
     balance: center(balance),
@@ -151,7 +154,7 @@ function extractPnbRows(items, page, layout) {
 
 function extractCentralBankRows(items, page, layout) {
   const dates = items
-    .filter((item) => /^\d{2}\/\d{2}\/\d{4}$/.test(item.text) && Math.abs(center(item) - layout.postDate) < 28)
+    .filter((item) => /^(?:\d{2}[-/]\d{2}[-/]\d{4}|\d{1,2}[- ][A-Za-z]{3}[- ]\d{2,4})$/.test(item.text) && Math.abs(center(item) - layout.postDate) < 28)
     .sort((left, right) => right.y - left.y);
   const debitCreditBoundary = (layout.debit + layout.credit) / 2;
   const creditBalanceBoundary = (layout.credit + layout.balance) / 2;
@@ -167,18 +170,21 @@ function extractCentralBankRows(items, page, layout) {
       layout.valueDate
         ? (layout.valueDate + layout.description) / 2
         : (layout.postDate + layout.description) / 2,
-      layout.debit - 20,
-      bounds
+      layout.descriptionRight ?? layout.debit - 20,
+      layout.reference ? { ...bounds, bottom: Math.max(bounds.bottom, dates[index].y - 20) } : bounds
     )
       .sort((left, right) => right.y - left.y || left.x - right.x)
       .map((item) => item.text)
       .join(" ")
       .trim();
+    if (!debitAmount && !creditAmount && /^(?:opening balance|closing balance)$/i.test(narration)) continue;
     if (Number(debitAmount > 0) + Number(creditAmount > 0) !== 1 || balanceAmount === null) {
       throw new Error("Central Bank transaction columns are incomplete");
     }
     rows.push({
-      reference: "",
+      reference: layout.reference ? items.filter(item => Math.abs(item.y - dates[index].y) < 4 &&
+        center(item) > layout.descriptionRight && center(item) < layout.debit - 20)
+        .sort((left, right) => left.x - right.x).map(item => item.text).join('').replace(/^[-–—]+$/, '') : "",
       sourceDate: dates[index].text,
       narration,
       debitAmount,

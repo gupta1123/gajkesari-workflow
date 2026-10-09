@@ -952,7 +952,7 @@ test("statement reconciliation reads manual entries and a bounded amount-filtere
   );
 
   assert.equal(calls.length, 2);
-  assert.match(calls[0].fetchFields, /BankAllocations/);
+  assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.\*/);
   assert.equal(calls[0].tallyType, "Vouchers : Ledger");
   assert.equal(calls[0].childOf, '"ICICI Current Account"');
   assert.equal(calls[0].dateFrom, "2026-08-01");
@@ -996,7 +996,7 @@ test("statement reconciliation reads bank allocations from the primary export", 
   );
 
   assert.equal(calls.length, 2);
-  assert.match(calls[0].fetchFields, /BankAllocations/);
+  assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.\*/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 0);
   assert.equal(outcome.result.queryDiagnostics.primaryIncludesBankReferences, true);

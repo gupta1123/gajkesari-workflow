@@ -26,9 +26,10 @@ function normalizedDate(value) {
   let year; let month; let day;
   if (match) [, year, month, day] = match;
   else {
-    match = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
+    match = text.match(/^(\d{1,2})[-/ ](\d{1,2}|[A-Za-z]{3})[-/ ](\d{2,4})/);
     if (!match) return null;
     [, day, month, year] = match;
+    if (/^[A-Za-z]/.test(month)) month = String(['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(month.toLowerCase()) + 1);
     if (year.length === 2) year = `20${year}`;
   }
   const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
@@ -97,7 +98,7 @@ export function extractBankStatementMarkdownAmounts(markdown, { includeSourceDet
     if (!headerCells || !isSeparatorRow(separatorCells) || separatorCells.length !== headerCells.length) continue;
 
     const headers = headerCells.map(normalizedHeader);
-    const referenceIndex = columnIndex(headers, [/^reference(?: no| number)?$/, /^ref(?: no| number)?$/, /^txn no$/, /\butr\b/, /cheque|check|chq/]);
+    const referenceIndex = columnIndex(headers, [/^(?:(?:bank|transaction|txn) )?(?:reference|ref)(?: no| number)?$/, /^(?:transaction|txn) id$/, /^txn no$/, /\butr\b/, /cheque|check|chq/]);
     // Merged headings are not reliable amount columns (e.g. Cheque No. Dr Amount).
     const debitIndex = columnIndex(headers, [/^dr amount$/, /\bdebit\b/, /withdrawal/, /paid out/]);
     const creditIndex = columnIndex(headers, [/^cr amount$/, /\bcredit\b/, /deposit/, /paid in/]);
@@ -144,6 +145,38 @@ export function extractBankStatementMarkdownAmounts(markdown, { includeSourceDet
   }
 
   return { openingBalance: extractOpeningBalance(markdown), rows };
+}
+
+// Identity is read independently from the source table. Match full row evidence,
+// including its running balance, before recovering a missing bank reference.
+export function restoreSourceBankReferences(transactions, sourceRows) {
+  const key = (date, description, debit, credit, balance) => JSON.stringify([
+    normalizedDate(date), normalizedNarration(description),
+    Math.round(Number(debit || 0) * 100), Math.round(Number(credit || 0) * 100),
+    balance == null ? null : Math.round(Number(balance) * 100),
+  ]);
+  const buckets = new Map();
+  for (const row of sourceRows) {
+    if (!normalizedDate(row.sourceDate) || !normalizedNarration(row.narration)) continue;
+    const id = key(row.sourceDate, row.narration, row.debitAmount, row.creditAmount, row.balanceAmount);
+    const matches = buckets.get(id) || []; matches.push(row); buckets.set(id, matches);
+  }
+  let recovered = 0, needsReview = 0;
+  const rows = transactions.map(transaction => {
+    const matches = buckets.get(key(transaction.transaction_date, transaction.description,
+      transaction.debit_amount, transaction.credit_amount, transaction.balance_amount));
+    const source = matches?.shift();
+    if (!source?.reference) return transaction;
+    const extracted = normalizedReference(transaction.reference_number);
+    const sourceReference = normalizedReference(source.reference);
+    const issue = Boolean(extracted && extracted !== sourceReference);
+    if (issue) needsReview++;
+    else if (!extracted) recovered++;
+    return { ...transaction, reference_number: extracted ? transaction.reference_number : source.reference,
+      raw_payload: { ...transaction.raw_payload, sourceBankReference: source.reference,
+        referenceNeedsReview: issue } };
+  });
+  return { transactions: rows, diagnostics: { recovered, needsReview } };
 }
 
 function sameNullableMoney(left, right) {

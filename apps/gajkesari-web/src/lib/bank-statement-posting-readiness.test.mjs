@@ -96,6 +96,7 @@ test("Suspense receipt badge does not report a missing ledger", async () => {
 });
 
 test("an explicit Suspense fallback stays postable when close-match alternatives exist", async () => {
+  const { bankChargeNeedsReview, isBankChargeDescription } = await import('@gajkesari/shared/lib/bank-charge-ledger');
   const page = await readFile(new URL("../components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
   const ast = ts.createSourceFile("page.tsx", page, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const helper = ast.statements.find((node) =>
@@ -104,6 +105,8 @@ test("an explicit Suspense fallback stays postable when close-match alternatives
   assert.ok(helper);
   const stubs = `
     const isSuspenseLedgerName = name => String(name).toLowerCase().includes('suspense');
+    ${isBankChargeDescription.toString()}
+    ${bankChargeNeedsReview.toString()}
   `;
   const compiled = ts.transpileModule(stubs + "export " + helper.getText(ast), {
     compilerOptions: { module: ts.ModuleKind.ESNext },
@@ -123,6 +126,10 @@ test("an explicit Suspense fallback stays postable when close-match alternatives
     requiresUserConfirmation: true,
     candidateLedgerNames: ["NACH DR Administrative Expenses"],
   }), "needs_review");
+  assert.equal(getReviewStatus({ description: 'Bank charges', selectedLedgerName: 'Suspense', ledgerAction: 'use_suspense' }), 'needs_review');
+  assert.equal(getReviewStatus({ description: 'Bank charges', selectedLedgerName: 'Suspense', ledgerAction: 'use_suspense', ledgerSelectionTouched: true }), 'suspense');
+  assert.equal(getReviewStatus({ description: 'Receipt', selectedLedgerName: 'Customer', ledgerAction: 'use_existing_ledger', referenceNeedsReview: true, referenceNumber: 'WRONG', sourceBankReference: 'UTR123' }), 'needs_review');
+  assert.equal(getReviewStatus({ description: 'Receipt', selectedLedgerName: 'Customer', ledgerAction: 'use_existing_ledger', referenceNeedsReview: true, referenceNumber: 'UTR-123', sourceBankReference: 'UTR123' }), 'matched');
 });
 
 test("close-match Suspense and plain Suspense have distinct labels and colors", async () => {

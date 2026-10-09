@@ -31,6 +31,7 @@ import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import { apiFetch } from "@/lib/api-client";
 import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { bankPostingOutcome, bankPostingMessage, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
+import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
 import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings } from "@/lib/statement-bank-book";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
@@ -275,6 +276,8 @@ type PreviewTransaction = {
   suggestionReason?: string | null;
   confirmedLedgerName?: string | null;
   rawPayload?: {
+    referenceNeedsReview?: boolean;
+    sourceBankReference?: string;
     aiLedgerRecommendation?: LedgerRecommendation | null;
     vectorLedgerCandidates?: Array<{
       ledgerName?: string | null;
@@ -312,6 +315,7 @@ type PostedBankBookTransaction = {
   referenceNumber?: string | null;
   debitAmount?: string | number | null;
   creditAmount?: string | number | null;
+  balanceAmount?: string | number | null;
   ledgerName?: string | null;
   voucherNumber?: string | null;
   postedAt?: string | null;
@@ -322,6 +326,8 @@ type PostedBankBookTransaction = {
 };
 
 type ReviewTransaction = {
+  referenceNeedsReview?: boolean;
+  sourceBankReference?: string;
   id: string;
   transactionDate: string;
   valueDate: string;
@@ -638,6 +644,7 @@ type OutgoingMatchCandidate = {
 };
 
 type OutgoingVerificationDraft = {
+  alreadyInTally?: boolean;
   status:
     | "verification_pending"
     | "not_checked"
@@ -1072,21 +1079,23 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     transaction.counterpartyName,
     transaction.description
   );
-  const standardLedger = aiVetoesDerivedAutoMatch
+  const bankChargeLedger = resolveBankChargeLedger(transaction.description || "", ledgerMasters);
+  const unresolvedBankCharge = isBankChargeDescription(transaction.description || "") && !bankChargeLedger && !confirmedLedger;
+  const standardLedger = bankChargeLedger || (aiVetoesDerivedAutoMatch
     ? null
-    : findLedgerByNormalizedName(ledgerMasters, standardLedgerNameForTransaction(transaction));
+    : findLedgerByNormalizedName(ledgerMasters, standardLedgerNameForTransaction(transaction)));
   const matchedLedger = aiVetoesDerivedAutoMatch
     ? null
     : findLedgerByCandidates(ledgerMasters, ledgerCandidates);
   const candidateLedgerNames = isAiCloseMatch ? aiCandidateLedgerNames : [];
   const hasCloseMatchCandidates = candidateLedgerNames.length >= 1;
   const reviewSuggestedLedgerName = hasCloseMatchCandidates ? "" : recommendedLedgerName;
-  const selectedLedgerName = confirmedMappedLedger?.name ||
+  const selectedLedgerName = unresolvedBankCharge ? "" : confirmedMappedLedger?.name ||
     standardLedger?.name ||
     matchedLedger?.name ||
     confirmedSuspenseLedger?.name ||
     (recommendationUnavailable ? "" : suspenseName);
-  const ledgerAction: LedgerRecommendationAction = confirmedMappedLedger
+  const ledgerAction: LedgerRecommendationAction = unresolvedBankCharge ? "needs_review" : confirmedMappedLedger
     ? "use_existing_ledger"
     : standardLedger
     ? "use_standard_ledger"
@@ -1100,6 +1109,8 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
 
   return {
     id: transaction.id || crypto.randomUUID(),
+    referenceNeedsReview: transaction.rawPayload?.referenceNeedsReview === true,
+    sourceBankReference: transaction.rawPayload?.sourceBankReference,
     transactionDate: transaction.transactionDate || "",
     valueDate: transaction.valueDate || transaction.transactionDate || "",
     description: transaction.description || "",
@@ -1128,11 +1139,11 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
         : recommendation?.reason || transaction.suggestionReason || "",
-    candidateLedgerNames,
+    candidateLedgerNames: bankChargeLedger ? [] : candidateLedgerNames,
     selectedLedgerName,
     ledgerAction,
     ledgerGroup: recommendation?.ledgerGroup || "",
-    requiresUserConfirmation: hasCloseMatchCandidates,
+    requiresUserConfirmation: hasCloseMatchCandidates && !bankChargeLedger,
     ledgerSelectionTouched: false,
   };
 }
@@ -2145,16 +2156,18 @@ function CurrencyAmountInput({
 }
 
 function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
+  const referenceConflict = transaction.referenceNeedsReview &&
+    String(transaction.referenceNumber || "").toUpperCase().replace(/[^A-Z0-9]/g, "") !==
+    String(transaction.sourceBankReference || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (referenceConflict || transaction.ledgerAction === "needs_review" ||
+    bankChargeNeedsReview(transaction.description, transaction.selectedLedgerName, transaction.ledgerSelectionTouched === true)) return "needs_review";
   // Suspense is a deliberate, postable fallback. Close-match candidates are
   // still shown to the user, but their presence must not turn an explicitly
   // selected Suspense ledger into a blocking review state.
   if (transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)) {
     return "suspense";
   }
-  if (
-    transaction.requiresUserConfirmation ||
-    (transaction.ledgerAction === "needs_review" && transaction.candidateLedgerNames.length > 0)
-  ) {
+  if (transaction.requiresUserConfirmation) {
     return "needs_review";
   }
   if (
@@ -2174,7 +2187,7 @@ function getReviewStatusLabel(transaction: ReviewTransaction) {
       ? "Close match · defaults to Suspense"
       : "In Suspense";
   }
-  return "Close match";
+  return "Review required";
 }
 
 function getReviewStatusDotClass(transaction: ReviewTransaction) {
@@ -4001,12 +4014,12 @@ export function BankStatementsPage() {
     setStatementDoneSummary(null);
     const unmatchedRows = rows.filter(row => !saved.some(posting => statementRowKey(posting) === statementRowKey(row))).length;
     if (summary.pending > 0 || unmatchedRows > 0) {
-      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${summary.confirmed} entries confirmed${summary.needsCheck ? `; ${summary.needsCheck} needs checking` : ""}. ${summary.pending + unmatchedRows} statement entries remain to be sent.` });
+      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary)} ${summary.pending + unmatchedRows} statement entries remain to be sent.` });
       return;
     }
     if (summary.confirmed || summary.needsCheck || summary.failed) {
       const tone = summary.failed ? "error" : summary.needsCheck || summary.pending ? "info" : "success";
-      setStatementDoneSummary({ tone, title: summary.needsCheck ? "Your entries were sent to Tally" : summary.failed ? "Some entries couldn't be posted" : "Entries confirmed in Tally",
+      setStatementDoneSummary({ tone, title: summary.needsCheck ? "Some entries need review" : summary.failed ? "Some entries couldn't be posted" : "Entries confirmed in Tally",
         text: bankPostingMessage(summary) + " Your download includes the full statement." });
     }
   }
@@ -4758,14 +4771,16 @@ export function BankStatementsPage() {
       if (nextStatus.finished) {
         if (nextStatus.needsCheck > 0) {
           const summary = summarizeBankPostings(nextStatus.commands.filter(command => (command.commandType || command.command_type) === "post_bank_voucher"));
-          setStatementDoneSummary({ tone: nextStatus.failed ? "error" : "info", title: "Your entries were sent to Tally", text: bankPostingMessage(summary) + " Your download includes the full statement." });
+          setStatementDoneSummary({ tone: nextStatus.failed ? "error" : "info", title: "Some entries need review", text: bankPostingMessage(summary) + " Your download includes the full statement." });
           setBanner(null);
           showToast("info", bankPostingMessage(summary));
         } else if (nextStatus.failed > 0 || nextStatus.canceled > 0) {
           setStatementDoneSummary({
             tone: "error",
             title: "Some entries couldn't be posted.",
-            text: `${nextStatus.voucherCompleted} entries confirmed; ${nextStatus.failed + nextStatus.canceled} could not be posted. Review the affected entries before trying again.`,
+            text: bankPostingMessage(summarizeBankPostings(nextStatus.commands.filter(
+              command => (command.commandType || command.command_type) === "post_bank_voucher"
+            ))) + " Review the affected entries before trying again.",
           });
           showToast(
             "error",
@@ -6594,6 +6609,7 @@ export function BankStatementsPage() {
             suggestionConfidence: transaction.suggestionConfidence,
             suggestionReason: transaction.suggestionReason || null,
             confirmedLedgerName: transaction.selectedLedgerName || null,
+            rawPayload: { sourceBankReference: transaction.sourceBankReference, referenceNeedsReview: transaction.referenceNeedsReview },
           })),
         }),
       });
@@ -6704,6 +6720,7 @@ export function BankStatementsPage() {
                   transaction.confirmedLedgerName ||
                   transaction.suggestedLedgerName ||
                   "Suspense",
+                ledgerSelectionConfirmed: reviewedTransaction?.ledgerSelectionTouched === true,
                 createLedgerName: "",
                 createLedgerParentName: "",
                 directPosting,
@@ -6808,6 +6825,7 @@ export function BankStatementsPage() {
                 ...drafts[transactionId],
                 status: "found",
                 label: alreadyInTally ? "Already entered in Tally" : "Confirmed in Tally",
+                alreadyInTally,
                 reason: alreadyInTally ? "This entry was already in Tally. No new entry was posted." : "This entry was posted and confirmed in Tally.",
                 voucherNumber: voucherNumber ?? drafts[transactionId]?.voucherNumber ?? null,
               };
@@ -8353,9 +8371,9 @@ export function BankStatementsPage() {
                                     }`}>
                                       {tallyPresence.duplicateInTally
                                         ? "Already posted - duplicates"
-                                        : postedThisSession
-                                          ? "Posted"
-                                          : "Already in Tally"}
+                                        : tallyPresence.alreadyInTally === true || !postedThisSession
+                                          ? "Already entered in Tally"
+                                          : "Posted successfully"}
                                     </span>
                                     <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={tallyPresence.reason}>
                                       {tallyPresence.duplicateInTally
@@ -9273,7 +9291,7 @@ export function BankStatementsPage() {
                 >
                   {tallyPostingStatus.voucherTotal > 0 ? (
                     <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
-                      Voucher posting {tallyPostingStatus.voucherCompleted}/{tallyPostingStatus.voucherTotal}
+                      Confirmed in Tally {tallyPostingStatus.voucherCompleted}/{tallyPostingStatus.voucherTotal}
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-white px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600">

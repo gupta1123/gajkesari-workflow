@@ -2,6 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { bankPostingOutcome, bankPostingMessage, summarizeBankPostings } from './bank-posting-outcome.ts';
 
+test('mixed upload counts existing, new and held rows separately', () => {
+  const existing = { status: 'succeeded', result: { alreadyInTally: true, duplicateCheck: { verificationStatus: 'found' } } };
+  const created = { status: 'succeeded', result: { created: 1, verificationStatus: 'verified' } };
+  const held = { status: 'failed', result: { possibleDuplicateInTally: true } };
+  assert.equal(bankPostingMessage(summarizeBankPostings([...Array(13).fill(existing), ...Array(5).fill(created), ...Array(4).fill(held)])),
+    '5 newly posted; 13 already entered in Tally; 4 need review.');
+});
+
 test('17 confirmations and 1 accepted but unconfirmed entry is a needs-check outcome', () => {
   const confirmed = { status: 'succeeded', result: { verificationStatus: 'verified' } };
   const uncertain = { status: 'failed', reconciliation_required: true, result: {
@@ -9,7 +17,7 @@ test('17 confirmations and 1 accepted but unconfirmed entry is a needs-check out
   } };
   const summary = summarizeBankPostings([...Array(17).fill(confirmed), uncertain]);
   assert.deepEqual(summary, { total: 18, confirmed: 17, needsCheck: 1, failed: 0, pending: 0, accepted: 18, alreadyExisting: 0 });
-  assert.equal(bankPostingMessage(summary), 'Tally accepted 18 entries. 17 confirmed; 1 needs checking.');
+  assert.equal(bankPostingMessage(summary), '17 newly posted; 0 already entered in Tally; 1 need review.');
 });
 
 test('a timeout or partial import does not claim acceptance or enable retrying', () => {

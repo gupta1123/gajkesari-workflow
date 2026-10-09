@@ -15,10 +15,11 @@ export function sourceDate(value) {
   let year, month, day;
   if (m) [,year,month,day] = m;
   else {
-    m = text.match(/^(\d{1,2})[-/ ]([A-Za-z]{3}|\d{1,2})[-/ ](\d{4})(?:\s|$)/);
+    m = text.match(/^(\d{1,2})[-/ ]([A-Za-z]{3}|\d{1,2})[-/ ](\d{2}|\d{4})(?:\s|$)/);
     if (!m) return null;
     day=m[1]; year=m[3]; month=/^\d+$/.test(m[2]) ? Number(m[2])
       : ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(m[2].toLowerCase())+1;
+    if (year.length === 2) year = `20${year}`;
   }
   const date = new Date(Date.UTC(Number(year),Number(month)-1,Number(day)));
   if (date.getUTCFullYear()!==Number(year)||date.getUTCMonth()+1!==Number(month)||date.getUTCDate()!==Number(day)) return null;

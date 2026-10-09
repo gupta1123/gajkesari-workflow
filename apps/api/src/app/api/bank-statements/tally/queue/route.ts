@@ -1,5 +1,6 @@
 import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { validateBankVoucherBillPolicy } from "@/lib/bank-voucher-bill-policy";
+import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { normalizeName } from "@/lib/bank-statements";
@@ -56,6 +57,7 @@ type QueuePayload = {
     billMatchingVerified?: boolean;
     directPosting?: boolean;
     duplicateCheckVerified?: boolean;
+    ledgerSelectionConfirmed?: boolean;
     saveMapping?: boolean;
   }>;
 };
@@ -163,6 +165,7 @@ type TransactionLedgerSelection = {
   billMatchingVerified: boolean;
   directPosting: boolean;
   duplicateCheckVerified: boolean;
+  ledgerSelectionConfirmed: boolean;
 };
 
 type TallyCommandInsert = {
@@ -369,6 +372,7 @@ export async function POST(request: Request) {
               billMatchingVerified: transaction?.billMatchingVerified === true,
               directPosting: transaction?.directPosting === true,
               duplicateCheckVerified: transaction?.duplicateCheckVerified === true,
+              ledgerSelectionConfirmed: transaction?.ledgerSelectionConfirmed === true,
             },
           ] as const,
         ];
@@ -427,7 +431,7 @@ export async function POST(request: Request) {
 
     const { data: submittedConnection, error: submittedConnectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id, installation_ref, session_generation, status, last_company_name, last_companies_snapshot, last_heartbeat_at, last_tally_reachable")
+      .select("id, owner_user_id, installation_ref, session_generation, status, last_company_name, last_companies_snapshot, last_heartbeat_at, last_tally_reachable, bridge_version")
       .eq("id", submittedConnectionId)
       .eq("owner_user_id", user.id)
       .is("revoked_at", null)
@@ -476,6 +480,16 @@ export async function POST(request: Request) {
       );
     }
 
+    const bridgeVersion = String(submittedConnection.bridge_version || '').match(/^(\d+)\.(\d+)\.(\d+)/);
+    const supportsSourceReferenceChecks = bridgeVersion &&
+      (Number(bridgeVersion[1]) > 0 || Number(bridgeVersion[2]) > 1 ||
+        (Number(bridgeVersion[2]) === 1 && Number(bridgeVersion[3]) >= 78));
+    if (!supportsSourceReferenceChecks) {
+      return jsonWithCors(request, {
+        error: "Install the latest Tally connector, then try again. This update is needed to check entries already in Tally.",
+        code: "connector_update_required",
+      }, { status: 409 });
+    }
     const activeCompanyName = toText(submittedConnection.last_company_name, 240);
     if (!activeCompanyName || normalizeName(activeCompanyName) !== normalizeName(expectedCompanyName)) {
       return jsonWithCors(
@@ -694,6 +708,8 @@ export async function POST(request: Request) {
       billMatchingNotVerified: 0,
       duplicateCheckNotVerified: 0,
       sameContraLedger: 0,
+      bankChargeLedgerNeedsReview: 0,
+      bankReferenceNeedsReview: 0,
     };
     type SkippedReason = keyof typeof skipped;
     const skippedRows: Array<{
@@ -716,6 +732,9 @@ export async function POST(request: Request) {
     // entire 12k+ master catalogue before it could create any commands.
     const requestedLedgerNames = new Set<string>();
     for (const transaction of transactions) {
+      if (isBankChargeDescription(transaction.description)) {
+        ["Bank Commission", "Bank Charges", "Bank Fees"].forEach(name => requestedLedgerNames.add(name));
+      }
       const account = accountsById.get(transaction.bank_account_id);
       const selection = ledgerSelectionByTransactionId.get(transaction.id);
       const bankLedger = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
@@ -903,7 +922,10 @@ export async function POST(request: Request) {
           ? storedSuggestedLedgerName
           : "") ||
         legacyFallback;
-      const counterpartyLedgerName =
+      const standardBankChargeLedger = resolveBankChargeLedger(transaction.description,
+        activeLedgers.map(ledger => ({ name: ledger.tally_name, parent: ledger.parent_name })));
+      const counterpartyLedgerName = standardBankChargeLedger && !selectedLedger?.ledgerSelectionConfirmed
+        ? standardBankChargeLedger.name :
         isSuspenseLedger(selectedCounterpartyLedgerName) && companySuspenseLedgerName
           ? companySuspenseLedgerName
           : selectedCounterpartyLedgerName;
@@ -923,6 +945,13 @@ export async function POST(request: Request) {
       ({ transaction, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
         if (blockedFingerprints.has(transaction.fingerprint)) {
           return skipTransaction(transaction, "alreadyPostedOrActive");
+        }
+        const sourceReference = String(transaction.raw_payload?.sourceBankReference || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+        const extractedReference = String(transaction.reference_number || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+        if (sourceReference && sourceReference !== extractedReference) return skipTransaction(transaction, "bankReferenceNeedsReview");
+        if (bankChargeNeedsReview(transaction.description, counterpartyLedgerName,
+          ledgerSelectionByTransactionId.get(transaction.id)?.ledgerSelectionConfirmed === true)) {
+          return skipTransaction(transaction, "bankChargeLedgerNeedsReview");
         }
         const account = accountsById.get(transaction.bank_account_id);
         const amount = getTransactionAmount(transaction);

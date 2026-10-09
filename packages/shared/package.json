@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./lib/bank-charge-ledger": "./src/lib/bank-charge-ledger.ts",
     "./lib/bank-posting-outcome": "./src/lib/bank-posting-outcome.ts",
     "./lib/case-summary": "./src/lib/case-summary.ts",
     "./lib/comparison": "./src/lib/comparison.ts",

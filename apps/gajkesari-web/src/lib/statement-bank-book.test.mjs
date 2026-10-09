@@ -4,6 +4,21 @@ import { buildStatementBankBook, savedPostingPresence, statementBalances, summar
 import { buildBankBookRows } from './bank-book-csv.ts';
 import { isReadyForTallyPosting } from './bank-statement-posting-readiness.ts';
 
+test('same-amount rows keep distinct saved statuses and existing-voucher identity after reopening', () => {
+  const first = { id: 'first', transactionDate: '2026-10-08', description: 'Credit from Arvind', creditAmount: 303.33, balanceAmount: 1303.33 };
+  const second = { ...first, id: 'second', balanceAmount: 1606.66 };
+  const saved = [{ ...first, postingStatus: 'verified', voucherNumber: '2722', postingResult: { alreadyInTally: true } },
+    { ...second, postingStatus: 'needs_tally_review', postingResult: { possibleDuplicateInTally: true } }];
+  const presence = savedPostingPresence([first, second], saved);
+  assert.equal(presence.first.status, 'found');
+  assert.equal(presence.first.alreadyInTally, true);
+  assert.equal(presence.first.label, 'Already entered in Tally');
+  assert.equal(presence.second.status, 'verification_pending');
+  assert.equal(presence.second.voucherNumber, null);
+  assert.deepEqual(statementBalances([first, second]), { opening: 1000, closing: 1606.66 });
+  assert.equal(buildStatementBankBook([first, second], saved).length, 2);
+});
+
 const rows = Array.from({ length: 18 }, (_, i) => ({ id: `preview-${i}`, transactionDate: '2026-09-30',
   description: `Transaction ${i}`, referenceNumber: String(1967486030 + i), debitAmount: i === 17 ? 518779 : 10,
   creditAmount: 0, balanceAmount: 1000000 - Math.min(i + 1, 17) * 10 - (i === 17 ? 518779 : 0), selectedLedgerName: 'Suspense' }));
