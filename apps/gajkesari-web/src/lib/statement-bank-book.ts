@@ -51,7 +51,9 @@ export function savedPostingPresence(rows: Array<StatementRow & { id: string }>,
       label: posting.postingResult?.alreadyInTally === true ? "Already entered in Tally" : "Confirmed in Tally",
       reason: posting.postingResult?.alreadyInTally === true ? "This entry was already in Tally. No new entry was posted." : "This entry was confirmed in Tally.", voucherNumber: posting.voucherNumber || null,
       alreadyInTally: posting.postingResult?.alreadyInTally === true }]];
-    if (outcome.status === "needs_check") return [[row.id, { status: "verification_pending" as const, label: "Needs checking in Tally",
+    if (outcome.status === "needs_check") return [[row.id, { status: "verification_pending" as const,
+      label: posting.postingResult?.possibleDuplicateInTally === true ? "Possible existing entry"
+        : outcome.accepted ? "Sent; confirmation pending" : "Needs checking in Tally",
       reason: posting.postingResult?.possibleDuplicateInTally === true ? "Possible existing entry in Tally. Nothing was posted for this row. Please review."
         : outcome.accepted ? "Tally accepted the entries, but this entry still needs checking. Do not send it again." : "We couldn't confirm this entry in Tally. Check again before sending it again.", voucherNumber: null }]];
     return [];

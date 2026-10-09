@@ -14,6 +14,7 @@ test('same-amount rows keep distinct saved statuses and existing-voucher identit
   assert.equal(presence.first.alreadyInTally, true);
   assert.equal(presence.first.label, 'Already entered in Tally');
   assert.equal(presence.second.status, 'verification_pending');
+  assert.equal(presence.second.label, 'Possible existing entry');
   assert.equal(presence.second.voucherNumber, null);
   assert.deepEqual(statementBalances([first, second]), { opening: 1000, closing: 1606.66 });
   assert.equal(buildStatementBankBook([first, second], saved).length, 2);
@@ -49,6 +50,7 @@ test('refresh maps durable posting status to preview IDs and never makes uncerta
   const presence = savedPostingPresence(rows, postings);
   assert.equal(presence['preview-0'].status, 'found');
   assert.equal(presence['preview-17'].status, 'verification_pending');
+  assert.equal(presence['preview-17'].label, 'Sent; confirmation pending');
   assert.equal(isReadyForTallyPosting({ ledgerName: 'Suspense', ledgerNeedsReview: false, amount: 518779,
     directPosting: true, billRequired: false, postingRecorded: true, presence: { status: 'missing' } }), false);
 });

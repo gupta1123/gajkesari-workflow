@@ -6779,9 +6779,9 @@ export function BankStatementsPage() {
         setBanner({
           tone: "info",
           text: voucherCount > 0 && paymentCheckCount > 0
-            ? `Sending ${voucherCount} entries and checking ${paymentCheckCount} payments in Tally. Keep this page open.`
+            ? `Checking ${voucherCount} entries before posting and checking ${paymentCheckCount} payments in Tally. Keep this page open.`
             : voucherCount > 0
-              ? `Sending ${voucherCount} entries to Tally. Keep this page open.`
+              ? `Checking ${voucherCount} entries in Tally before posting. Existing entries will be skipped.`
               : `Checking ${paymentCheckCount} outgoing payment(s) against Tally.`,
         });
         void pollTallyPostingStatus(postingConnectionId, commandIds)
@@ -6895,9 +6895,9 @@ export function BankStatementsPage() {
       showToast(
         "info",
         (queuedPayload.queuedCount ?? 0) > 0 && (queuedPayload.verificationCount ?? 0) > 0
-          ? `${queuedPayload.queuedCount ?? 0} bank voucher(s) will be created; ${queuedPayload.verificationCount ?? 0} outgoing payment(s) will be checked.`
+          ? `Checking ${queuedPayload.queuedCount ?? 0} entries before posting and ${queuedPayload.verificationCount ?? 0} payments in Tally.`
           : (queuedPayload.queuedCount ?? 0) > 0
-            ? `${queuedPayload.queuedCount ?? 0} bank voucher(s) will be created.`
+            ? `Checking ${queuedPayload.queuedCount ?? 0} entries in Tally. Existing entries will be skipped.`
             : `${queuedPayload.verificationCount ?? 0} outgoing payment check(s) started.`
       );
     } catch (error) {
@@ -8370,7 +8370,7 @@ export function BankStatementsPage() {
                                         : "border-emerald-250 bg-emerald-50 text-emerald-800"
                                     }`}>
                                       {tallyPresence.duplicateInTally
-                                        ? "Already posted - duplicates"
+                                        ? "Multiple entries in Tally"
                                         : tallyPresence.alreadyInTally === true || !postedThisSession
                                           ? "Already entered in Tally"
                                           : "Posted successfully"}
@@ -8387,8 +8387,8 @@ export function BankStatementsPage() {
                                   </button>
                                 ) : tallyPresence?.status === "verification_pending" ? (
                                   <div className="flex flex-col gap-1 text-left" title={tallyPresence.reason}>
-                                    <span className="self-start rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[9px] font-bold text-amber-800">Needs checking in Tally</span>
-                                    <span className="text-[9px] text-slate-500">Check again before sending</span>
+                                    <span className="self-start rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[9px] font-bold text-amber-800">{tallyPresence.label || "Needs checking in Tally"}</span>
+                                    <span className="text-[9px] text-slate-500">{tallyPresence.reason || "Check again before sending"}</span>
                                   </div>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
                                   <button
