@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.78";
+const BRIDGE_VERSION = "0.1.79";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -3445,8 +3445,21 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
   if (candidates.length === 0) {
     // A manual voucher can have no UTR or only an unrelated app tracking ID.
     // A different genuine reference, however, identifies a separate transaction.
-    const compatible = baseCandidates.filter(({ voucher }) =>
-      !voucherHasConflictingBankReference(voucher, bankReference));
+    const compatible = baseCandidates.filter(({ voucher }) => {
+      if (voucherHasConflictingBankReference(voucher, bankReference)) return false;
+      // Equal bank/date/amount alone is not a duplicate when both entries use
+      // clearly different party ledgers. Exact references were checked above.
+      if (hasUsableCounterparty && !voucherHasLedger(voucher, counterpartyLedgerName)) {
+        const partyKey = normalizeLooseName(voucher.partyLedgerName);
+        const bankKey = normalizeLooseName(bankLedgerName);
+        const otherLedgerKeys = [...new Set((voucher.ledgerNames || []).map(normalizeLooseName))]
+          .filter(key => key && key !== bankKey);
+        const knownPartyKey = partyKey && partyKey !== bankKey ? partyKey
+          : otherLedgerKeys.length === 1 ? otherLedgerKeys[0] : "";
+        if (knownPartyKey && !knownPartyKey.includes("suspense")) return false;
+      }
+      return true;
+    });
     const partyMatches = hasUsableCounterparty
       ? compatible.filter(({ voucher, index }) => !reservedVoucherIndexes.has(index) &&
           voucherHasLedger(voucher, counterpartyLedgerName))
@@ -3487,6 +3500,9 @@ function serializeStrictVoucherMatch(candidate) {
     voucherNumber: voucher.voucherNumber,
     reference: voucher.reference,
     bankReferences: voucher.bankReferences || [],
+    amount: candidate.bankEntry ? Math.abs(Number(candidate.bankEntry.amount)) : null,
+    bankLedgerName: candidate.bankEntry?.ledgerName || null,
+    direction: candidate.bankEntry ? (candidate.bankEntry.isDebit ? "incoming" : "outgoing") : null,
     partyLedgerName: voucher.partyLedgerName,
     ledgerNames: voucher.ledgerNames,
     masterId: voucher.masterId,

@@ -354,7 +354,7 @@ export async function GET(
     const { data: postedLogs, error: postedLogsError } = postedFingerprints.length
       ? await supabase
           .from("bank_transaction_posting_log")
-          .select("fingerprint,result,tally_voucher_id,tally_posted_at,status,command_id,voucher_type")
+          .select("fingerprint,result,tally_voucher_id,tally_posted_at,status,command_id,voucher_type,source_transaction_id")
           .eq("owner_user_id", user.id)
           .eq("company_dataset_id", importRow.company_dataset_id)
           .in("fingerprint", postedFingerprints)
@@ -373,12 +373,13 @@ export async function GET(
         debitAmount: row.debit_amount ?? null,
         creditAmount: row.credit_amount ?? null,
         balanceAmount: row.balance_amount ?? null,
-        ledgerName: String(row.confirmed_ledger_name ?? row.suggested_ledger_name ?? "").trim(),
+        ledgerName: String(log?.result?.reviewLedgerName ?? row.confirmed_ledger_name ?? row.suggested_ledger_name ?? "").trim(),
         voucherNumber: row.tally_status === "verified" ? readPostedVoucherNumber(log?.result) : "",
         postedAt: log?.tally_posted_at ?? row.tally_posted_at ?? null,
         postingStatus: log?.status ?? row.tally_status,
         postingCommandId: log?.command_id ?? null,
-        postingResult: log?.result ?? null,
+        postingResult: log?.status === "verified" && log.source_transaction_id && log.source_transaction_id !== row.id
+          ? { ...log.result, alreadyInTally: true } : log?.result ?? null,
         voucherType: log?.voucher_type ?? null,
       };
     });

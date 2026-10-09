@@ -675,21 +675,21 @@ test("strict bank presence uses exact reference independently of a wrong selecte
   assert.equal(result.hasUsableReference, true);
 });
 
-test("a different party without a bank reference requires review instead of permission to post", () => {
+test("a clearly different party without a matching reference is a separate transaction", () => {
   const result = strictBankTransactionCandidates(
     [bankVoucher({ party: "Actual Customer" })],
     {
       voucherDate: "2026-08-01",
       amount: 1250,
       expectedDirection: "incoming",
-      counterpartyLedgerName: "Wrong Customer",
+      counterpartyLedgerName: "Other Customer",
     },
     "ICICI Current Account",
     new Set()
   );
   assert.equal(result.baseCandidateCount, 1);
-  assert.equal(result.candidates.length, 1);
-  assert.equal(result.identityInsufficient, true);
+  assert.equal(result.candidates.length, 0);
+  assert.equal(result.identityInsufficient, false);
   assert.equal(result.hasUsableCounterparty, true);
 });
 
@@ -770,6 +770,60 @@ async function checkManualBankVouchers(vouchers, transaction = {}) {
   return outcome.result.transactions[0];
 }
 
+test("voucher evidence contains the actual bank entry amount, ledger and direction", async () => {
+  const row = await checkManualBankVouchers([bankVoucher()]);
+  assert.equal(row.matches[0].amount, 1250);
+  assert.equal(row.matches[0].bankLedgerName, "ICICI Current Account");
+  assert.equal(row.matches[0].direction, "incoming");
+  assert.equal(row.matches[0].partyLedgerName, "Customer A");
+});
+
+test("same-date same-amount different-ledger receipts and payments proceed without a duplicate warning", async () => {
+  for (const expectedDirection of ["incoming", "outgoing"]) {
+    const voucher = bankVoucher({ party: "Arvind Industrial Components" });
+    if (expectedDirection === "outgoing") voucher.ledgerEntries = voucher.ledgerEntries.map(entry => ({ ...entry, isDebit: !entry.isDebit }));
+    for (const referenceNumber of [undefined, "UTR-123456", "NEFT-ICICI-171A17A86A895CCDCF57"]) {
+      const result = await checkManualBankVouchers([voucher], { expectedDirection, counterpartyLedgerName: "BluePeak Fabricators", referenceNumber });
+      assert.equal(result.verificationStatus, "missing");
+      assert.equal(result.matchCount, 0);
+      assert.deepEqual(result.matches, []);
+      assert.equal(result.reason, "No matching entry found in Tally.");
+    }
+  }
+});
+
+test("the Axis BluePeak 1101.11 receipt is new despite the same-day Arvind receipt", async () => {
+  const voucher = { ...bankVoucher({ party: "Arvind Industrial Components" }), date: "20261008", effectiveDate: "20261008",
+    ledgerNames: ["Arvind Industrial Components", "Axis Bank - 7440012233"],
+    ledgerEntries: [{ ledgerName: "Axis Bank - 7440012233", amount: -1101.11, isDebit: true },
+      { ledgerName: "Arvind Industrial Components", amount: 1101.11, isDebit: false }] };
+  const result = await reconcileBankTransactionsInTally({}, { bankLedgerName: "Axis Bank - 7440012233", includeBalanceProof: false,
+    transactions: [{ transactionId: "bluepeak", voucherDate: "2026-10-08", amount: 1101.11, expectedDirection: "incoming", referenceNumber: null, counterpartyLedgerName: "BluePeak Fabricators" }] },
+    { voucherProvider: async () => ({ vouchers: [voucher], diagnostics: {} }) });
+  assert.equal(result.result.transactions[0].verificationStatus, "missing");
+  assert.deepEqual(result.result.transactions[0].matches, []);
+});
+
+test("the same known party still detects a manual duplicate among different-party coincidences", async () => {
+  const result = await checkManualBankVouchers([bankVoucher({ party: "Other Customer" }), bankVoucher()]);
+  assert.equal(result.verificationStatus, "found");
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].partyLedgerName, "Customer A");
+});
+
+test("unavailable party evidence stays under review rather than assuming a different party", async () => {
+  const voucher = { ...bankVoucher(), partyLedgerName: "", ledgerNames: ["ICICI Current Account"] };
+  assert.equal((await checkManualBankVouchers([voucher])).verificationStatus, "ambiguous");
+  const withoutPartyField = { ...bankVoucher({ party: "Other Customer" }), partyLedgerName: "" };
+  assert.equal((await checkManualBankVouchers([withoutPartyField])).verificationStatus, "missing");
+});
+
+test("an exact reference still detects the same transaction even when the selected party differs", async () => {
+  const row = await checkManualBankVouchers([bankVoucher({ party: "Arvind", reference: "UTR-123456" })], { counterpartyLedgerName: "BluePeak", referenceNumber: "UTR-123456" });
+  assert.equal(row.verificationStatus, "found");
+  assert.equal(row.matchBasis, "reference");
+});
+
 test("generated tracking references do not hide a unique manually entered voucher", async () => {
   const referenceNumber = "NEFT-ICICI-171A17A86A895CCDCF57";
   for (const metadata of [{}, { bankReferenceNumber: null, referenceSource: "generated" }]) {
@@ -796,7 +850,7 @@ test("a generated tracking reference still identifies an earlier app posting", a
 test("uncertain manual candidates and multiple party matches are held for review", async () => {
   for (const [vouchers, counterpartyLedgerName] of [
     [[bankVoucher()], "Suspense"],
-    [[bankVoucher()], "Wrong Customer"],
+    [[bankVoucher({ party: "Suspense" })], "Customer A"],
     [[bankVoucher(), bankVoucher()], "Customer A"],
   ]) {
     const row = await checkManualBankVouchers(vouchers, { referenceNumber: "UTR-123456", counterpartyLedgerName });
