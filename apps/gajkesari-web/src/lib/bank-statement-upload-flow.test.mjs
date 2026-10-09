@@ -4,8 +4,9 @@ import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 import { bankPostingMessage, bankPostingTitle } from '@gajkesari/shared/lib/bank-posting-outcome';
 import { markPreviouslyConfirmedPostings, savedPostingPresence, savedPostingOutcome,
-  summarizeSavedPostings, summarizeStatementPostings, statementRowKey } from './statement-bank-book.ts';
+  summarizeSavedPostings, summarizeStatementPostings, statementRowKey, mergeCompletedPostingEvidence } from './statement-bank-book.ts';
 import { isReadyForTallyPosting } from './bank-statement-posting-readiness.ts';
+import { PostingStatusUnavailable } from './bank-posting-status-recovery.ts';
 
 const source = await readFile(new URL('../components/bank-statements/BankStatementsPage.tsx', import.meta.url), 'utf8');
 const ast = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -15,10 +16,10 @@ function visit(node) {
   ts.forEachChild(node, visit);
 }
 visit(ast);
-const extracted = ['applyPreviewPayload', 'restorePostingState', 'sendToTally'].map(name => functions.get(name)).join('\n');
+const extracted = ['applyPreviewPayload', 'restorePostingState', 'sendToTally', 'resumePostingStatus'].map(name => functions.get(name)).join('\n');
 const code = ts.transpileModule(extracted, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
-function reviewHarness(rows, saved) {
+function reviewHarness(rows, saved, overrides = {}) {
   const payload = { import: { id: 'repeat-import' }, account: { accountNumber: '1234', tallyLedgerName: 'Bank' },
     bankLedgerResolution: { verified: true }, transactions: rows, postedTransactions: saved };
   // Start with another completed statement to catch leaked badges/downloads.
@@ -34,10 +35,13 @@ function reviewHarness(rows, saved) {
     tallyPresenceByTransactionId: {}, transactionsNeedingTallyWork: rows, previewExtractionIncomplete: false,
     tallyConnectionId: 'connection', bankLedgerName: 'Bank', selectedAccountId: '', account: payload.account,
     commandConnection: { id: 'connection' }, directPosting: true, selectedCompanyName: 'Company',
+    pendingPostingJob: null, resumingPostingStatus: false, sending: false, PostingStatusUnavailable,
+    billAllocationsByTransactionId: {}, buildQueueLedgerContext: () => [], isSuspenseLedgerName: () => false,
+    isBillMatchEligibleTransaction: () => false,
     isIncomingReceiptRow: () => true, isOutgoingPaymentRow: () => false,
     transactionQueueKey: row => row.id, parseNumber: value => value == null ? null : Number(value),
     markPreviouslyConfirmedPostings, savedPostingPresence, savedPostingOutcome, summarizeSavedPostings,
-    summarizeStatementPostings, statementRowKey, bankPostingMessage, bankPostingTitle,
+    summarizeStatementPostings, statementRowKey, bankPostingMessage, bankPostingTitle, mergeCompletedPostingEvidence,
     showToast: (...args) => toasts.push(args), selectReviewTransaction: () => {},
     loadImportPreviewMetadata: async () => payload,
     apiFetch: async (url, options) => {
@@ -51,7 +55,8 @@ function reviewHarness(rows, saved) {
     const key = setter.slice(3, 4).toLowerCase() + setter.slice(4);
     context[setter] = update => { state[key] = typeof update === 'function' ? update(state[key] ?? []) : update; };
   }
-  const handlers = new Function(...Object.keys(context), `${code}; return { applyPreviewPayload, sendToTally };`)(...Object.values(context));
+  Object.assign(context, overrides);
+  const handlers = new Function(...Object.keys(context), `${code}; return { applyPreviewPayload, sendToTally, resumePostingStatus };`)(...Object.values(context));
   return { payload, state, requests, toasts, ...handlers };
 }
 
@@ -131,4 +136,40 @@ test('a fresh upload does not inherit the preceding statement results', () => {
   assert.deepEqual(review.state.tallyPresenceByTransactionId, {});
   assert.equal(review.state.statementDoneSummary, null);
   assert.equal(review.requests.length, 0);
+});
+
+test('a lost status connection retains the accepted job and never retries the posting POST', async () => {
+  const {rows}=fixtures();const requests=[];
+  const review=reviewHarness(rows,[],{
+    apiFetch:async url=>{
+      requests.push(url);
+      return {ok:true,json:async()=>url.endsWith('/confirm')?
+        {account:{id:'account'},import:{id:'repeat-import'},importedTransactionCount:23,duplicateTransactionCount:0,
+          queueableTransactions:rows}:
+        {jobId:'accepted-job'}};
+    },
+    pollTallyQueueJob:async()=>{throw new PostingStatusUnavailable();},
+  });
+  await review.sendToTally('post_all');
+  assert.deepEqual(requests,['/api/bank-statements/imports/repeat-import/confirm','/api/bank-statements/tally/queue'],JSON.stringify(review.toasts));
+  assert.equal(review.state.pendingPostingJob.id,'accepted-job');
+  assert.equal(review.state.sendingMode,null);
+  assert.equal(review.toasts.some(([tone])=>tone==='error'),false);
+  assert.match(review.state.banner.text,/Do not post again/);
+});
+
+test('Resume reads the original job and restores full results without confirmation or queue POSTs',async()=>{
+  const {rows,saved}=fixtures();const reads=[];
+  const review=reviewHarness(rows,saved,{
+    pendingPostingJob:{id:'accepted-job',importId:'repeat-import',connectionId:'connection'},
+    pollTallyQueueJob:async id=>{reads.push(id);return {commands:[{id:'command'}]};},
+    pollTallyPostingStatus:async(connection,ids)=>{reads.push([connection,ids]);return {finished:true,commands:[]};},
+  });
+  await review.resumePostingStatus();
+  assert.deepEqual(reads,['accepted-job',['connection',['command']]]);
+  assert.equal(review.requests.length,0);
+  assert.equal(review.state.pendingPostingJob,null);
+  assert.equal(review.state.resumingPostingStatus,false);
+  assert.equal(review.state.persistedPostedTransactions.length,23);
+  assert.equal(review.state.statementDoneSummary.tone,'info');
 });

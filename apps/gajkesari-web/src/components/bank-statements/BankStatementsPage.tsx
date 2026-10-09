@@ -31,6 +31,7 @@ import { Button } from "@/components/ui/button";
 import { CompanyAvatar } from "@/components/ui/company-avatar";
 import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import { apiFetch } from "@/lib/api-client";
+import { readPostingStatus, PostingStatusUnavailable } from "@/lib/bank-posting-status-recovery";
 import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { bankPostingOutcome, bankPostingMessage, bankPostingTitle, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
 import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
@@ -3403,6 +3404,8 @@ export function BankStatementsPage() {
   const [postUploadSyncError, setPostUploadSyncError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [tallyPostingStatus, setTallyPostingStatus] = useState<TallyPostingStatus | null>(null);
+  const [pendingPostingJob, setPendingPostingJob] = useState<{ id: string; importId: string; connectionId: string } | null>(null);
+  const [resumingPostingStatus, setResumingPostingStatus] = useState(false);
   const [statementDoneSummary, setStatementDoneSummary] = useState<StatementDoneSummary | null>(null);
   const [reviewFiltersOpen, setReviewFiltersOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -3987,7 +3990,7 @@ export function BankStatementsPage() {
     visibleReviewTransactions.length === 0
       ? 0
       : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
-  const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
+  const tallyPostingInProgress = Boolean(pendingPostingJob || (tallyPostingStatus && !tallyPostingStatus.finished));
   const bankBookTransactions = buildStatementBankBook(validTransactions, persistedPostedTransactions);
   const hasPostedEntries = persistedPostedTransactions.some(row =>
     ["confirmed", "needs_check"].includes(savedPostingOutcome(row).status)
@@ -4080,6 +4083,28 @@ export function BankStatementsPage() {
         try { const updated = await loadImportPreviewMetadata(preview.import.id); restorePostingState(updated.postedTransactions ?? []); setTallyPostingStatus(null); } catch { /* The next refresh restores any saved correction. */ }
       }
     } finally { setRecheckingPostings(false); }
+  }
+
+  function postingStatusReconnecting() {
+    setBanner({ tone: "info", text: "Posting is continuing. Reconnecting to get the latest results. Keep the connector open." });
+  }
+
+  async function resumePostingStatus() {
+    if (!pendingPostingJob || resumingPostingStatus || sending) return;
+    setResumingPostingStatus(true);
+    try {
+      const queued = await pollTallyQueueJob(pendingPostingJob.id);
+      const ids = (queued.commands ?? []).map(command => command.id).filter(Boolean);
+      const final = ids.length ? await pollTallyPostingStatus(pendingPostingJob.connectionId, ids) : null;
+      if (ids.length && !final?.finished) throw new PostingStatusUnavailable();
+      const updated = await loadImportPreviewMetadata(pendingPostingJob.importId);
+      restorePostingState(mergeCompletedPostingEvidence(updated.postedTransactions ?? [], final?.commands ?? []));
+      setPendingPostingJob(null);
+      setBanner(null);
+    } catch (error) {
+      setBanner({ tone: "info", text: error instanceof PostingStatusUnavailable ? error.message
+        : "The latest results could not be loaded. Keep the connector open and resume the status check. Do not post again." });
+    } finally { setResumingPostingStatus(false); }
   }
   const bankPostingCompleted = Boolean(
     statementCompletedCleanly &&
@@ -4777,6 +4802,7 @@ export function BankStatementsPage() {
     setPostUploadSyncImportId(null);
     setPostUploadSyncError(null);
     setTallyPostingStatus(null);
+    setPendingPostingJob(null);
     setStatementDoneSummary(null);
     setBillAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
@@ -4796,18 +4822,13 @@ export function BankStatementsPage() {
 
       const commandChunks = await Promise.all(
         chunkValues(commandIds, 80).map(async (chunk) => {
-          const response = await apiFetch(
+          return await readPostingStatus<{ commands?: TallyCommand[] }>(() => apiFetch(
             `/api/tally/connections/${connectionId}/commands?${new URLSearchParams({
               ids: chunk.join(","),
               limit: String(chunk.length),
             }).toString()}`,
-            { cache: "no-store" }
-          );
-          if (!response.ok) {
-            throw new Error(await readError(response));
-          }
-          const payload = (await response.json()) as { commands?: TallyCommand[] };
-          return payload.commands ?? [];
+            { cache: "no-store", signal: AbortSignal.timeout(12000) }
+          ), { onReconnect: postingStatusReconnecting }).then(payload => payload.commands ?? []);
         })
       );
       const nextStatus = buildTallyPostingStatus(connectionId, commandIds, commandChunks.flat());
@@ -4865,13 +4886,9 @@ export function BankStatementsPage() {
   }, []);
 
   const readTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueJobResponse> => {
-    const response = await apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}`, {
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      throw new Error(await readError(response));
-    }
-    return (await response.json()) as TallyQueueJobResponse;
+    return readPostingStatus<TallyQueueJobResponse>(() => apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}`, {
+      cache: "no-store", signal: AbortSignal.timeout(12000),
+    }), { onReconnect: postingStatusReconnecting });
   }, []);
 
   const pollTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueResult> => {
@@ -5465,6 +5482,7 @@ export function BankStatementsPage() {
     // Retain prior evidence in preview for duplicate protection and show it only
     // after an explicit Post/Check action, never as an upload completion result.
     setPersistedPostedTransactions([]);
+    setPendingPostingJob(null);
     setStatementDoneSummary(null);
     setTallyBalanceProof(null);
     setBillMatchingRequested(false);
@@ -5656,14 +5674,9 @@ export function BankStatementsPage() {
   }
 
   async function loadImportPreviewMetadata(importId: string) {
-    const response = await apiFetch(`/api/bank-statements/imports/${importId}?includeTransactions=false`, {
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      throw new Error(await readError(response));
-    }
-
-    return (await response.json()) as PreviewResponse;
+    return readPostingStatus<PreviewResponse>(() => apiFetch(`/api/bank-statements/imports/${importId}?includeTransactions=false`, {
+      cache: "no-store", signal: AbortSignal.timeout(12000),
+    }));
   }
 
   async function loadImportPreviewWithPagedTransactions(importId: string) {
@@ -6818,6 +6831,8 @@ export function BankStatementsPage() {
       }
 
       const queueResponsePayload = (await queueResponse.json()) as TallyQueueJobResponse & TallyQueueResult;
+      if (queueResponsePayload.jobId) setPendingPostingJob({ id: queueResponsePayload.jobId,
+        importId: confirmPayload.import.id, connectionId: tallyConnectionId });
       const queuedPayload = queueResponsePayload.jobId
         ? await pollTallyQueueJob(queueResponsePayload.jobId)
         : {
@@ -6852,6 +6867,7 @@ export function BankStatementsPage() {
             const savedResults = mergeCompletedPostingEvidence(
               markPreviouslyConfirmedPostings(refreshedImport.postedTransactions ?? [], preview.postedTransactions ?? []), finalStatus.commands);
             restorePostingState(savedResults);
+            setPendingPostingJob(null);
             setBanner(null);
             if (finalStatus.failed > 0 || finalStatus.canceled > 0 || finalStatus.needsCheck > 0 || !commandConnection) return;
             setBanner({ tone: "info", text: "Posting finished. Checking the full statement in Tally..." });
@@ -6873,6 +6889,10 @@ export function BankStatementsPage() {
               ? { tone: "info", text: statementBalanceMessage(balanceProof) } : null);
           })
           .catch((pollError) => {
+            if (pollError instanceof PostingStatusUnavailable) {
+              setBanner({ tone: "info", text: pollError.message });
+              return;
+            }
             showToast(
               "error",
               pollError instanceof Error ? pollError.message : "Could not refresh Tally posting status."
@@ -6881,6 +6901,7 @@ export function BankStatementsPage() {
       } else {
         const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
         restorePostingState(refreshedImport.postedTransactions ?? []);
+        setPendingPostingJob(null);
         setBanner(null);
         return;
       }
@@ -6893,6 +6914,10 @@ export function BankStatementsPage() {
             : `${queuedPayload.verificationCount ?? 0} outgoing payment check(s) started.`
       );
     } catch (error) {
+      if (error instanceof PostingStatusUnavailable) {
+        setBanner({ tone: "info", text: error.message });
+        return;
+      }
       showToast(
         "error",
         error instanceof Error
@@ -9177,6 +9202,13 @@ export function BankStatementsPage() {
               >
                 Upload Another
               </Button>
+              {pendingPostingJob && !sending ? (
+                <Button type="button" onClick={() => void resumePostingStatus()}
+                  disabled={resumingPostingStatus} variant="outline">
+                  {resumingPostingStatus ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  {resumingPostingStatus ? "Reconnecting" : "Resume status check"}
+                </Button>
+              ) : null}
               {needsPostingCheck.length > 0 ? (
                 <>
                 <Button type="button" variant={showPostingResultFooter ? "default" : "outline"}

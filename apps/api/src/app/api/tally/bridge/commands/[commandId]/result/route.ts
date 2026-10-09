@@ -15,6 +15,7 @@ import {
 } from "@/lib/tally/commands";
 import { toNullableText } from "@/lib/tally/masters";
 import { normalizeMasterKey } from "@/lib/tally/masters";
+import { protectExistingVoucherClaim, existingVoucherClaimReason } from "@/lib/bank-existing-voucher-claim";
 
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
@@ -110,12 +111,12 @@ export async function POST(
     }
 
     const { commandId } = await context.params;
-    const success = body.status === "succeeded" || body.success === true;
+    let success = body.status === "succeeded" || body.success === true;
     const rawResult = body.result && typeof body.result === "object" ? body.result as Record<string, unknown> : {};
     const nativePdfBase64 = typeof rawResult.nativePdfBase64 === "string" ? rawResult.nativePdfBase64 : null;
-    const result = { ...rawResult };
+    let result = { ...rawResult };
     delete result.nativePdfBase64;
-    const errorMessage = success ? null : toNullableText(body.error, 2000) ?? "Tally command failed.";
+    let errorMessage = success ? null : toNullableText(body.error, 2000) ?? "Tally command failed.";
 
     if (isLocalDbMode()) {
       const completed = await completeLocalTallyCommand({
@@ -193,6 +194,18 @@ export async function POST(
       return jsonWithCors(request, {
         command: { id: commandId, status: pendingCommand.status },
       });
+    }
+
+    if (success && pendingCommand.command_type === "post_bank_voucher") {
+      const protectedResult = await protectExistingVoucherClaim(supabase, {
+        ownerId: connection.owner_user_id, companyDatasetId: pendingCommand.company_dataset_id!,
+        transactionId: String(commandPayload.transactionId || ""), commandId,
+      }, result);
+      if (protectedResult !== result) {
+        result = protectedResult;
+        success = false;
+        errorMessage = existingVoucherClaimReason;
+      }
     }
 
     const completionArguments = {
