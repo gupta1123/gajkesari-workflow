@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildStatementBankBook, savedPostingPresence, statementBalances, summarizeSavedPostings } from './statement-bank-book.ts';
+import { buildStatementBankBook, savedPostingPresence, statementBalances, summarizeSavedPostings,
+  statementCheckMessage, statementBalanceMessage } from './statement-bank-book.ts';
 import { buildBankBookRows } from './bank-book-csv.ts';
 import { isReadyForTallyPosting } from './bank-statement-posting-readiness.ts';
 
@@ -50,7 +51,7 @@ test('refresh maps durable posting status to preview IDs and never makes uncerta
   const presence = savedPostingPresence(rows, postings);
   assert.equal(presence['preview-0'].status, 'found');
   assert.equal(presence['preview-17'].status, 'verification_pending');
-  assert.equal(presence['preview-17'].label, 'Sent; confirmation pending');
+  assert.equal(presence['preview-17'].label, 'Accepted by Tally; confirmation pending');
   assert.equal(isReadyForTallyPosting({ ledgerName: 'Suspense', ledgerNeedsReview: false, amount: 518779,
     directPosting: true, billRequired: false, postingRecorded: true, presence: { status: 'missing' } }), false);
 });
@@ -78,4 +79,50 @@ test('held manual duplicates explain that nothing was posted', () => {
   const presence = savedPostingPresence([rows[0]], saved);
   assert.equal(presence['preview-0'].status, 'verification_pending');
   assert.match(presence['preview-0'].reason, /Possible existing entry.*Nothing was posted/);
+});
+
+test('completed held rows retain voucher evidence and do not appear as a pending Tally check', () => {
+  const row = { id: 'held', transactionDate: '2026-10-08', description: 'Payment to Deccan', debitAmount: 220.22, selectedLedgerName: 'Deccan' };
+  const matches = ['5266', '5267'].map(voucherNumber => ({ voucherNumber, date: '2026-10-08', partyLedgerName: 'Deccan', ledgerNames: ['Deccan', 'ICICI'], bankReferences: [] }));
+  const presence = savedPostingPresence([row], [{ ...row, postingStatus: 'needs_tally_review', postingResult: { possibleDuplicateInTally: true, duplicateCheck: { matches } } }]);
+  assert.equal(presence.held.reviewKind, 'held');
+  assert.deepEqual(presence.held.matches.map(match => match.voucherNumber), ['5266', '5267']);
+  assert.match(presence.held.reason, /2 Tally vouchers/);
+  assert.match(presence.held.reason, /Nothing was posted/);
+  assert.match(statementCheckMessage(Object.values(presence)), /Check complete.*1 entry needs review/);
+  assert.doesNotMatch(statementCheckMessage(Object.values(presence)), /pending|not been checked/);
+  assert.equal(isReadyForTallyPosting({ ledgerName: 'Deccan', ledgerNeedsReview: false, presence: presence.held, amount: 220.22, directPosting: true, billRequired: false }), false);
+});
+
+test('single possible matches explain repeated rows, reference conflicts and party conflicts', () => {
+  const row = { id: 'first', transactionDate: '2026-10-08', description: 'Credit from Arvind', creditAmount: 1201.12, balanceAmount: 2000, selectedLedgerName: 'Arvind' };
+  const match = { voucherNumber: '2725', ledgerNames: ['Arvind', 'ICICI'], partyLedgerName: 'Arvind', bankReferences: [] };
+  const saved = (row, match) => ({ ...row, postingStatus: 'needs_tally_review', postingResult: { possibleDuplicateInTally: true, duplicateCheck: { matches: [match] } } });
+  const repeated = savedPostingPresence([row, { ...row, id: 'second', balanceAmount: 3201.12 }], [saved(row, match)]);
+  assert.match(repeated.first.reason, /repeats.*One existing Tally voucher cannot confirm both rows/);
+  const referenced = { ...row, referenceNumber: 'UTRIC261009004' };
+  const conflict = savedPostingPresence([referenced], [saved(referenced, { ...match, reference: 'INV-2026-1009' })]);
+  assert.match(conflict.first.reason, /different reference/);
+  assert.equal(conflict.first.matches[0].reference, 'INV-2026-1009');
+  const suspense = { ...row, selectedLedgerName: 'Suspense' };
+  assert.match(savedPostingPresence([suspense], [saved(suspense, match)]).first.reason, /different party ledger/);
+  const bankRef = savedPostingPresence([referenced], [saved(referenced, { ...match, reference: 'INV-2026-1009', bankReferences: ['UTRIC261009004'] })]);
+  assert.doesNotMatch(bankRef.first.reason, /different reference/);
+});
+
+test('unknown posting outcomes never claim either acceptance or no posting', () => {
+  const row = rows[0];
+  const presence = savedPostingPresence([row], [{ ...postings[0], postingStatus: 'needs_tally_review', postingResult: { reconciliationRequired: true } }]);
+  assert.equal(presence[row.id].reviewKind, 'outcome_unknown');
+  assert.match(presence[row.id].reason, /whether.*posted.*before retrying/);
+  assert.doesNotMatch(presence[row.id].reason, /accepted|Nothing was posted/);
+});
+
+test('balance differences show source and Tally amounts, including an opening-only mismatch', () => {
+  const message = statementBalanceMessage({ balancesMatch: false, statementOpeningBalance: 1000, tallyOpeningBalance: 900, statementClosingBalance: 2000, tallyClosingBalance: 2000 });
+  assert.match(message, /Opening balance: statement.*1,000.*Tally.*900.*difference.*100/);
+  assert.match(message, /Closing balance: statement.*2,000.*Tally.*2,000.*difference.*0/);
+  assert.match(message, /may explain.*download keeps the statement balances/);
+  assert.equal(statementBalanceMessage({ balancesMatch: true }), '');
+  assert.doesNotMatch(statementBalanceMessage({ balancesMatch: false }), /undefined|NaN/);
 });

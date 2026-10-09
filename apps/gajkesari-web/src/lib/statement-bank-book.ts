@@ -40,22 +40,90 @@ export function summarizeSavedPostings(rows: SavedPostingRow[]) {
     result: row.postingStatus === "verified" ? { ...row.postingResult, verificationStatus: "verified" } : row.postingResult })));
 }
 
+export type PostingMatch = {
+  reasons: string[]; ledgerNames: string[]; bankReferences: string[];
+  date: string | null; voucherType: string | null; voucherNumber: string | null;
+  reference: string | null; partyLedgerName: string | null; masterId: string | null;
+};
+export function postingMatches(result?: Record<string, unknown> | null): PostingMatch[] {
+  const check = result?.duplicateCheck as Record<string, unknown> | undefined;
+  const matches = check?.matches ?? result?.matches;
+  const strings = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  return Array.isArray(matches) ? matches.flatMap(value => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const row = value as Record<string, unknown>;
+    const string = (key: string) => typeof row[key] === "string" ? row[key] as string : null;
+    return [{ reasons: strings(row.reasons), ledgerNames: strings(row.ledgerNames), bankReferences: strings(row.bankReferences),
+      date: string("date"), voucherType: string("voucherType"), voucherNumber: string("voucherNumber"), reference: string("reference"),
+      partyLedgerName: string("partyLedgerName"), masterId: string("masterId") }];
+  }) : [];
+}
+
+export function heldPostingReason(row: StatementRow, rows: StatementRow[], matches: PostingMatch[]) {
+  const normalize = (value?: string | null) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const sameRows = rows.filter(candidate => candidate.transactionDate === row.transactionDate &&
+    candidate.description === row.description && !candidate.referenceNumber &&
+    Number(candidate.debitAmount || 0) === Number(row.debitAmount || 0) && Number(candidate.creditAmount || 0) === Number(row.creditAmount || 0));
+  let reason = "Possible existing entry in Tally. Compare the voucher details before deciding whether this is a separate transaction.";
+  if (matches.length > 1) reason = `${matches.length} Tally vouchers could match this transaction. Compare their dates, parties and references to identify the correct voucher.`;
+  else if (!row.referenceNumber && sameRows.length > 1 && matches.length === 1) reason = "This statement repeats the same transaction details without a bank reference. One existing Tally voucher cannot confirm both rows. Check whether this row is a separate transaction.";
+  else if (matches.length === 1) {
+    const match = matches[0];
+    const references = [match.reference, ...match.bankReferences].filter(Boolean);
+    if (row.referenceNumber && references.length && !references.some(reference => normalize(reference) === normalize(row.referenceNumber))) {
+      reason = "A similar Tally voucher has a different reference. Compare the statement bank reference with the voucher reference before posting.";
+    } else if (row.selectedLedgerName && match.ledgerNames.length && !match.ledgerNames.some(name => normalize(name) === normalize(row.selectedLedgerName))) {
+      reason = "A similar Tally voucher uses a different party ledger. Compare the party details before posting.";
+    }
+  }
+  return `${reason} Nothing was posted for this row.`;
+}
+
+export function statementCheckMessage(drafts: Array<{ status?: string; reviewKind?: string }>) {
+  const checking = drafts.filter(row => row.status === "checking").length;
+  const notChecked = drafts.filter(row => !row.status || row.status === "not_checked" || row.status === "cannot_check_yet").length;
+  const failed = drafts.filter(row => row.status === "failed").length;
+  const review = drafts.filter(row => row.status === "ambiguous" || row.reviewKind === "held").length;
+  const uncertain = drafts.filter(row => row.status === "verification_pending" && row.reviewKind !== "held").length;
+  if (checking) return `Checking ${checking} ${checking === 1 ? "entry" : "entries"} in Tally`;
+  if (notChecked) return `${notChecked} ${notChecked === 1 ? "entry has" : "entries have"} not been checked in Tally`;
+  if (failed) return `${failed} ${failed === 1 ? "entry" : "entries"} couldn't be checked in Tally`;
+  if (review || uncertain) return `Check complete · ${[review ? `${review} ${review === 1 ? "entry needs" : "entries need"} review` : "", uncertain ? `${uncertain} posting ${uncertain === 1 ? "confirmation needs" : "confirmations need"} checking` : ""].filter(Boolean).join(" · ")}`;
+  return "Tally check complete";
+}
+
+export function statementBalanceMessage(proof?: { balancesMatch?: boolean | null; statementOpeningBalance?: number | null; tallyOpeningBalance?: number | null; statementClosingBalance?: number | null; tallyClosingBalance?: number | null } | null) {
+  if (proof?.balancesMatch !== false) return "";
+  const money = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(value);
+  const comparisons = [["Opening", proof.statementOpeningBalance, proof.tallyOpeningBalance], ["Closing", proof.statementClosingBalance, proof.tallyClosingBalance]] as const;
+  const details = comparisons.flatMap(([label, statement, tally]) => typeof statement === "number" && typeof tally === "number" && Number.isFinite(statement) && Number.isFinite(tally)
+    ? [`${label} balance: statement ${money(statement)}; Tally ${money(tally)}; difference ${money(Math.abs(statement - tally))}.`] : []);
+  return `${details.length ? details.join(" ") : "The statement and Tally balances differ."} Compare the bank ledger for the statement period; entries awaiting review or other Tally entries may explain the difference. Your download keeps the statement balances.`;
+}
+
 export function savedPostingPresence(rows: Array<StatementRow & { id: string }>, postings: SavedPostingRow[]) {
   const saved = new Map(postings.map(row => [statementRowKey(row), row]));
-  type Presence = { status: "found" | "verification_pending"; label: string; reason: string; voucherNumber: string | null; alreadyInTally?: boolean };
+  type Presence = { status: "found" | "verification_pending"; label: string; reason: string; voucherNumber: string | null; alreadyInTally?: boolean;
+    reviewKind?: "held" | "confirmation_pending" | "outcome_unknown"; matches: PostingMatch[]; voucherDate?: string | null; duplicateInTally?: boolean };
   return Object.fromEntries(rows.flatMap<[string, Presence]>(row => {
     const posting = saved.get(statementRowKey(row));
     if (!posting) return [];
     const outcome = savedPostingOutcome(posting);
+    const matches = postingMatches(posting.postingResult);
+    const evidence = { matches, voucherDate: matches[0]?.date || null, duplicateInTally: posting.postingResult?.duplicateInTally === true ||
+      (posting.postingResult?.duplicateCheck as Record<string, unknown> | undefined)?.duplicateInTally === true };
     if (outcome.status === "confirmed") return [[row.id, { status: "found" as const,
       label: posting.postingResult?.alreadyInTally === true ? "Already entered in Tally" : "Confirmed in Tally",
       reason: posting.postingResult?.alreadyInTally === true ? "This entry was already in Tally. No new entry was posted." : "This entry was confirmed in Tally.", voucherNumber: posting.voucherNumber || null,
-      alreadyInTally: posting.postingResult?.alreadyInTally === true }]];
+      alreadyInTally: posting.postingResult?.alreadyInTally === true, ...evidence }]];
     if (outcome.status === "needs_check") return [[row.id, { status: "verification_pending" as const,
       label: posting.postingResult?.possibleDuplicateInTally === true ? "Possible existing entry"
-        : outcome.accepted ? "Sent; confirmation pending" : "Needs checking in Tally",
-      reason: posting.postingResult?.possibleDuplicateInTally === true ? "Possible existing entry in Tally. Nothing was posted for this row. Please review."
-        : outcome.accepted ? "Tally accepted the entries, but this entry still needs checking. Do not send it again." : "We couldn't confirm this entry in Tally. Check again before sending it again.", voucherNumber: null }]];
+        : outcome.accepted ? "Accepted by Tally; confirmation pending" : "Posting outcome unknown",
+      reason: posting.postingResult?.possibleDuplicateInTally === true ? heldPostingReason({ ...row, selectedLedgerName: posting.ledgerName || row.selectedLedgerName }, rows, matches)
+        : outcome.accepted ? "Tally accepted this entry, but its voucher confirmation is pending. Recheck in Tally; do not post it again."
+          : "We couldn't confirm whether this entry was posted. Check Tally before retrying to avoid a duplicate.",
+      reviewKind: posting.postingResult?.possibleDuplicateInTally === true ? "held" : outcome.accepted ? "confirmation_pending" : "outcome_unknown",
+      voucherNumber: null, ...evidence }]];
     return [];
   }));
 }

@@ -134,7 +134,7 @@ test("an explicit Suspense fallback stays postable when close-match alternatives
 
 test("close-match Suspense and plain Suspense have distinct labels and colors", async () => {
   const page = await readFile(new URL("../components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
-  assert.match(page, /Close match · defaults to Suspense/);
+  assert.match(page, /Suggested ledger: Suspense · review party/);
   assert.match(page, /status === "suspense" && transaction\.candidateLedgerNames\.length > 0\) return "bg-sky-500"/);
   assert.match(page, /return "bg-amber-500"/);
 });

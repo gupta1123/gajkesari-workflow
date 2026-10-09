@@ -30,9 +30,10 @@ import { CompanyAvatar } from "@/components/ui/company-avatar";
 import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import { apiFetch } from "@/lib/api-client";
 import { buildBankBookCsv } from "@/lib/bank-book-csv";
-import { bankPostingOutcome, bankPostingMessage, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
+import { bankPostingOutcome, bankPostingMessage, bankPostingTitle, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
 import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
-import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings } from "@/lib/statement-bank-book";
+import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings,
+  heldPostingReason, statementCheckMessage, statementBalanceMessage } from "@/lib/statement-bank-book";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
@@ -641,10 +642,12 @@ type OutgoingMatchCandidate = {
   partyLedgerName?: string | null;
   ledgerNames: string[];
   masterId?: string | null;
+  bankReferences?: string[];
 };
 
 type OutgoingVerificationDraft = {
   alreadyInTally?: boolean;
+  reviewKind?: "held" | "confirmation_pending" | "outcome_unknown";
   status:
     | "verification_pending"
     | "not_checked"
@@ -2181,11 +2184,11 @@ function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
 
 function getReviewStatusLabel(transaction: ReviewTransaction) {
   const status = getReviewStatus(transaction);
-  if (status === "matched") return "Ledger matched";
+  if (status === "matched") return "Ledger selected";
   if (status === "suspense") {
     return transaction.candidateLedgerNames.length > 0
-      ? "Close match · defaults to Suspense"
-      : "In Suspense";
+      ? "Suggested ledger: Suspense · review party"
+      : "Selected ledger: Suspense";
   }
   return "Review required";
 }
@@ -2207,6 +2210,8 @@ function getLedgerReviewFilterValue(transaction: ReviewTransaction): Exclude<Rev
 function getTallyResultFilterValue(
   draft?: OutgoingVerificationDraft | null
 ): Exclude<ReviewTallyResultFilter, "all"> {
+  if (draft?.reviewKind === "held") return "review";
+  if (draft?.status === "verification_pending") return "pending";
   if (!draft || draft.status === "not_checked" || draft.status === "checking") return "pending";
   if (draft.duplicateInTally || draft.status === "ambiguous") return "review";
   if (draft.status === "found") return "found";
@@ -2374,6 +2379,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
           voucherType: typeof row.voucherType === "string" ? row.voucherType : null,
           voucherNumber: typeof row.voucherNumber === "string" ? row.voucherNumber : null,
           reference: typeof row.reference === "string" ? row.reference : null,
+          bankReferences: Array.isArray(row.bankReferences) ? row.bankReferences.filter((value): value is string => typeof value === "string") : [],
           partyLedgerName: typeof row.partyLedgerName === "string" ? row.partyLedgerName : null,
           ledgerNames: Array.isArray(row.ledgerNames)
             ? row.ledgerNames.filter((ledgerName): ledgerName is string => typeof ledgerName === "string")
@@ -2535,7 +2541,7 @@ function getReviewPostingAction(
   ledgerMasters: TallyMaster[],
   tallyPresence?: OutgoingVerificationDraft | null
 ): ReviewPostingAction {
-  if (tallyPresence?.status === "found") return "outgoing";
+  if (tallyPresence && ["found", "ambiguous", "verification_pending"].includes(tallyPresence.status)) return "outgoing";
 
   const outgoingPayment = isOutgoingPaymentRow(transaction);
   const billMatchEligible = isBillMatchEligibleTransaction(transaction, ledgerMasters);
@@ -3405,7 +3411,7 @@ export function BankStatementsPage() {
   const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [postedTransactionIds, setPostedTransactionIds] = useState<Set<string>>(() => new Set());
   const [persistedPostedTransactions, setPersistedPostedTransactions] = useState<PostedBankBookTransaction[]>([]);
-  const [, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
+  const [tallyBalanceProof, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [billAllocationSearch, setBillAllocationSearch] = useState("");
   const [confirmFullAdvance, setConfirmFullAdvance] = useState(false);
@@ -3750,7 +3756,7 @@ export function BankStatementsPage() {
   );
   const uncheckedTallyPresenceCount = validTransactions.filter((transaction) => {
     const status = tallyPresenceByTransactionId[transaction.id]?.status;
-    return status !== "found" && status !== "missing" && status !== "ambiguous";
+    return !status || ["not_checked", "checking", "cannot_check_yet", "failed"].includes(status);
   }).length;
   const ambiguousTallyPresenceCount = validTransactions.filter(
     (transaction) => tallyPresenceByTransactionId[transaction.id]?.status === "ambiguous"
@@ -3869,11 +3875,11 @@ export function BankStatementsPage() {
     for (const transaction of validTransactions) {
       const completed = tallyPresenceByTransactionId[transaction.id]?.status === "found";
       if (completed) counts.completed += 1;
-      else if (getReviewStatus(transaction) === "needs_review") counts.needsAction += 1;
-      else if (getReviewStatus(transaction) === "matched") counts.ready += 1;
+      else if (readyPostingIds.has(transaction.id)) counts.ready += 1;
+      else counts.needsAction += 1;
     }
     return counts;
-  }, [tallyPresenceByTransactionId, validTransactions]);
+  }, [tallyPresenceByTransactionId, validTransactions, readyPostingIds]);
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
     return validTransactions.filter((transaction) => {
@@ -3882,11 +3888,7 @@ export function BankStatementsPage() {
       const completed = tallyPresenceByTransactionId[transaction.id]?.status === "found";
       const workStatus: Exclude<ReviewWorkStatusFilter, "all"> | null = completed
         ? "completed"
-        : getReviewStatus(transaction) === "needs_review"
-          ? "needs_action"
-          : getReviewStatus(transaction) === "matched"
-            ? "ready"
-            : null;
+        : readyPostingIds.has(transaction.id) ? "ready" : "needs_action";
       if (reviewWorkStatusFilter !== "all" && workStatus !== reviewWorkStatusFilter) {
         return false;
       }
@@ -3944,6 +3946,7 @@ export function BankStatementsPage() {
   }, [
     billAllocationsByTransactionId,
     ledgerMasters,
+    readyPostingIds,
     reviewAllocationFilter,
     reviewDateFrom,
     reviewDateTo,
@@ -3981,6 +3984,11 @@ export function BankStatementsPage() {
   ) || validTransactions.some(row => postedTransactionIds.has(row.id) && tallyPresenceByTransactionId[row.id]?.status === "found");
   const canDownloadBankBook = hasPostedEntries && bankBookTransactions.length > 0 && !tallyPostingInProgress && !previewExtractionIncomplete;
   const needsPostingCheck = persistedPostedTransactions.filter(row => savedPostingOutcome(row).status === "needs_check");
+  const postingSummary = tallyPostingStatus
+    ? summarizeBankPostings(tallyPostingStatus.commands.filter(command => (command.commandType || command.command_type) === "post_bank_voucher"))
+    : summarizeSavedPostings(persistedPostedTransactions);
+  const tallyCheckMessage = tallyPostingInProgress ? "Processing entries in Tally"
+    : statementCheckMessage(validTransactions.map(row => tallyPresenceByTransactionId[row.id] || {}));
   const [bankBookFormat, setBankBookFormat] = useState<"pdf" | "csv">("pdf");
   const [downloadingBankBook, setDownloadingBankBook] = useState(false);
   const [recheckingPostings, setRecheckingPostings] = useState(false);
@@ -4014,12 +4022,12 @@ export function BankStatementsPage() {
     setStatementDoneSummary(null);
     const unmatchedRows = rows.filter(row => !saved.some(posting => statementRowKey(posting) === statementRowKey(row))).length;
     if (summary.pending > 0 || unmatchedRows > 0) {
-      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary)} ${summary.pending + unmatchedRows} statement entries remain to be sent.` });
+      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary)}${unmatchedRows ? ` ${unmatchedRows} statement entries have no saved posting result; check Tally before posting.` : ""}` });
       return;
     }
     if (summary.confirmed || summary.needsCheck || summary.failed) {
       const tone = summary.failed ? "error" : summary.needsCheck || summary.pending ? "info" : "success";
-      setStatementDoneSummary({ tone, title: summary.needsCheck ? "Some entries need review" : summary.failed ? "Some entries couldn't be posted" : "Entries confirmed in Tally",
+      setStatementDoneSummary({ tone, title: bankPostingTitle(summary),
         text: bankPostingMessage(summary) + " Your download includes the full statement." });
     }
   }
@@ -4030,7 +4038,7 @@ export function BankStatementsPage() {
       const response = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/recheck`, { method: "POST" });
       if (!response.ok) throw new Error(await readError(response));
       const { commandIds, connectionId } = await response.json() as { commandIds: string[]; connectionId: string };
-      setBanner({ tone: "info", text: "Checking the remaining entries in Tally. No entries will be sent again." });
+      setBanner({ tone: "info", text: "Rechecking the remaining entries in Tally without posting. Conflicting details may still need review." });
       const commands = await waitForCommands(connectionId, commandIds);
       if (commands.length !== commandIds.length) throw new Error("Tally is still checking. Please check again shortly.");
       const complete = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/recheck`, { method: "PATCH", body: JSON.stringify({ commandIds }) });
@@ -4071,10 +4079,12 @@ export function BankStatementsPage() {
     ? "Posting blocked"
     : matchingBills
       ? "Checking statement against Tally"
+      : tallyPostingInProgress
+        ? "Processing entries in Tally"
       : statementCompletedCleanly
-        ? tallyPostingStatus?.voucherTotal
-          ? "Posted and verified"
-          : "Verified in Tally"
+        ? "Entries confirmed in Tally"
+        : statementDoneSummary
+          ? "Processing finished"
         : uncheckedTallyPresenceCount > 0
           ? `${readyPostingTransactions.length} prepared`
           : readyPostingTransactions.length > 0
@@ -4088,10 +4098,14 @@ export function BankStatementsPage() {
     ? "Complete the extraction review before posting."
     : matchingBills
       ? "Checking duplicates and existing vouchers."
+      : tallyPostingInProgress
+        ? "Existing entries are skipped; only new entries are posted."
       : statementCompletedCleanly
         ? "Statement processing is complete."
+        : statementDoneSummary
+          ? postingSummary.failed ? "Review the entries that couldn't be posted." : tallyCheckMessage
         : uncheckedTallyPresenceCount > 0
-          ? "Tally duplicate check pending"
+          ? tallyCheckMessage
           : readyPostingTransactions.length > 0
             ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
             : heldPostingRowCount > 0
@@ -4364,6 +4378,7 @@ export function BankStatementsPage() {
     outgoingReviewTransaction &&
       tallyResultReviewIsIncoming &&
       !tallyResultReviewAlreadyInTally &&
+      (!tallyResultReviewDraft || ["not_checked", "missing"].includes(tallyResultReviewDraft.status)) &&
       !isBillMatchEligibleTransaction(outgoingReviewTransaction, ledgerMasters)
   );
   const tallyResultReviewDirection = tallyResultReviewIsIncoming ? "receipt" : "payment";
@@ -4378,7 +4393,7 @@ export function BankStatementsPage() {
   })();
   const tallyResultReviewReason = (() => {
     if (!outgoingReviewTransaction || !tallyResultReviewDraft) {
-      return `Run Check Tally Matches to verify this ${tallyResultReviewDirection} against Tally.`;
+      return `Use Check Tally to check this ${tallyResultReviewDirection} for an existing voucher.`;
     }
     if (tallyResultReviewDraft.status === "found") {
       const genericOutgoingReason = "Existing outgoing entry was found in Tally.";
@@ -4386,8 +4401,14 @@ export function BankStatementsPage() {
         return `This ${tallyResultReviewDirection} matches an existing Tally voucher. No action is required.`;
       }
     }
+    if (tallyResultReviewDraft.status === "ambiguous") {
+      return heldPostingReason(outgoingReviewTransaction, validTransactions, (tallyResultReviewDraft.matches || []).map(match => ({
+        ...match, bankReferences: match.bankReferences || [], date: match.date || null, voucherType: match.voucherType || null,
+        voucherNumber: match.voucherNumber || null, reference: match.reference || null, partyLedgerName: match.partyLedgerName || null, masterId: match.masterId || null,
+      })));
+    }
     if (tallyResultReviewIsDirectReceipt) {
-      return "Bill matching is not applicable for this ledger. This receipt is ready to post directly as a Receipt voucher.";
+      return "This ledger does not use bill allocation. The receipt can be posted directly after the duplicate check passes.";
     }
     return tallyResultReviewDraft.reason;
   })();
@@ -4771,7 +4792,7 @@ export function BankStatementsPage() {
       if (nextStatus.finished) {
         if (nextStatus.needsCheck > 0) {
           const summary = summarizeBankPostings(nextStatus.commands.filter(command => (command.commandType || command.command_type) === "post_bank_voucher"));
-          setStatementDoneSummary({ tone: nextStatus.failed ? "error" : "info", title: "Some entries need review", text: bankPostingMessage(summary) + " Your download includes the full statement." });
+          setStatementDoneSummary({ tone: nextStatus.failed ? "error" : "info", title: bankPostingTitle(summary), text: bankPostingMessage(summary) + " Your download includes the full statement." });
           setBanner(null);
           showToast("info", bankPostingMessage(summary));
         } else if (nextStatus.failed > 0 || nextStatus.canceled > 0) {
@@ -6846,7 +6867,6 @@ export function BankStatementsPage() {
             const remainingPostedRows = validTransactions.filter(
               (transaction) => selectedIds.has(transaction.id) && drafts[transaction.id]?.status !== "found"
             ).length;
-            const foundRows = Object.values(drafts).filter((draft) => draft.status === "found").length;
             if (remainingPostedRows > 0) {
               setStatementDoneSummary({
                 tone: "info",
@@ -6866,21 +6886,21 @@ export function BankStatementsPage() {
               setStatementDoneSummary(null);
               setBanner({
                 tone: "success",
-                text: `${selectedTallyWorkTransactions.length} selected transaction(s) were posted and verified. ${remainingStatementRows} statement row(s) remain for another posting action.`,
+                text: `${bankPostingMessage(summarizeBankPostings(finalStatus.commands.filter(command => (command.commandType || command.command_type) === "post_bank_voucher")))} ${remainingStatementRows} statement entries still need checking before posting.`,
               });
               return;
             }
             const checksOnly = finalStatus.voucherTotal === 0;
             setStatementDoneSummary({
               tone: "success",
-              title: checksOnly ? "Statement verified against Tally." : "Posted and verified in Tally.",
+              title: checksOnly ? "Statement checked against Tally" : "Entries confirmed in Tally",
               text: checksOnly
                 ? `${finalStatus.paymentCheckCompleted} outgoing payment check(s) completed and no Tally entries were created.`
-                : `${selectedTallyWorkTransactions.length} selected transaction(s) were posted and verified. ${foundRows} statement row(s) currently have matching Tally vouchers.`,
+                : bankPostingMessage(summarizeBankPostings(finalStatus.commands.filter(command => (command.commandType || command.command_type) === "post_bank_voucher"))),
             });
             setBanner({
               tone: balanceProof?.balancesMatch === false ? "info" : "success",
-              text: `${checksOnly ? "No entries were created." : "All selected bank transactions were verified in live Tally."}${balanceProof?.balancesMatch === false ? " Balance differs from Tally; posting remains allowed." : ""}`,
+              text: `${checksOnly ? "No entries were created." : "All selected bank transactions were confirmed in Tally."}${balanceProof?.balancesMatch === false ? ` ${statementBalanceMessage(balanceProof)}` : ""}`,
             });
           })
           .catch((pollError) => {
@@ -7017,12 +7037,14 @@ export function BankStatementsPage() {
                 {preview && (
                   <span
                     className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
-                      statementDoneSummary
-                        ? "border-emerald-250 bg-emerald-50 text-emerald-800"
+                      statementDoneSummary?.tone === "error"
+                        ? "border-red-250 bg-red-50 text-red-800"
+                        : postingSummary.needsCheck > 0
+                          ? "border-amber-250 bg-amber-50 text-amber-800"
                         : "border-emerald-250 bg-emerald-50 text-emerald-800"
                     }`}
                   >
-                    {statementDoneSummary?.tone === "success" ? "Completed" : needsPostingCheck.length ? "Needs checking" : "Analyzed"}
+                    {tallyPostingInProgress ? "Processing" : statementDoneSummary?.tone === "success" ? "Completed" : postingSummary.failed ? "Some entries failed" : postingSummary.held ? "Needs review" : postingSummary.needsCheck ? "Confirmation needs checking" : "Analyzed"}
                   </span>
                 )}
                 <button
@@ -7117,6 +7139,12 @@ export function BankStatementsPage() {
             </div>
             </div>
           </header>
+
+          {preview && tallyBalanceProof?.balancesMatch === false ? (
+            <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900">
+              {statementBalanceMessage(tallyBalanceProof)}
+            </div>
+          ) : null}
 
           {!preview ? (
             <div className="flex w-full min-w-0 flex-wrap items-center gap-1 rounded-xl border border-[#e2dbd1] bg-white/80 px-2.5 py-1.5">
@@ -7760,7 +7788,7 @@ export function BankStatementsPage() {
                           <div className="flex items-center gap-1.5">
                             <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Tally Ledger</span>
                             <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[7px] font-extrabold uppercase tracking-wider text-emerald-800">
-                              {bankLedgerVerified ? "Matched" : bankLedgerManuallyConfirmed ? "Selected" : "Chosen"}
+                              {bankLedgerVerified ? "Account matched" : bankLedgerManuallyConfirmed ? "Selected" : "Chosen"}
                             </span>
                           </div>
                           <div className="truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={bankLedgerName}>
@@ -7912,9 +7940,12 @@ export function BankStatementsPage() {
                     <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 rounded-lg border border-[#e5ddd0] bg-[#faf8f4]/70 px-3 py-1.5 text-[10px] font-bold">
                       <span className="inline-flex items-center gap-1.5 text-slate-700">
                         <span className="h-1.5 w-1.5 rounded-full bg-slate-500" />
-                        {validTransactions.length} checked
+                        {validTransactions.length} statement entries
                       </span>
-                      {uncheckedTallyPresenceCount === 0 ? (
+                      <span className={`inline-flex items-center gap-1.5 ${heldPostingRowCount > 0 ? "text-amber-800" : "text-slate-600"}`}>
+                        {tallyCheckMessage}
+                      </span>
+                      {uncheckedTallyPresenceCount === 0 && !statementDoneSummary ? (
                         <>
                           <span className="inline-flex items-center gap-1.5 text-emerald-800">
                             <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
@@ -7933,12 +7964,7 @@ export function BankStatementsPage() {
                             {transactionOutcomeCounts.needsAttention} need review
                           </span>
                         </>
-                      ) : (
-                        <span className="inline-flex items-center gap-1.5 text-slate-600">
-                          <span className="h-1.5 w-1.5 rounded-full bg-slate-400" />
-                          Live Tally check pending
-                        </span>
-                      )}
+                      ) : null}
                     </div>
                   </div>
                   {reviewFiltersOpen ? (
@@ -8386,10 +8412,12 @@ export function BankStatementsPage() {
                                     </span>
                                   </button>
                                 ) : tallyPresence?.status === "verification_pending" ? (
-                                  <div className="flex flex-col gap-1 text-left" title={tallyPresence.reason}>
+                                  <button type="button" className="flex w-full flex-col gap-1 rounded-lg px-1.5 text-left hover:bg-amber-50 focus-visible:ring-2 focus-visible:ring-amber-300" title="View the reason and matching Tally voucher details"
+                                    onClick={() => { setReviewActionStage("posting"); setOutgoingReviewTransactionId(transaction.id); }}>
                                     <span className="self-start rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[9px] font-bold text-amber-800">{tallyPresence.label || "Needs checking in Tally"}</span>
                                     <span className="text-[9px] text-slate-500">{tallyPresence.reason || "Check again before sending"}</span>
-                                  </div>
+                                    <span className="text-[9px] font-semibold text-amber-800 underline">View details</span>
+                                  </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
                                   <button
                                     className={`flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition ${
@@ -8613,7 +8641,7 @@ export function BankStatementsPage() {
                             ),
                           ],
                           ["UTR / Ref", getTransactionReference(billAllocationReviewTransaction) || "-"],
-                          ["Matched Ledger", billAllocationReviewTransaction.selectedLedgerName || "-"],
+                          ["Selected Ledger", billAllocationReviewTransaction.selectedLedgerName || "-"],
                           ["Ledger Group", getLedgerGroupLabel(billAllocationReviewTransaction, ledgerMasters)],
                         ].map(([label, value]) => (
                           <div key={label} className="border-b border-[#e5ddd0] pb-2">
@@ -9097,10 +9125,13 @@ export function BankStatementsPage() {
                           ],
                           ["Amount", formatCurrencyAmount(tallyResultReviewAmount)],
                           ["UTR / Ref", getTransactionReference(outgoingReviewTransaction) || "-"],
-                          ["Matched Ledger", outgoingReviewTransaction.selectedLedgerName || "-"],
+                          ["Selected Ledger", outgoingReviewTransaction.selectedLedgerName || "-"],
                           ["Ledger Group", getLedgerGroupLabel(outgoingReviewTransaction, ledgerMasters)],
                           ["Bank Ledger", bankLedgerName || "-"],
-                          ["Will Post As", tallyResultReviewAlreadyInTally ? "No posting required" : tallyResultReviewPostingVoucherType],
+                          ["Posting action", tallyResultReviewAlreadyInTally ? "No posting required: confirmed in Tally"
+                            : tallyResultReviewDraft?.reviewKind === "held" || tallyResultReviewDraft?.status === "ambiguous" ? "Not posted: review the possible match"
+                            : tallyResultReviewDraft?.status === "verification_pending" ? "Recheck confirmation; do not post again"
+                            : `Proposed voucher: ${tallyResultReviewPostingVoucherType}`],
                         ].map(([label, value]) => (
                           <div key={label} className="min-w-0 border-b border-[#e0e7eb] px-4 py-2 sm:border-r sm:even:border-r-0">
                             <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#7890a1]">
@@ -9163,7 +9194,7 @@ export function BankStatementsPage() {
                                 ? "border-amber-200 bg-amber-50 text-amber-800"
                                 : "border-emerald-200 bg-emerald-50 text-emerald-800"
                             }`}>
-                              {tallyResultReviewDraft.duplicateInTally ? "Posted with duplicates" : "Verified match"}
+                              {tallyResultReviewDraft.duplicateInTally ? "Multiple matching vouchers in Tally" : "Confirmed match"}
                             </span>
                           ) : null}
                         </div>
@@ -9205,6 +9236,14 @@ export function BankStatementsPage() {
                                     </div>
                                   </div>
                                   <div>
+                                    <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Voucher reference</div>
+                                    <div className="mt-0.5 break-words text-[10px] font-semibold text-[#1a1a1a]">{match.reference || "Not recorded"}</div>
+                                  </div>
+                                  <div>
+                                    <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Bank reference in Tally</div>
+                                    <div className="mt-0.5 break-words text-[10px] font-semibold text-[#1a1a1a]">{match.bankReferences?.filter(Boolean).join(", ") || "Not recorded"}</div>
+                                  </div>
+                                  <div>
                                     <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                       Why it matched
                                     </div>
@@ -9220,7 +9259,7 @@ export function BankStatementsPage() {
                                         ))
                                       ) : (
                                         <span className="text-[9px] font-semibold text-slate-400">
-                                          Unique voucher returned by the live Tally check
+                                          {tallyResultReviewDraft?.status === "found" ? "Confirmed by the Tally check" : "Similar date, bank and amount; compare party and reference"}
                                         </span>
                                       )}
                                     </div>
@@ -9238,7 +9277,7 @@ export function BankStatementsPage() {
                     </div>
                     <div className="flex items-center justify-between border-t border-[#b8cad5] bg-[#eaf3f8] px-4 py-2">
                       <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#61788a]">
-                        Review transaction
+                        Viewing details does not change or post this entry
                       </span>
                       <Button
                         autoFocus
@@ -9247,8 +9286,8 @@ export function BankStatementsPage() {
                         type="button"
                       >
                         {(filteredTransactionIndexById.get(outgoingReviewTransaction.id) ?? -1) < filteredTransactions.length - 1
-                          ? "Done & next"
-                          : "Done"}
+                          ? "Next entry"
+                          : "Close"}
                       </Button>
                     </div>
                   </aside>
@@ -9291,7 +9330,7 @@ export function BankStatementsPage() {
                 >
                   {tallyPostingStatus.voucherTotal > 0 ? (
                     <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
-                      Confirmed in Tally {tallyPostingStatus.voucherCompleted}/{tallyPostingStatus.voucherTotal}
+                      {postingSummary.confirmed - postingSummary.alreadyExisting} newly posted · {postingSummary.alreadyExisting} already present
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-white px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600">
@@ -9316,7 +9355,9 @@ export function BankStatementsPage() {
                         : "Checking Tally transactions"}
                     </span>
                   ) : null}
-                  {tallyPostingStatus.needsCheck > 0 ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">{tallyPostingStatus.needsCheck} needs checking</span> : null}
+                  {postingSummary.held > 0 ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">{postingSummary.held} not posted · review required</span> : null}
+                  {postingSummary.confirmationPending > 0 ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">{postingSummary.confirmationPending} accepted · confirmation pending</span> : null}
+                  {postingSummary.outcomeUnknown > 0 ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">{postingSummary.outcomeUnknown} posting {postingSummary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown</span> : null}
                   {tallyPostingStatus.errors[0] ? (
                     <span className="min-w-0 max-w-[520px] truncate text-xs text-red-700">
                       Review the entries that could not be posted.
@@ -9336,10 +9377,13 @@ export function BankStatementsPage() {
                 Upload Another
               </Button>
               {needsPostingCheck.length > 0 ? (
-                <Button type="button" variant="outline" onClick={recheckPostings} disabled={recheckingPostings || tallyPostingInProgress || matchingBills || sending}>
+                <div className="flex max-w-[310px] flex-col items-end gap-1">
+                <Button type="button" variant="outline" onClick={recheckPostings} aria-describedby="posting-recheck-help" disabled={recheckingPostings || tallyPostingInProgress || matchingBills || sending}>
                   {recheckingPostings ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                  Check again ({needsPostingCheck.length})
+                  {recheckingPostings ? "Rechecking" : "Recheck in Tally"} ({needsPostingCheck.length})
                 </Button>
+                <span id="posting-recheck-help" className="text-right text-[9px] leading-3 text-slate-500">Checks without posting. Review conflicting details using View details.</span>
+                </div>
               ) : null}
               {!statementDoneSummary ? (
                 <>
