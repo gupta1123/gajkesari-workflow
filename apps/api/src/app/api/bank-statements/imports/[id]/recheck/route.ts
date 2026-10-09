@@ -1,3 +1,4 @@
+import { loadStatementPostingRows } from "@/lib/bank-statement-linked-transactions";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -23,7 +24,7 @@ async function scope(request: Request, context: Context) {
   const { id } = await context.params;
   const db = createSupabaseAdminClient();
   const { data: statement, error } = await db.from("bank_statement_imports")
-    .select("id,company_dataset_id,processing_meta")
+    .select("id,company_dataset_id,bank_account_id,processing_meta")
     .eq("id", id).eq("owner_user_id", user.id)
     .in("company_dataset_id", await browserDatasetIds(request, user.id)).single();
   if (error || !statement) throw new RecheckError("This statement isn't available for the selected company.", 404);
@@ -44,14 +45,9 @@ export async function POST(request: Request, context: Context) {
     const transactionId = typeof body.transactionId === "string" ? body.transactionId : "";
     const ledgerName = typeof body.ledgerName === "string" ? body.ledgerName : "";
     if (ledgerName && !transactionId) throw new RecheckError("Select an entry before correcting its ledger.", 400);
-    let query = db.from("bank_transactions")
-      .select("id,fingerprint").eq("statement_import_id", statement.id)
-      .eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id)
-      .eq("tally_status", "needs_tally_review").limit(100);
-    if (transactionId) query = query.eq("id", transactionId);
-    const { data: transactions, error } = await query;
-    if (error) throw error;
-    if (transactionId && !transactions?.length) throw new RecheckError("This entry no longer needs checking. Refresh the statement.", 409);
+    const statementRows = await loadStatementPostingRows(db, statement, user.id);
+    const transactions = statementRows.filter(row => row.tally_status === "needs_tally_review" && (!transactionId || row.id === transactionId)).slice(0, 100);
+    if (transactionId && !transactions.length) throw new RecheckError("This entry no longer needs checking. Refresh the statement.", 409);
     const commandIds: string[] = [];
     let connectionId = "";
     for (const transaction of transactions ?? []) {
@@ -141,6 +137,8 @@ export async function PATCH(request: Request, context: Context) {
       .eq("company_dataset_id", statement.company_dataset_id).eq("command_type", "verify_bank_transaction")
       .contains("payload", { recheckImportId: statement.id }) : { data: [], error: null };
     if (error) throw error;
+    const statementRows = await loadStatementPostingRows(db, statement, user.id);
+    const statementTransactionIds = new Set(statementRows.map(row => row.id));
     let confirmed = 0;
     let checked = 0;
     let checkFailed = 0;
@@ -153,8 +151,9 @@ export async function PATCH(request: Request, context: Context) {
       if (!original) continue;
       if (!["succeeded", "failed", "canceled", "cancelled", "expired", "quarantined"].includes(command.status)) continue;
       const transactionId = command.payload.recheckTransactionId || original.payload.transactionId;
+      if (!statementTransactionIds.has(transactionId)) continue;
       const { data: transaction, error: transactionError } = await db.from("bank_transactions")
-        .select("id,fingerprint").eq("id", transactionId).eq("statement_import_id", statement.id)
+        .select("id,fingerprint").eq("id", transactionId)
         .eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id).single();
       if (transactionError) throw transactionError;
       if (!transaction) continue;
@@ -215,10 +214,7 @@ export async function PATCH(request: Request, context: Context) {
       if (original.queue_job_id) await refreshBankStatementQueueJobStatus(db, original.queue_job_id);
       confirmed++;
     }
-    const { data: remainingRows, error: remainingError } = await db.from("bank_transactions").select("id")
-      .eq("statement_import_id", statement.id).eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id)
-      .eq("tally_status", "needs_tally_review");
-    if (remainingError) throw remainingError;
+    const remainingRows = (await loadStatementPostingRows(db, statement, user.id)).filter(row => row.tally_status === "needs_tally_review");
     return jsonWithCors(request, { confirmed, checked, checkFailed, remaining: remainingRows?.length || 0 });
   } catch (error) {
     return recheckErrorResponse(request, error);

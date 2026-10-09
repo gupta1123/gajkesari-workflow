@@ -40,7 +40,31 @@ export function summarizeSavedPostings(rows: SavedPostingRow[]) {
     result: row.postingStatus === "verified" ? { ...row.postingResult, verificationStatus: "verified" } : row.postingResult })));
 }
 
-export function postingFooterSegments(summary: ReturnType<typeof summarizeBankPostings>) {
+export function summarizeStatementPostings(rows: StatementRow[], saved: SavedPostingRow[]) {
+  const byKey = new Map(saved.map(row => [statementRowKey(row), row]));
+  return summarizeSavedPostings(rows.map((row, index) => byKey.get(statementRowKey(row)) ??
+    { ...row, id: `unsubmitted-${index}`, postingStatus: "pending" }));
+}
+
+export function mergeCompletedPostingEvidence<T extends SavedPostingRow>(saved: T[], commands: Array<{
+  commandType?: string; command_type?: string; status?: string; result?: Record<string, unknown> | null;
+}>) {
+  const confirmed = new Map(commands.flatMap(command => {
+    const result = command.result;
+    return (command.commandType || command.command_type) === "post_bank_voucher" &&
+      bankPostingOutcome(command).status === "confirmed" && typeof result?.transactionId === "string"
+      ? [[result.transactionId, result] as const] : [];
+  }));
+  return saved.map(row => {
+    const result = confirmed.get(row.id);
+    // Read-back belongs to this exact posting command, never to another
+    // preview row that merely matched the same voucher during a bulk check.
+    return result ? { ...row, postingStatus: "verified", postingResult: { ...row.postingResult, ...result },
+      voucherNumber: typeof result.voucherNumber === "string" ? result.voucherNumber : row.voucherNumber } : row;
+  });
+}
+
+export function postingFooterSegments(summary: ReturnType<typeof summarizeBankPostings>, processing = true) {
   const segments: Array<{ text: string; tone: "success" | "neutral" | "review" | "error" }> = [];
   const newlyPosted = summary.confirmed - summary.alreadyExisting;
   if (newlyPosted > 0) segments.push({ text: `${newlyPosted} posted`, tone: "success" });
@@ -49,7 +73,7 @@ export function postingFooterSegments(summary: ReturnType<typeof summarizeBankPo
   if (summary.confirmationPending > 0) segments.push({ text: `${summary.confirmationPending} awaiting confirmation`, tone: "review" });
   if (summary.outcomeUnknown > 0) segments.push({ text: `${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown`, tone: "review" });
   if (summary.failed > 0) segments.push({ text: `${summary.failed} couldn't be posted`, tone: "error" });
-  if (summary.pending > 0) segments.push({ text: `${summary.pending} processing`, tone: "neutral" });
+  if (summary.pending > 0) segments.push({ text: `${summary.pending} ${processing ? "processing" : "not sent"}`, tone: processing ? "neutral" : "review" });
   return segments;
 }
 

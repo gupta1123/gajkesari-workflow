@@ -1,9 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildStatementBankBook, savedPostingPresence, statementBalances, summarizeSavedPostings,
-  statementCheckMessage, statementBalanceMessage } from './statement-bank-book.ts';
+  statementCheckMessage, statementBalanceMessage, summarizeStatementPostings, postingFooterSegments, mergeCompletedPostingEvidence } from './statement-bank-book.ts';
 import { buildBankBookRows } from './bank-book-csv.ts';
 import { isReadyForTallyPosting } from './bank-statement-posting-readiness.ts';
+
+test('the complete 23-row repeat upload counts 4 new, 14 existing and 5 held and preserves held evidence over a live match', () => {
+  const rows = Array.from({length:23},(_,i)=>({id:`row-${i}`,transactionDate:'2026-10-08',description:`Entry ${i}`,creditAmount:100+i,balanceAmount:1000+i}));
+  const saved = rows.map((row,i)=>({...row,id:`db-${i}`,postingStatus:i<18?'verified':'needs_tally_review',
+    voucherNumber:i<18?`${2700+i}`:null,postingResult:i<18?{created:i<4?1:0,alreadyInTally:i>=4}:{possibleDuplicateInTally:true}}));
+  const summary=summarizeStatementPostings(rows,saved);
+  assert.equal(summary.confirmed-summary.alreadyExisting,4);
+  assert.equal(summary.alreadyExisting,14);assert.equal(summary.held,5);assert.equal(summary.total,23);
+  assert.deepEqual(postingFooterSegments(summary,false).map(r=>r.text),['4 posted','14 already entered','5 need review']);
+  const live=Object.fromEntries(rows.map(row=>[row.id,{status:'found',voucherNumber:'2725'}]));
+  Object.assign(live,savedPostingPresence(rows,saved));
+  assert.equal(live['row-18'].status,'verification_pending');assert.equal(live['row-18'].voucherNumber,null);
+  assert.equal(live['row-4'].alreadyInTally,true);
+});
+
+test('a completed partial posting accounts for every statement row without saying untouched rows are processing',()=>{
+  const rows=[{id:'one',description:'one'},{id:'two',description:'two'}];
+  const summary=summarizeStatementPostings(rows,[{...rows[0],postingStatus:'verified',postingResult:{created:1}}]);
+  assert.equal(summary.total,2);assert.equal(summary.pending,1);
+  assert.deepEqual(postingFooterSegments(summary,false).map(r=>r.text),['1 posted','1 not sent']);
+});
+
+test('a confirmed command survives a delayed saved status without confirming an unrelated held row',()=>{
+  const saved=[{id:'created-row',postingStatus:'pending'},{id:'old-held',postingStatus:'needs_tally_review',postingResult:{possibleDuplicateInTally:true}}];
+  const result=mergeCompletedPostingEvidence(saved,[{commandType:'post_bank_voucher',status:'succeeded',result:{transactionId:'created-row',created:1,verificationStatus:'verified',voucherNumber:'2741'}}]);
+  assert.equal(result[0].postingStatus,'verified');assert.equal(result[0].voucherNumber,'2741');
+  assert.equal(result[1].postingStatus,'needs_tally_review');assert.equal(saved[0].postingStatus,'pending');
+});
 
 test('same-amount rows keep distinct saved statuses and existing-voucher identity after reopening', () => {
   const first = { id: 'first', transactionDate: '2026-10-08', description: 'Credit from Arvind', creditAmount: 303.33, balanceAmount: 1303.33 };

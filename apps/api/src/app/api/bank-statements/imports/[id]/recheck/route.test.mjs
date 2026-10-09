@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import Module from 'node:module';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import * as linkedHelpers from '../../../../../../lib/bank-statement-linked-transactions.ts';
 import * as recheckHelpers from '../../../../../../lib/bank-statement-recheck.ts';
 
 const approved = { transactionId: 'tx', voucherDate: '2026-09-30', amount: 518779,
@@ -31,6 +32,7 @@ function fixture() {
       in(key, values) { filters.push(row => values.includes(row[key])); return query; },
       contains(key, values) { filters.push(row => Object.entries(values).every(([k, v]) => row[key]?.[k] === v)); return query; },
       order() { return query; },
+      range() { return query; },
       limit(value) { limit = value; return query; },
       single() { single = true; return query; },
       maybeSingle() { single = true; return query; },
@@ -69,6 +71,7 @@ function fixture() {
       return { command };
     } },
     '@/lib/bank-statement-recheck': recheckHelpers,
+    '@/lib/bank-statement-linked-transactions': linkedHelpers,
     '@/lib/bank-statement-tally-queue-status': { refreshBankStatementQueueJobStatus: async (_db, id) => state.refreshed.push(id) },
   };
   const filename = fileURLToPath(new URL('./route.ts', import.meta.url));
@@ -81,6 +84,26 @@ function fixture() {
   return { state, route: mod.exports };
 }
 const context = { params: Promise.resolve({ id: 'statement' }) };
+
+test('a repeat-upload recheck resolves held rows from the original import and rejects unrelated rows', async () => {
+  const {state,route}=fixture();
+  const fingerprint='a'.repeat(64);
+  Object.assign(state.tables.bank_statement_imports[0],{bank_account_id:'bank',processing_meta:{reviewedTransactionFingerprints:[fingerprint]}});
+  Object.assign(state.tables.bank_transactions[0],{statement_import_id:'original-import',bank_account_id:'bank',fingerprint});
+  state.tables.bank_transaction_posting_log[0].fingerprint=fingerprint;
+  const response=await route.POST(request('POST',{transactionId:'tx'}),context);
+  assert.equal(response.status,200);assert.equal(state.queued.length,1);
+  assert.equal(state.queued[0].payload.recheckImportId,'statement');
+  assert.equal(state.queued[0].payload.recheckTransactionId,'tx');
+  assert.equal(state.tables.bank_transactions[0].statement_import_id,'original-import');
+  const check=state.tables.tally_bridge_commands.find(c=>c.id==='check-1');
+  Object.assign(check,{status:'succeeded',result:{transactions:[{transactionId:'tx',verificationStatus:'found',matchCount:1,voucherId:'123',voucherNumber:'456',matchBasis:'reference'}]}});
+  const result=await route.PATCH(request('PATCH',{commandIds:['check-1']}),context);
+  assert.equal(result.status,200);assert.equal((await result.json()).remaining,0);
+  assert.equal(state.tables.bank_transactions[0].tally_status,'verified');
+  const unrelated=await route.POST(request('POST',{transactionId:'unrelated'}),context);
+  assert.equal(unrelated.status,409);assert.equal(state.queued.length,1);
+});
 const request = (method, body) => new Request('http://localhost/api/bank-statements/imports/statement/recheck', {
   method, ...(body ? { body: JSON.stringify(body) } : {}),
 });

@@ -1,3 +1,4 @@
+import { loadStatementPostingRows, isExistingStatementPosting } from "@/lib/bank-statement-linked-transactions";
 import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -339,14 +340,7 @@ export async function GET(
     const publicJobStatus =
       jobStatus === "succeeded" && requiresManualExtraction ? "partial" : jobStatus;
 
-    const { data: postedRows, error: postedRowsError } = await supabase
-      .from("bank_transactions")
-      .select("id,fingerprint,transaction_date,description,reference_number,debit_amount,credit_amount,balance_amount,confirmed_ledger_name,suggested_ledger_name,tally_voucher_id,tally_posted_at,tally_status")
-      .eq("statement_import_id", id)
-      .eq("owner_user_id", user.id)
-      .eq("company_dataset_id", importRow.company_dataset_id)
-      .order("transaction_date", { ascending: true });
-    if (postedRowsError) throw postedRowsError;
+    const postedRows = await loadStatementPostingRows(supabase, importRow, user.id);
 
     const postedFingerprints = (postedRows ?? [])
       .map((row) => String(row.fingerprint ?? "").trim())
@@ -378,8 +372,8 @@ export async function GET(
         postedAt: log?.tally_posted_at ?? row.tally_posted_at ?? null,
         postingStatus: log?.status ?? row.tally_status,
         postingCommandId: log?.command_id ?? null,
-        postingResult: log?.status === "verified" && log.source_transaction_id && log.source_transaction_id !== row.id
-          ? { ...log.result, alreadyInTally: true } : log?.result ?? null,
+        postingResult: isExistingStatementPosting(row, log, id)
+          ? { ...log?.result, alreadyInTally: true } : log?.result ?? null,
         voucherType: log?.voucher_type ?? null,
       };
     });

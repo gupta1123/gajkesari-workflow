@@ -820,6 +820,7 @@ export async function POST(
                 : {}),
               confirmedAt: new Date().toISOString(),
               confirmedTransactionCount: transactions.length,
+              reviewedTransactionFingerprints: submittedFingerprints,
               ignoredNonPostingRowCount: submittedTransactions.length - transactions.length,
               importedAfterTransactionDate: lastImportedTransactionDate,
               importedAfterTransactionMarker: lastImportedTransactionMarker,
