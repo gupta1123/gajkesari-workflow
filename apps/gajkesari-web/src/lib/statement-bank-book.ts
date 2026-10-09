@@ -46,6 +46,14 @@ export function summarizeStatementPostings(rows: StatementRow[], saved: SavedPos
     { ...row, id: `unsubmitted-${index}`, postingStatus: "pending" }));
 }
 
+// Results known before this upload's Post action are existing entries, even
+// when an identical PDF reuses the original import and transaction IDs.
+export function markPreviouslyConfirmedPostings<T extends SavedPostingRow>(saved: T[], previous: SavedPostingRow[]) {
+  const existingIds = new Set(previous.filter(row => savedPostingOutcome(row).status === "confirmed").map(row => row.id));
+  return saved.map(row => existingIds.has(row.id) && savedPostingOutcome(row).status === "confirmed"
+    ? { ...row, postingResult: { ...row.postingResult, alreadyInTally: true } } : row);
+}
+
 export function mergeCompletedPostingEvidence<T extends SavedPostingRow>(saved: T[], commands: Array<{
   commandType?: string; command_type?: string; status?: string; result?: Record<string, unknown> | null;
 }>) {

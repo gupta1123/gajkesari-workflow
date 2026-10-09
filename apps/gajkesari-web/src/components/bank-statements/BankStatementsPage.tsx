@@ -35,7 +35,7 @@ import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { bankPostingOutcome, bankPostingMessage, bankPostingTitle, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
 import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
 import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings,
-  heldPostingReason, statementCheckMessage, statementBalanceMessage, postingFooterSegments, summarizeStatementPostings, mergeCompletedPostingEvidence } from "@/lib/statement-bank-book";
+  heldPostingReason, statementCheckMessage, statementBalanceMessage, postingFooterSegments, summarizeStatementPostings, mergeCompletedPostingEvidence, markPreviouslyConfirmedPostings } from "@/lib/statement-bank-book";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
@@ -4026,6 +4026,7 @@ export function BankStatementsPage() {
     } finally { setDownloadingBankBook(false); }
   }
   function restorePostingState(saved: PostedBankBookTransaction[], rows = validTransactions) {
+    saved = markPreviouslyConfirmedPostings(saved, preview?.postedTransactions ?? []);
     setPersistedPostedTransactions(saved);
     setTransactions(current => current.map(row => {
       const posting = saved.find(value => statementRowKey(value) === statementRowKey(row));
@@ -5460,7 +5461,11 @@ export function BankStatementsPage() {
     setTallyPresenceByTransactionId({});
     setPostedTransactionIds(new Set());
     setTallyCheckAttempted(false);
-    restorePostingState(payload.postedTransactions ?? [], payload.transactions.map(transaction => normalizeReviewTransaction(transaction, effectiveLedgerMasters)));
+    // Upload starts in ledger review, including when this PDF was used before.
+    // Retain prior evidence in preview for duplicate protection and show it only
+    // after an explicit Post/Check action, never as an upload completion result.
+    setPersistedPostedTransactions([]);
+    setStatementDoneSummary(null);
     setTallyBalanceProof(null);
     setBillMatchingRequested(false);
     setReviewFiltersOpen(false);
@@ -6685,6 +6690,18 @@ export function BankStatementsPage() {
         selectedTallyWorkTransactions.map((transaction) => [transactionQueueKey(transaction), transaction])
       );
       if (queueRows.length === 0) {
+        const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
+        const savedResults = markPreviouslyConfirmedPostings(refreshedImport.postedTransactions ?? [], preview.postedTransactions ?? []);
+        const summary = summarizeStatementPostings(validTransactions, savedResults);
+        if (summary.confirmed || summary.needsCheck) {
+          setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
+          setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
+          setSelectedAccountId(confirmPayload.account.id);
+          restorePostingState(savedResults);
+          setBanner(null);
+          showToast("info", bankPostingMessage(summary));
+          return;
+        }
         if (confirmPayload.importedTransactionCount <= 0) {
           throw new Error(
             `${confirmPayload.duplicateTransactionCount} row(s) were already imported or skipped. No Tally vouchers were queued.`
@@ -6832,7 +6849,8 @@ export function BankStatementsPage() {
           .then(async (finalStatus) => {
             if (!finalStatus?.finished) return;
             const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
-            const savedResults = mergeCompletedPostingEvidence(refreshedImport.postedTransactions ?? [], finalStatus.commands);
+            const savedResults = mergeCompletedPostingEvidence(
+              markPreviouslyConfirmedPostings(refreshedImport.postedTransactions ?? [], preview.postedTransactions ?? []), finalStatus.commands);
             restorePostingState(savedResults);
             setBanner(null);
             if (finalStatus.failed > 0 || finalStatus.canceled > 0 || finalStatus.needsCheck > 0 || !commandConnection) return;
@@ -6861,7 +6879,10 @@ export function BankStatementsPage() {
             );
           });
       } else {
+        const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
+        restorePostingState(refreshedImport.postedTransactions ?? []);
         setBanner(null);
+        return;
       }
       showToast(
         "info",
