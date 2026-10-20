@@ -59,9 +59,14 @@ route. `npm run check:protected` fails if a protected bank path is edited; CI ru
 - **No sidebar link (decision).** The sidebar is shown to everyone and the pages 404 for
   owners not on the allowlist. Open `/collections/follow-ups` and
   `/settings/payment-reminders` by URL; add links when the feature is enabled for all.
-- **Customer-scope settings and live-only analysis.** Both need changes to the live
-  session route, the gateway and the connector: the same path bank-statement matching
-  uses. Do them as a separate, separately-released change with the bank regression run.
+- **Customer scope and live-only analysis are built without touching the shared live
+  path** (`20261020120200_collections_customer_scope.sql`,
+  `/api/collections/customer-scope`, `/api/collections/follow-ups/live-candidates`).
+  They reuse the existing read-only `fetch_customer_open_bills` gateway operation, so
+  the gateway, connector and live-session route are unchanged and no connector release
+  is needed. Reads are live (nothing cached or written), limited to customers saved in
+  the scope, and at most 10 customers per read so Tally gets small filtered requests.
+  Kalika's full-company scan is intentionally not ported.
 - **Kalika's `queryPurpose: 'payment_followup'` settled-by-proof branch.** The bridge
   does not implement it, so a bill missing from Tally goes to review.
 

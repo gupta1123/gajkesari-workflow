@@ -61,6 +61,44 @@ export async function createPipelines(input: {
   );
 }
 
+export type FollowupCandidate = {
+  customer: string;
+  invoice: string;
+  invoiceDate: string | null;
+  outstanding: number;
+  narration: string;
+  paymentCategory: "advance_rtgs" | "same_day_rtgs" | null;
+  eligible: boolean;
+  ageLabel: string;
+};
+
+type CompanyRef = { connectionId: string; companyName: string };
+
+export async function getCustomerScope(company: CompanyRef) {
+  const query = new URLSearchParams(company);
+  return readJson<{ ledgerNames: string[] }>(await apiFetch(`/api/collections/customer-scope?${query}`, { cache: "no-store" }));
+}
+
+export async function saveCustomerScope(company: CompanyRef, ledgerNames: string[]) {
+  return readJson<{ ledgerNames: string[] }>(
+    await apiFetch("/api/collections/customer-scope", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...company, ledgerNames }),
+    })
+  );
+}
+
+export async function findCandidates(company: CompanyRef & { financialYear: string }, ledgerNames: string[]) {
+  return readJson<{ today: string; candidates: FollowupCandidate[] }>(
+    await apiFetch("/api/collections/follow-ups/live-candidates", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...company, ledgerNames }),
+    })
+  );
+}
+
 export async function runPipelineAction(
   pipeline: Pick<FollowupPipeline, "id" | "revision">,
   action: PipelineAction,

@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
 import {
-  createPipelines, listPipelines, runPipelineAction,
-  type FollowupPipeline, type PipelineAction, type ReminderMessage,
+  createPipelines, findCandidates, getCustomerScope, listPipelines, runPipelineAction, saveCustomerScope,
+  type FollowupCandidate, type FollowupPipeline, type PipelineAction, type ReminderMessage,
 } from "@/lib/followups-client";
 
 type Company = { id: string; connectionId: string; companyName: string; financialYear: string };
@@ -30,8 +30,50 @@ export function FollowUpPipelines() {
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [form, setForm] = useState({ customer: "", invoice: "", invoiceDate: "", phone: "", narration: "", template: "", everyDays: "3", limit: "3" });
   const [adding, setAdding] = useState(false);
+  const [scopeText, setScopeText] = useState("");
+  const [scopeNames, setScopeNames] = useState<string[]>([]);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [candidates, setCandidates] = useState<FollowupCandidate[]>([]);
+  const [finding, setFinding] = useState(false);
 
   const company = companies.find((c) => c.id === companyId) ?? companies[0] ?? null;
+
+  useEffect(() => {
+    if (!company) return;
+    getCustomerScope(company)
+      .then(({ ledgerNames }) => { setScopeNames(ledgerNames); setScopeText(ledgerNames.join("\n")); setPicked(new Set()); setCandidates([]); })
+      .catch(() => undefined);
+  }, [company?.connectionId, company?.companyName]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveScope = async () => {
+    if (!company) return;
+    try {
+      const { ledgerNames } = await saveCustomerScope(company, scopeText.split("\n"));
+      setScopeNames(ledgerNames);
+      setScopeText(ledgerNames.join("\n"));
+      setNotice({ tone: "ok", text: `Customer scope saved (${ledgerNames.length}).` });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not save the scope." });
+    }
+  };
+
+  const find = async () => {
+    if (!company || picked.size === 0) return;
+    setFinding(true);
+    setNotice(null);
+    try {
+      const { candidates: found } = await findCandidates(company, [...picked]);
+      setCandidates(found);
+      if (found.length === 0) setNotice({ tone: "ok", text: "No open invoices for those customers." });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not read Tally." });
+    } finally {
+      setFinding(false);
+    }
+  };
+
+  const use = (c: FollowupCandidate) =>
+    setForm((f) => ({ ...f, customer: c.customer, invoice: c.invoice, invoiceDate: c.invoiceDate ?? "", narration: c.narration }));
 
   const refresh = useCallback(async () => {
     const data = await listPipelines();
@@ -124,6 +166,42 @@ export function FollowUpPipelines() {
           {notice.text}
         </p>
       )}
+
+      <section className="space-y-3 rounded-lg border border-slate-200 p-4">
+        <h2 className="text-sm font-medium">Customers to follow up</h2>
+        <p className="text-xs text-slate-500">One exact Tally ledger name per line. Tally is read live, a few customers at a time (max 10).</p>
+        <textarea className={`${field} h-24 w-full`} value={scopeText} onChange={(e) => setScopeText(e.target.value)} />
+        <button className="text-sm underline" onClick={saveScope}>Save customers</button>
+        {scopeNames.length > 0 && (
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-3">
+              {scopeNames.map((name) => (
+                <label key={name} className="text-sm">
+                  <input type="checkbox" checked={picked.has(name)} onChange={() => setPicked((s) => { const n = new Set(s); if (n.has(name)) n.delete(name); else n.add(name); return n; })} /> {name}
+                </label>
+              ))}
+            </div>
+            <button className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50" disabled={finding || picked.size === 0 || picked.size > 10} onClick={find}>
+              {finding ? "Reading Tally…" : "Find open invoices"}
+            </button>
+          </div>
+        )}
+        {candidates.length > 0 && (
+          <table className="w-full text-left text-sm">
+            <tbody>
+              {candidates.map((c) => (
+                <tr key={`${c.customer}|${c.invoice}`} className="border-t border-slate-100">
+                  <td className="p-1">{c.customer}</td><td className="p-1">{c.invoice}</td>
+                  <td className="p-1">{inr(c.outstanding)}</td>
+                  <td className="p-1">{c.paymentCategory ? c.paymentCategory.replace("_", " ").toUpperCase() : ""}</td>
+                  <td className="p-1">{c.eligible ? c.ageLabel : "Not due yet"}</td>
+                  <td className="p-1"><button className="underline" onClick={() => use(c)}>Use</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
 
       <section className="rounded-lg border border-slate-200 p-4">
         <h2 className="mb-3 text-sm font-medium">Add an invoice</h2>
