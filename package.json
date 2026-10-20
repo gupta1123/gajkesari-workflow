@@ -31,6 +31,8 @@
     "test:tally-bridge": "node --test apps/tally-bridge/src/bridge.test.mjs apps/tally-bridge/src/document-parsing/*.test.mjs apps/tally-bridge/src/local-matching/*.test.mjs",
     "local-matching:suggest": "node apps/tally-bridge/src/local-matching/cli.mjs",
     "test:tally-live-gateway": "node --test apps/cash-discount-gateway/src/server.test.mjs",
+    "check:protected": "node scripts/check-protected-paths.mjs",
+    "test:protected-paths": "node --test scripts/check-protected-paths.test.mjs",
     "test:tally-browser-live": "node --test apps/gajkesari-web/src/lib/cash-discount-live.test.mjs",
     "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
     "evaluate:ledger-matching": "node --env-file=apps/api/.env.local scripts/evaluate-ledger-matching.mjs",
