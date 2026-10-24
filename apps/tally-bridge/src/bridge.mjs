@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.79";
+const BRIDGE_VERSION = "0.1.80";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -5226,8 +5226,11 @@ async function testTally(tallyUrl) {
 }
 
 const commandLeases = new Map();
+const commandClaimReads = new Map();
 
 async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
+  commandClaimReads.set(config.connectionId,(commandClaimReads.get(config.connectionId)||0)+1);
+  try {
   const url = new URL(`${config.apiBase}/api/tally/bridge/commands/next`);
   url.searchParams.set("connectionId", config.connectionId);
   url.searchParams.set("bridgeVersion", BRIDGE_VERSION);
@@ -5254,6 +5257,10 @@ async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
     if (command.claimToken) commandLeases.set(command.id, { id: command.id, token: command.claimToken, connectionId: config.connectionId });
   }
   return commands;
+  } finally {
+    const remaining=(commandClaimReads.get(config.connectionId)||1)-1;
+    if(remaining)commandClaimReads.set(config.connectionId,remaining);else commandClaimReads.delete(config.connectionId);
+  }
 }
 
 async function sendCommandResults(config, entries, concurrency = 10) {
@@ -6799,6 +6806,13 @@ function createBridgeRunner(options = {}) {
       }
     },
     stop,
+    prepareForUpdate() {
+      // Do not interrupt exports, claimed commands, or an outstanding claim read.
+      if (executeExclusive.isBusy() || executeExclusive.hasPendingInteractive() || commandPollRunning ||
+          backgroundCycleRunning || commandClaimReads.has(config.connectionId) || [...commandLeases.values()].some(claim => claim.connectionId === config.connectionId)) return false;
+      stop("restarting for update");
+      return true;
+    },
     async runOnce() {
       await runSerially();
     },

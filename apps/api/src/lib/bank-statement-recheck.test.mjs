@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recheckEvidence, recheckObservation, recheckPayload, confirmedRecheckResult } from './bank-statement-recheck.ts';
+import { recheckEvidence, recheckObservation, recheckPayload, confirmedRecheckResult, clearedHeldRecheckResult } from './bank-statement-recheck.ts';
 
 const original = { transactionId: 'transaction-1', voucherDate: '2026-09-30', amount: 518779,
   expectedDirection: 'outgoing', referenceNumber: '1967486047', bankLedgerName: 'HDFC' };
@@ -46,4 +46,23 @@ test('finding a held or unknown voucher never invents a newly posted entry', () 
   assert.equal(confirmedRecheckResult({ reconciliationRequired: true }, verification).alreadyInTally, true);
   assert.equal(confirmedRecheckResult({ importSummary: { created: 1, errors: 0 } }, verification).alreadyInTally, false);
   assert.equal(confirmedRecheckResult({ alreadyInTally: true, importSummary: { created: 1, errors: 0 } }, verification).alreadyInTally, true);
+});
+
+test('only a definitively blocked duplicate preflight can be cleared after a complete missing result',()=>{
+  const held={possibleDuplicateInTally:true,duplicateCheck:{verificationStatus:'ambiguous',matches:[{voucherNumber:'6757'}]}};
+  const original={status:'failed',result:held};
+  const missing={verificationStatus:'missing',matchCount:0,matches:[]};
+  const cleared=clearedHeldRecheckResult(original,held,missing);
+  assert.equal(cleared.retryCleared,true);assert.equal(cleared.possibleDuplicateInTally,false);
+  assert.equal(cleared.verificationStatus,'missing');assert.equal(cleared.beforeExecution,true);
+  for(const extra of [{created:1},{altered:1},{importSummary:{created:0}},{requestXml:'sent'},
+    {voucherCreatedButVerificationFailed:true},{uncertaintyReason:'write_timeout'},
+    {alreadyInTally:true},{voucherId:'123'},{voucherNumber:'6757'},{reconciliationRequired:true}]){
+    assert.equal(clearedHeldRecheckResult({...original,result:{...held,...extra}},held,missing),null);
+    assert.equal(clearedHeldRecheckResult(original,{...held,...extra},missing),null);
+  }
+  for(const observation of [{...missing,verificationStatus:'failed'},{...missing,verificationStatus:'ambiguous'},
+    {...missing,matchCount:1},{...missing,matches:[{voucherNumber:'6757'}]},{verificationStatus:'missing'}])
+    assert.equal(clearedHeldRecheckResult(original,held,observation),null);
+  assert.equal(clearedHeldRecheckResult({...original,status:'succeeded'},held,missing),null);
 });

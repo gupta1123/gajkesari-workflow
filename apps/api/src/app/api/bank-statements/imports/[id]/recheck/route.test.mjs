@@ -137,7 +137,7 @@ test('missing and ambiguous verification evidence keep the original posting unce
     Object.assign(state.tables.tally_bridge_commands[1], { status: 'succeeded', result: {
       transactions: [{ transactionId: 'tx', verificationStatus, matchCount: verificationStatus === 'missing' ? 0 : 2 }] } });
     const response = await route.PATCH(request('PATCH', { commandIds: ['check-1'] }), context);
-    assert.deepEqual(await response.json(), { confirmed: 0, checked: 1, checkFailed: 0, remaining: 1 });
+    assert.deepEqual(await response.json(), { confirmed: 0, cleared: 0, checked: 1, checkFailed: 0, remaining: 1 });
     assert.equal(state.writes.length, 1);
     assert.equal(state.tables.bank_transaction_posting_log[0].result.recheck.verification.verificationStatus, verificationStatus);
     assert.equal(state.tables.bank_transactions[0].tally_status, 'needs_tally_review');
@@ -151,7 +151,7 @@ test('unique evidence saves confirmation idempotently without changing the origi
     transactions: [{ transactionId: 'tx', verificationStatus: 'found', matchCount: 1, voucherId: '428329', voucherNumber: '123' }] } });
   for (let i = 0; i < 2; i++) {
     const response = await route.PATCH(request('PATCH', { commandIds: ['check-1'] }), context);
-    assert.deepEqual(await response.json(), { confirmed: 1, checked: 1, checkFailed: 0, remaining: 0 });
+    assert.deepEqual(await response.json(), { confirmed: 1, cleared: 0, checked: 1, checkFailed: 0, remaining: 0 });
   }
   assert.equal(state.tables.bank_transactions[0].tally_status, 'verified');
   assert.equal(state.tables.bank_transaction_posting_log[0].result.voucherNumber, '123');
@@ -215,7 +215,7 @@ test('a failed check retains the hold and saves a simple failure result', async 
   await route.POST(request('POST'), context);
   state.tables.tally_bridge_commands[1].status = 'failed';
   const response = await route.PATCH(request('PATCH', { commandIds: ['check-1'] }), context);
-  assert.deepEqual(await response.json(), { confirmed: 0, checked: 1, checkFailed: 1, remaining: 1 });
+  assert.deepEqual(await response.json(), { confirmed: 0, cleared: 0, checked: 1, checkFailed: 1, remaining: 1 });
   assert.equal(state.tables.bank_transactions[0].tally_status, 'needs_tally_review');
   assert.equal(state.tables.bank_transaction_posting_log[0].result.recheck.verification.verificationStatus, 'failed');
 });
@@ -259,7 +259,7 @@ test('a correction saved while confirmation is finishing cannot be overwritten b
 test('null old results can be checked and an empty recheck returns the real remaining count', async () => {
   const { state, route } = fixture();
   state.tables.bank_transaction_posting_log[0].result = null;
-  assert.deepEqual(await (await route.PATCH(request('PATCH', { commandIds: [] }), context)).json(), { confirmed: 0, checked: 0, checkFailed: 0, remaining: 1 });
+  assert.deepEqual(await (await route.PATCH(request('PATCH', { commandIds: [] }), context)).json(), { confirmed: 0, cleared: 0, checked: 0, checkFailed: 0, remaining: 1 });
   await route.POST(request('POST'), context);
   Object.assign(state.tables.tally_bridge_commands[1], { status: 'succeeded', result: { transactions: [{ transactionId: 'tx', verificationStatus: 'found', matchCount: 1, voucherId: '2721' }] } });
   assert.equal((await (await route.PATCH(request('PATCH', { commandIds: ['check-1'] }), context)).json()).confirmed, 1);
@@ -289,4 +289,51 @@ test('a reuploaded row can refresh its original posting evidence without changin
   assert.equal(state.tables.bank_transactions[0].tally_status, 'verified');
   assert.equal(state.tables.bank_transaction_posting_log[0].source_transaction_id, 'tx');
   assert.equal(state.tables.bank_transaction_posting_log[0].result.alreadyInTally, true);
+});
+
+test('a false duplicate cleared by a fresh check becomes postable without creating a voucher',async()=>{
+  const {state,route}=fixture();
+  const held={possibleDuplicateInTally:true,duplicateCheck:{verificationStatus:'ambiguous',matchBasis:'possible_manual_entry',matches:[{voucherNumber:'6757'}]}};
+  state.tables.bank_transaction_posting_log[0].result=held;
+  Object.assign(state.tables.tally_bridge_commands[0],{status:'failed',result:held});
+  await route.POST(request('POST'),context);
+  Object.assign(state.tables.tally_bridge_commands[1],{status:'succeeded',result:{transactions:[{transactionId:'tx',verificationStatus:'missing',matchCount:0,matches:[]}]}});
+  const response=await route.PATCH(request('PATCH',{commandIds:['check-1']}),context);
+  assert.deepEqual(await response.json(),{confirmed:0,cleared:1,checked:1,checkFailed:0,remaining:0});
+  assert.equal(state.tables.bank_transactions[0].tally_status,'missing_in_tally');
+  assert.equal(state.tables.bank_transaction_posting_log[0].status,'missing_in_tally');
+  assert.equal(state.tables.bank_transaction_posting_log[0].result.retryCleared,true);
+  assert.deepEqual(state.queued.map(c=>c.commandType),['verify_bank_transaction']);
+  assert.equal(state.tables.tally_bridge_commands[0].status,'failed');
+});
+
+test('a failed or uncertain import cannot be released just because its voucher is missing',async()=>{
+  for(const importProof of [{created:1},{importSummary:{created:1,errors:0}},{voucherCreatedButVerificationFailed:true},{uncertaintyReason:'write_timeout'}]){
+    const {state,route}=fixture();
+    const held={possibleDuplicateInTally:true,duplicateCheck:{verificationStatus:'ambiguous'}};
+    state.tables.bank_transaction_posting_log[0].result={...held,...importProof};
+    Object.assign(state.tables.tally_bridge_commands[0],{status:'failed',result:{...held,...importProof}});
+    await route.POST(request('POST'),context);
+    Object.assign(state.tables.tally_bridge_commands[1],{status:'succeeded',result:{transactions:[{transactionId:'tx',verificationStatus:'missing',matchCount:0,matches:[]}]}});
+    const response=await route.PATCH(request('PATCH',{commandIds:['check-1']}),context);
+    assert.equal((await response.json()).cleared,0);
+    assert.equal(state.tables.bank_transactions[0].tally_status,'needs_tally_review');
+  }
+});
+
+test('a release row-write failure can finish idempotently from its durable read-only evidence',async()=>{
+  const {state,route}=fixture();
+  const held={possibleDuplicateInTally:true,duplicateCheck:{verificationStatus:'ambiguous'}};
+  state.tables.bank_transaction_posting_log[0].result=held;
+  Object.assign(state.tables.tally_bridge_commands[0],{status:'failed',result:held});
+  await route.POST(request('POST'),context);
+  Object.assign(state.tables.tally_bridge_commands[1],{status:'succeeded',result:{transactions:[{transactionId:'tx',verificationStatus:'missing',matchCount:0,matches:[]}]}});
+  state.failRowUpdate=true;
+  const old=console.error;console.error=()=>{};
+  try{assert.equal((await route.PATCH(request('PATCH',{commandIds:['check-1']}),context)).status,500);}finally{console.error=old;}
+  assert.equal(state.tables.bank_transaction_posting_log[0].status,'missing_in_tally');
+  const retry=await route.POST(request('POST'),context);
+  assert.deepEqual((await retry.json()).commandIds,['check-1']);assert.equal(state.queued.length,1);
+  await route.PATCH(request('PATCH',{commandIds:['check-1']}),context);
+  assert.equal(state.tables.bank_transactions[0].tally_status,'missing_in_tally');
 });

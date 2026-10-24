@@ -4045,7 +4045,7 @@ export function BankStatementsPage() {
     setStatementDoneSummary(null);
     const unmatchedRows = rows.filter(row => !saved.some(posting => statementRowKey(posting) === statementRowKey(row))).length;
     if (summary.pending > 0 || unmatchedRows > 0) {
-      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary)}${unmatchedRows ? ` ${unmatchedRows} statement entries have no saved posting result; check Tally before posting.` : ""}` });
+      if (summary.confirmed || summary.needsCheck || summary.readyToPost) setBanner({ tone: "info", text: `${bankPostingMessage(summary)}${unmatchedRows ? ` ${unmatchedRows} statement entries have no saved posting result; check Tally before posting.` : ""}` });
       return;
     }
     if (summary.confirmed || summary.needsCheck || summary.failed) {
@@ -4067,7 +4067,7 @@ export function BankStatementsPage() {
       if (commands.length !== commandIds.length) throw new Error("Tally is still checking. Please check again shortly.");
       const complete = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/recheck`, { method: "PATCH", body: JSON.stringify({ commandIds }) });
       if (!complete.ok) throw new Error(await readError(complete));
-      const result = await complete.json() as { confirmed: number; checked?: number; remaining?: number; checkFailed?: number };
+      const result = await complete.json() as { confirmed: number; checked?: number; remaining?: number; checkFailed?: number; cleared?: number };
       const updated = await loadImportPreviewMetadata(preview.import.id);
       restorePostingState(updated.postedTransactions ?? []);
       const message = recheckResultMessage({ ...result, checked: result.checked ?? commands.length,
@@ -6217,7 +6217,11 @@ export function BankStatementsPage() {
       billLedgerNames,
       "openBillsByLedger"
     );
-    Object.assign(drafts, savedPostingPresence(rows, persistedPostedTransactions));
+    for (const [id,saved] of Object.entries(savedPostingPresence(rows, persistedPostedTransactions))) {
+      // A previous release must not hide a voucher found by this fresh check.
+      if(saved.status === "missing" && drafts[id])continue;
+      drafts[id]=saved;
+    }
     setTallyPresenceByTransactionId(drafts);
     setOutgoingVerificationsByTransactionId(Object.fromEntries(
       rows.filter(isOutgoingPaymentRow).flatMap((transaction) => {

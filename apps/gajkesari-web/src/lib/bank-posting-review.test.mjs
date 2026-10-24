@@ -41,6 +41,7 @@ test('a failed recheck labels earlier evidence honestly and does not permit post
 });
 
 test('recheck messages distinguish new confirmations, no change, failure and complete results', () => {
+  assert.match(recheckResultMessage({confirmed:0,cleared:1,checked:1,remaining:0}),/1 entry is ready to post.*Click Post to Tally.*No vouchers were posted/);
   assert.match(recheckResultMessage({ confirmed: 2, checked: 3, remaining: 1 }), /2 entries confirmed.*1 entry still needs review/);
   assert.match(recheckResultMessage({ confirmed: 0, checked: 1, remaining: 1 }), /No additional entries were confirmed/);
   assert.match(recheckResultMessage({ confirmed: 0, checked: 1, remaining: 1, checkFailed: 1 }), /couldn't be checked/);

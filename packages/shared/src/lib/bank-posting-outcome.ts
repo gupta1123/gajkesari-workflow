@@ -28,7 +28,7 @@ export function bankPostingOutcome(command: BankPostingCommand) {
 
 export function summarizeBankPostings(commands: BankPostingCommand[]) {
   const summary = { total: commands.length, confirmed: 0, needsCheck: 0, failed: 0, pending: 0, accepted: 0, alreadyExisting: 0,
-    held: 0, confirmationPending: 0, outcomeUnknown: 0 };
+    held: 0, confirmationPending: 0, outcomeUnknown: 0, readyToPost: 0 };
   for (const command of commands) {
     const outcome = bankPostingOutcome(command);
     if (outcome.accepted) summary.accepted++;
@@ -43,7 +43,10 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
       else summary.outcomeUnknown++;
     }
     else if (outcome.status === "failed") summary.failed++;
-    else summary.pending++;
+    else {
+      summary.pending++;
+      if(command.status === "missing_in_tally" && command.result?.retryCleared === true)summary.readyToPost++;
+    }
   }
   return summary;
 }
@@ -54,7 +57,8 @@ export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPosti
   if (summary.confirmationPending) progress.push(`${summary.confirmationPending} accepted by Tally: confirmation pending`);
   if (summary.outcomeUnknown) progress.push(`${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown: check Tally before retrying`);
   if (summary.failed) progress.push(`${summary.failed} couldn't be posted`);
-  if (summary.pending) progress.push(`${summary.pending} still processing`);
+  if (summary.readyToPost) progress.push(`${summary.readyToPost} ready to post: click Post to Tally`);
+  if (summary.pending > summary.readyToPost) progress.push(`${summary.pending - summary.readyToPost} still processing`);
   if (summary.pending || summary.needsCheck || summary.failed) return `${progress.join("; ")}.`;
   if (!summary.total) return "No entries were posted.";
   if (summary.alreadyExisting === summary.total && summary.total > 0) return `${summary.alreadyExisting} ${summary.alreadyExisting === 1 ? "entry was" : "entries were"} already entered in Tally. No new entries were posted.`;
@@ -67,7 +71,8 @@ export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPosti
 
 export function bankPostingTitle(summary: ReturnType<typeof summarizeBankPostings>) {
   if (summary.failed) return "Some entries couldn't be posted";
-  if (summary.pending) return "Processing entries in Tally";
+  if (summary.pending > summary.readyToPost) return "Processing entries in Tally";
+  if (summary.readyToPost) return "Entries ready to post";
   if (summary.held) return "Some entries need review";
   if (summary.needsCheck) return "Some posting confirmations need checking";
   return "Entries confirmed in Tally";

@@ -17,7 +17,7 @@ test('17 confirmations and 1 accepted but unconfirmed entry is a needs-check out
   } };
   const summary = summarizeBankPostings([...Array(17).fill(confirmed), uncertain]);
   assert.deepEqual(summary, { total: 18, confirmed: 17, needsCheck: 1, failed: 0, pending: 0, accepted: 18, alreadyExisting: 0,
-    held: 0, confirmationPending: 1, outcomeUnknown: 0 });
+    held: 0, confirmationPending: 1, outcomeUnknown: 0, readyToPost: 0 });
   assert.equal(bankPostingMessage(summary), '17 newly posted; 0 already entered in Tally; 1 accepted by Tally: confirmation pending.');
 });
 
@@ -72,4 +72,12 @@ test('empty work and pending work never claim a completed posting', () => {
   const pending = summarizeBankPostings([{ status: 'queued' }]);
   assert.match(bankPostingMessage(pending), /1 still processing/);
   assert.equal(bankPostingTitle(pending), 'Processing entries in Tally');
+});
+
+test('a released duplicate hold is ready for a user post, never still processing or confirmed',()=>{
+  const summary=summarizeBankPostings([{status:'missing_in_tally',result:{retryCleared:true,verificationStatus:'missing'}}]);
+  assert.equal(summary.confirmed,0);assert.equal(summary.readyToPost,1);
+  assert.match(bankPostingMessage(summary),/1 ready to post: click Post to Tally/);
+  assert.doesNotMatch(bankPostingMessage(summary),/still processing|posted and confirmed/);
+  assert.equal(bankPostingTitle(summary),'Entries ready to post');
 });

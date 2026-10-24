@@ -56,7 +56,7 @@ function reviewHarness(rows, saved, overrides = {}) {
     context[setter] = update => { state[key] = typeof update === 'function' ? update(state[key] ?? []) : update; };
   }
   Object.assign(context, overrides);
-  const handlers = new Function(...Object.keys(context), `${code}; return { applyPreviewPayload, sendToTally, resumePostingStatus };`)(...Object.values(context));
+  const handlers = new Function(...Object.keys(context), `${code}; return { applyPreviewPayload, restorePostingState, sendToTally, resumePostingStatus };`)(...Object.values(context));
   return { payload, state, requests, toasts, ...handlers };
 }
 
@@ -172,4 +172,29 @@ test('Resume reads the original job and restores full results without confirmati
   assert.equal(review.state.resumingPostingStatus,false);
   assert.equal(review.state.persistedPostedTransactions.length,23);
   assert.equal(review.state.statementDoneSummary.tone,'info');
+});
+
+test('restoring a cleared hold enables explicit posting without automatically sending anything',async()=>{
+  const {rows}=fixtures(1);
+  const saved=[{...rows[0],postingStatus:'missing_in_tally',postingResult:{retryCleared:true,possibleDuplicateInTally:false,
+    recheck:{verification:{verificationStatus:'missing',matchCount:0,matches:[]}}}}];
+  const requests=[];
+  const review=reviewHarness(rows,saved,{
+    apiFetch:async(url,options)=>{
+      requests.push({url,body:JSON.parse(options.body)});
+      return {ok:true,json:async()=>url.endsWith('/confirm')?{account:{id:'account'},import:{id:'repeat-import'},
+        importedTransactionCount:0,duplicateTransactionCount:1,queueableTransactions:rows}:{jobId:'explicit-new-post'}};
+    },
+    pollTallyQueueJob:async()=>{throw new PostingStatusUnavailable();},
+  });
+  review.restorePostingState(saved);
+  assert.equal(requests.length,0);
+  assert.equal(review.state.statementDoneSummary,null);
+  assert.equal(review.state.tallyPresenceByTransactionId[rows[0].id].status,'missing');
+  assert.match(review.state.banner.text,/ready to post/);
+  assert.doesNotMatch(review.state.banner.text,/still processing/);
+  await review.sendToTally('post_all');
+  assert.deepEqual(requests.map(r=>r.url),['/api/bank-statements/imports/repeat-import/confirm','/api/bank-statements/tally/queue']);
+  assert.deepEqual(requests[1].body.transactionIds,[rows[0].id]);
+  assert.equal(review.state.pendingPostingJob.id,'explicit-new-post');
 });

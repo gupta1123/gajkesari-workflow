@@ -21,7 +21,8 @@ export function comparePostingVoucher(statement: ReviewStatement, match: Partial
   return fields.map(field => ({ ...field, state: !field.tally ? "unavailable" : field.label === "Bank reference / UTR" && !statement.reference ? "unavailable" : field.equal ? "match" : "different" }));
 }
 
-export function recheckResultMessage(result: { confirmed: number; checked: number; remaining: number; checkFailed?: number }) {
+export function recheckResultMessage(result: { confirmed: number; checked: number; remaining: number; checkFailed?: number; cleared?: number }) {
+  if (result.cleared) return `${result.cleared} ${result.cleared === 1 ? "entry is" : "entries are"} ready to post after checking Tally. Click Post to Tally to send ${result.cleared === 1 ? "it" : "them"}.${result.confirmed ? ` ${result.confirmed} confirmed in Tally.` : ""}${result.remaining ? ` ${result.remaining} still need review.` : ""} No vouchers were posted by this check.`;
   const remaining = result.remaining ? `${result.remaining} ${result.remaining === 1 ? "entry still needs" : "entries still need"} review.` : "All entries are confirmed in Tally.";
   if (!result.checked && result.remaining) return `No entries could be checked. ${remaining} Keep Tally and the connector open, then try again.`;
   if (result.checkFailed) return `${result.confirmed ? `${result.confirmed} ${result.confirmed === 1 ? "entry confirmed" : "entries confirmed"}. ` : ""}${result.checkFailed} ${result.checkFailed === 1 ? "entry couldn't" : "entries couldn't"} be checked. ${remaining} No vouchers were posted by this check.`;

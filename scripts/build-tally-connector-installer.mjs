@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const connector = {
   brandName: "Gajkesari",
@@ -52,7 +53,8 @@ const dashboardSource = path.join(
   "TallyPrimeDashboard.tsx"
 );
 const innoDefinition = path.join(installerRoot, "gajkesari-tally-bridge.iss");
-const tempBuildRoot = `C:\\tmp\\${connector.tempFolderName}`;
+const worktreeKey = createHash("sha256").update(repoRoot.toLowerCase()).digest("hex").slice(0,10);
+const tempBuildRoot = `C:\\tmp\\${connector.tempFolderName}\\${worktreeKey}`;
 const stagingDir = path.join(tempBuildRoot, "staging");
 const tempOutputDir = path.join(tempBuildRoot, "output");
 const tempOutputExe = path.join(tempOutputDir, connector.setupName);
@@ -76,6 +78,8 @@ function validateSources() {
   ensureFile(bridgeSource, "Tally bridge source");
   ensureFile(path.join(webSocketPackageSource, "package.json"), "ws runtime dependency");
   ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
+  ensureFile(path.join(electronAppSource, "updates.mjs"), "Connector updater");
+  ensureFile(path.join(electronAppSource, "update-helper.ps1"), "Background update helper");
   ensureFile(path.join(electronAppSource, "package.json"), "Electron wrapper package");
   ensureFile(path.join(anydocPackageSource, "package.json"), "AnyDoc runtime dependency");
   ensureFile(path.join(anydocWindowsSource, "package.json"), "AnyDoc Windows runtime dependency");
@@ -97,6 +101,10 @@ function validateSources() {
     connector.connectorName,
     "Electron product name"
   );
+  const version=JSON.parse(fs.readFileSync(path.join(electronAppSource,"package.json"),"utf8")).version;
+  ensureContains(bridgeSource,`const BRIDGE_VERSION = "${version}"`,"Bridge release version");
+  ensureContains(innoDefinition,`#define AppVersion "${version}"`,"Installer release version");
+  if(JSON.parse(fs.readFileSync(path.join(bridgeRoot,"package.json"),"utf8")).version!==version)throw Error("Connector package versions do not match.");
   // Zvec is required for Local Matching vector search. Validate if installed.
   if (fs.existsSync(path.join(zvecPackageSource, "package.json"))) {
     ensureContains(path.join(electronAppSource, "main.mjs"), "Local Matching", "Electron Local Matching UI");
@@ -289,6 +297,8 @@ copyDir(tdlSource, path.join(payloadDir, "tdl"));
 const appDir = path.join(payloadDir, "resources", "app");
 fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
+fs.copyFileSync(path.join(electronAppSource, "updates.mjs"), path.join(appDir, "updates.mjs"));
+fs.copyFileSync(path.join(electronAppSource, "update-helper.ps1"), path.join(appDir, "update-helper.ps1"));
 const installerVersion = JSON.parse(fs.readFileSync(path.join(electronAppSource, "package.json"), "utf8")).version;
 const stagedWrapper = path.join(appDir, "main.mjs");
 fs.writeFileSync(stagedWrapper, fs.readFileSync(stagedWrapper, "utf8")

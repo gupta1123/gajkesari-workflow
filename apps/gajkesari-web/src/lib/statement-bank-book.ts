@@ -81,7 +81,8 @@ export function postingFooterSegments(summary: ReturnType<typeof summarizeBankPo
   if (summary.confirmationPending > 0) segments.push({ text: `${summary.confirmationPending} awaiting confirmation`, tone: "review" });
   if (summary.outcomeUnknown > 0) segments.push({ text: `${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown`, tone: "review" });
   if (summary.failed > 0) segments.push({ text: `${summary.failed} couldn't be posted`, tone: "error" });
-  if (summary.pending > 0) segments.push({ text: `${summary.pending} ${processing ? "processing" : "not sent"}`, tone: processing ? "neutral" : "review" });
+  if (summary.readyToPost > 0) segments.push({text:`${summary.readyToPost} ready to post`,tone:"neutral"});
+  if (summary.pending > summary.readyToPost) segments.push({ text: `${summary.pending - summary.readyToPost} ${processing ? "processing" : "not sent"}`, tone: processing ? "neutral" : "review" });
   return segments;
 }
 
@@ -153,7 +154,7 @@ export function statementBalanceMessage(proof?: { balancesMatch?: boolean | null
 
 export function savedPostingPresence(rows: Array<StatementRow & { id: string }>, postings: SavedPostingRow[]) {
   const saved = new Map(postings.map(row => [statementRowKey(row), row]));
-  type Presence = { status: "found" | "verification_pending"; label: string; reason: string; voucherNumber: string | null; alreadyInTally?: boolean;
+  type Presence = { status: "found" | "verification_pending" | "missing"; label: string; reason: string; voucherNumber: string | null; alreadyInTally?: boolean;
     reviewKind?: "held" | "confirmation_pending" | "outcome_unknown"; matches: PostingMatch[]; voucherDate?: string | null; duplicateInTally?: boolean;
     checkedAt?: string | null; checkFailed?: boolean };
   return Object.fromEntries(rows.flatMap<[string, Presence]>(row => {
@@ -162,6 +163,9 @@ export function savedPostingPresence(rows: Array<StatementRow & { id: string }>,
     const outcome = savedPostingOutcome(posting);
     const matches = postingMatches(posting.postingResult);
     const recheck = posting.postingResult?.recheck as { checkedAt?: string; verification?: Record<string, unknown> } | undefined;
+    if (posting.postingStatus === "missing_in_tally" && posting.postingResult?.retryCleared === true && recheck?.verification?.verificationStatus === "missing") {
+      return [[row.id,{status:"missing" as const,label:"Ready to post",reason:"The latest Tally check found no matching entry. Nothing was posted before. Click Post to Tally when ready.",voucherNumber:null,matches:[],checkedAt:recheck.checkedAt||null}]];
+    }
     const evidence = { matches, voucherDate: matches[0]?.date || null, checkedAt: recheck?.checkedAt || null,
       checkFailed: recheck?.verification?.verificationStatus === "failed", duplicateInTally: recheck?.verification
         ? recheck.verification.duplicateInTally === true : posting.postingResult?.duplicateInTally === true ||

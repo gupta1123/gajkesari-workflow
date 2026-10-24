@@ -5,6 +5,16 @@ import { buildStatementBankBook, savedPostingPresence, statementBalances, summar
 import { buildBankBookRows } from './bank-book-csv.ts';
 import { isReadyForTallyPosting } from './bank-statement-posting-readiness.ts';
 
+test('a released preflight hold becomes ready for an explicit post without appearing confirmed',()=>{
+  const row={id:'jagdamba',transactionDate:'2026-10-23',description:'Jagdamba',creditAmount:1000000,referenceNumber:'S11451554'};
+  const saved={...row,postingStatus:'missing_in_tally',postingResult:{retryCleared:true,possibleDuplicateInTally:false,
+    recheck:{checkedAt:'2026-10-24T07:00:00Z',verification:{verificationStatus:'missing',matchCount:0,matches:[]}}}};
+  const presence=savedPostingPresence([row],[saved]).jagdamba;
+  assert.equal(presence.status,'missing');assert.equal(presence.label,'Ready to post');
+  assert.equal(summarizeSavedPostings([saved]).confirmed,0);
+  assert.equal(isReadyForTallyPosting({directPosting:true,ledgerName:'Jagdamba',ledgerNeedsReview:false,presence,billRequired:false,amount:1000000}),true);
+});
+
 test('the complete 23-row repeat upload counts 4 new, 14 existing and 5 held and preserves held evidence over a live match', () => {
   const rows = Array.from({length:23},(_,i)=>({id:`row-${i}`,transactionDate:'2026-10-08',description:`Entry ${i}`,creditAmount:100+i,balanceAmount:1000+i}));
   const saved = rows.map((row,i)=>({...row,id:`db-${i}`,postingStatus:i<18?'verified':'needs_tally_review',

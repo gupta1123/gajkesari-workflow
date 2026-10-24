@@ -1,5 +1,5 @@
 #define AppName "Gajkesari Tally Connector"
-#define AppVersion "0.1.79"
+#define AppVersion "0.1.80"
 #define AppPublisher "Gajkesari"
 #define AppInstallDir "C:\Gajkesari\tally-bridge"
 #define AppExeName "Gajkesari Tally Connector.exe"
@@ -13,6 +13,7 @@ AppPublisher={#AppPublisher}
 UninstallDisplayName={#AppName}
 DefaultDirName={#AppInstallDir}
 DisableProgramGroupPage=yes
+DisableDirPage=yes
 DisableWelcomePage=no
 DisableReadyPage=no
 OutputDir=output

@@ -4,7 +4,7 @@ import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { browserDatasetIds, resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { queueTallyCommandAndWake } from "@/lib/tally/queue-command";
-import { recheckEvidence, recheckObservation, recheckPayload, confirmedRecheckResult } from "@/lib/bank-statement-recheck";
+import { recheckEvidence, recheckObservation, recheckPayload, confirmedRecheckResult, clearedHeldRecheckResult } from "@/lib/bank-statement-recheck";
 import { refreshBankStatementQueueJobStatus } from "@/lib/bank-statement-tally-queue-status";
 
 export const runtime = "nodejs";
@@ -53,7 +53,7 @@ export async function POST(request: Request, context: Context) {
     for (const transaction of transactions ?? []) {
       const { data: log, error: logError } = await db.from("bank_transaction_posting_log")
         .select("id,command_id,status,result").eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id)
-        .eq("fingerprint", transaction.fingerprint).in("status", ["needs_tally_review", "verified"]).single();
+        .eq("fingerprint", transaction.fingerprint).in("status", ["needs_tally_review", "verified", "missing_in_tally"]).single();
       if (logError) throw logError;
       if (!log) throw new RecheckError("No saved posting result was found for this entry.", 409);
       const { data: original, error: commandError } = await db.from("tally_bridge_commands")
@@ -65,7 +65,7 @@ export async function POST(request: Request, context: Context) {
       connectionId = original.connection_id;
       // A previous PATCH may have saved the durable log before a transient
       // failure updating the snapshot row. Reuse its read-only evidence.
-      if (log.status === "verified" && log.result?.recheck?.commandId) {
+      if ((log.status === "verified" || (log.status === "missing_in_tally" && log.result?.retryCleared === true)) && log.result?.recheck?.commandId) {
         const { data: savedCheck, error: savedCheckError } = await db.from("tally_bridge_commands").select("id")
           .eq("id", String(log.result.recheck.commandId)).eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id)
           .eq("command_type", "verify_bank_transaction").contains("payload", { recheckImportId: statement.id }).maybeSingle();
@@ -140,11 +140,12 @@ export async function PATCH(request: Request, context: Context) {
     const statementRows = await loadStatementPostingRows(db, statement, user.id);
     const statementTransactionIds = new Set(statementRows.map(row => row.id));
     let confirmed = 0;
+    let cleared = 0;
     let checked = 0;
     let checkFailed = 0;
     for (const command of commands ?? []) {
       const { data: original, error: originalError } = await db.from("tally_bridge_commands")
-        .select("payload,queue_job_id").eq("id", command.payload.recheckPostingCommandId)
+        .select("payload,queue_job_id,status,result").eq("id", command.payload.recheckPostingCommandId)
         .eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id)
         .eq("command_type", "post_bank_voucher").single();
       if (originalError) throw originalError;
@@ -160,7 +161,7 @@ export async function PATCH(request: Request, context: Context) {
       const { data: log, error: logError } = await db.from("bank_transaction_posting_log")
         .select("id,status,result,tally_posted_at,fingerprint").eq("command_id", command.payload.recheckPostingCommandId)
         .eq("source_transaction_id", original.payload.transactionId).eq("fingerprint", transaction.fingerprint).eq("owner_user_id", user.id)
-        .eq("company_dataset_id", statement.company_dataset_id).in("status", ["needs_tally_review", "verified"]).single();
+        .eq("company_dataset_id", statement.company_dataset_id).in("status", ["needs_tally_review", "verified", "missing_in_tally"]).single();
       if (logError) throw logError;
       if (!log) continue;
       const approved = recheckPayload(original.payload, log.result);
@@ -168,6 +169,15 @@ export async function PATCH(request: Request, context: Context) {
       if (!observation) continue;
       if (command.created_at && log.result?.recheck?.startedAt && command.created_at < log.result.recheck.startedAt) continue;
       checked++;
+      // Finish a release whose durable log was saved before a transient row-write failure.
+      if (log.status === "missing_in_tally" && log.result?.retryCleared === true &&
+          log.result.recheck?.commandId === command.id && observation.verificationStatus === "missing") {
+        const {error: rowError}=await db.from("bank_transactions").update({tally_status:"missing_in_tally",tally_voucher_id:null,tally_posted_at:null})
+          .eq("id",transaction.id).eq("owner_user_id",user.id).eq("company_dataset_id",statement.company_dataset_id).eq("tally_status","needs_tally_review");
+        if(rowError)throw rowError;
+        cleared++;
+        continue;
+      }
       let evidence = recheckEvidence(command, approved);
       // A manual voucher without a matching bank reference must not confirm
       // two indistinguishable statement rows through separate recheck commands.
@@ -189,6 +199,21 @@ export async function PATCH(request: Request, context: Context) {
         verification: observation, lastSuccessfulVerification };
       if (!evidence) {
         if (log.status === "verified") continue;
+        const released = clearedHeldRecheckResult(original, log.result || {}, observation);
+        if (released) {
+          const {data: saved, error: releaseError} = await db.from("bank_transaction_posting_log").update({
+            status: "missing_in_tally", error: null, verification_status: "missing", uncertainty_reason: null,
+            tally_voucher_id: null, tally_posted_at: null, result: {...released, recheck},
+          }).eq("id",log.id).eq("owner_user_id",user.id).eq("company_dataset_id",statement.company_dataset_id)
+            .eq("status","needs_tally_review").filter("result",log.result == null ? "is" : "eq",log.result == null ? "null" : JSON.stringify(log.result)).select("id");
+          if(releaseError)throw releaseError;
+          if(!saved?.length)continue;
+          const {error: rowError}=await db.from("bank_transactions").update({tally_status:"missing_in_tally",tally_voucher_id:null,tally_posted_at:null})
+            .eq("id",transaction.id).eq("owner_user_id",user.id).eq("company_dataset_id",statement.company_dataset_id).eq("tally_status","needs_tally_review");
+          if(rowError)throw rowError;
+          cleared++;
+          continue;
+        }
         if (observation.verificationStatus === "failed") checkFailed++;
         const { error: saveError } = await db.from("bank_transaction_posting_log").update({ result: { ...log.result, recheck } })
           .eq("id", log.id).eq("owner_user_id", user.id).eq("company_dataset_id", statement.company_dataset_id)
@@ -215,7 +240,7 @@ export async function PATCH(request: Request, context: Context) {
       confirmed++;
     }
     const remainingRows = (await loadStatementPostingRows(db, statement, user.id)).filter(row => row.tally_status === "needs_tally_review");
-    return jsonWithCors(request, { confirmed, checked, checkFailed, remaining: remainingRows?.length || 0 });
+    return jsonWithCors(request, { confirmed, cleared, checked, checkFailed, remaining: remainingRows?.length || 0 });
   } catch (error) {
     return recheckErrorResponse(request, error);
   }

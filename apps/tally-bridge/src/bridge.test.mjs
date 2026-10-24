@@ -13,6 +13,7 @@ import {
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   createExclusiveScheduler,
+  createBridgeRunner,
   decodeTallyResponseBytes,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
@@ -38,6 +39,16 @@ import {
 function decodeRequestBody(body) {
   return Buffer.isBuffer(body) ? decodeTallyResponseBytes(body) : String(body);
 }
+
+test('updating waits for the active Tally task and stops accepting work only after it is idle',async()=>{
+  const runner=createBridgeRunner({config:{connectionId:'test-connector',tallyUrl:'http://127.0.0.1:9000'}});
+  let finish;const task=runner.runTallyTask(()=>new Promise(resolve=>{finish=resolve;}),'posting');
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(runner.prepareForUpdate(),false);assert.equal(runner.stopped,false);
+  finish();await task;await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(runner.prepareForUpdate(),true);assert.equal(runner.stopped,true);
+  await assert.rejects(runner.runTallyTask(()=>{throw Error('must never execute');}),'stopped');
+});
 
 // Real names verified against TallyPrime: UTF-8 requests fail or return "?".
 const UNICODE_LEDGER_NAMES = [
