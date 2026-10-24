@@ -40,6 +40,7 @@ import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, stat
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
+import { resolveBankBillReference } from "@gajkesari/shared/lib/bank-bill-reference";
 import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
@@ -2606,19 +2607,8 @@ function normalizeReferenceToken(value?: string | null) {
 }
 
 function findNarrationBill(openBills: OpenBillReference[], transaction: ReviewTransaction) {
-  const narration = normalizeReferenceToken(`${transaction.description} ${transaction.referenceNumber}`);
-  const matches = openBills.filter((bill) => {
-    const ref = normalizeReferenceToken(bill.referenceName);
-    return ref.length >= 5 && narration.includes(ref);
-  }).sort((left, right) =>
-    normalizeReferenceToken(right.referenceName).length - normalizeReferenceToken(left.referenceName).length
-  );
-  if (matches.length === 0) return null;
-  const longestLength = normalizeReferenceToken(matches[0].referenceName).length;
-  const longestMatches = matches.filter(
-    (bill) => normalizeReferenceToken(bill.referenceName).length === longestLength
-  );
-  return longestMatches.length === 1 ? longestMatches[0] : null;
+  const match = resolveBankBillReference(openBills, { narration: transaction.description, referenceNumber: transaction.referenceNumber });
+  return match.status === "matched" ? openBills.find(bill => bill.referenceName === match.referenceName) ?? null : null;
 }
 
 function sortOpenBills(openBills: OpenBillReference[]) {
@@ -2795,6 +2785,26 @@ function allocateBillsForTransaction(
 
   const narrationBill = findNarrationBill(openBills, transaction);
   const candidateBills = sortOpenBills(openBills);
+  const referenceMatch = resolveBankBillReference(openBills, { narration: transaction.description, referenceNumber: transaction.referenceNumber });
+  if (referenceMatch.status === "ambiguous" || referenceMatch.status === "unresolved") {
+    return {
+      status: "needs_review",
+      caseType: "cannot_match_yet",
+      caseLabel: "Needs Review",
+      reason: referenceMatch.status === "ambiguous"
+        ? "The invoice reference matches more than one open bill. Select the correct bill before posting."
+        : "The invoice reference could not be matched to an open bill. Review the bills before posting.",
+      receiptAmount,
+      totalAllocatedAmount: 0,
+      newAdvanceAmount: 0,
+      unallocatedAmount: receiptAmount,
+      allocations: [],
+      candidateBills,
+      existingAdvances,
+      requiresUserReview: true,
+      isEligibleForPosting: false,
+    };
+  }
 
   if (openBills.length > 0 && existingAdvances.length > 0) {
     return {
@@ -5423,7 +5433,7 @@ export function BankStatementsPage() {
     const candidateMasters = connectorCandidateMasters(payload.transactions);
     const effectiveLedgerMasters = Array.from(
       new Map(
-        [...ledgerMastersForReview, ...candidateMasters].map((ledger) => [normalizeName(ledger.name), ledger])
+        [...candidateMasters, ...ledgerMastersForReview].map((ledger) => [normalizeName(ledger.name), ledger])
       ).values()
     );
     if (candidateMasters.length > 0) {
