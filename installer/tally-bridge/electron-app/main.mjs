@@ -946,6 +946,7 @@ function createWindow() {
             </div>
           </div>
           <button id="checkUpdatesBtn" class="updateAction">Check for updates</button>
+          <p id="updateLastUpdated" class="meta" hidden></p>
           <progress id="updateProgress" max="100" value="0" hidden style="width:100%;margin-top:12px;accent-color:#b87529" aria-label="Update download progress"></progress>
           <p id="updateNotice" class="meta" role="status" aria-live="polite"></p>
         </div>
@@ -1048,6 +1049,9 @@ function createWindow() {
             document.getElementById('updateTitle').textContent = ({available:'Update available',current:"You're up to date",installed:'Updated successfully',error:'Update needs attention',ready:'Ready to update',waiting:'Finish Tally work first',restarting:'Restarting connector',checking:'Checking for updates',downloading:'Downloading update',verifying:'Verifying update'})[phase] || 'Connector updates';
             document.getElementById('updateCopy').textContent = state.message || '';
             document.querySelector('.updateVersion').textContent = 'Current version '+state.currentVersion;
+            const lastUpdated = document.getElementById('updateLastUpdated');
+            lastUpdated.hidden = !state.lastUpdatedAt;
+            lastUpdated.textContent = state.lastUpdatedAt ? 'Last updated: '+fmtTime(state.lastUpdatedAt) : '';
             const busy = ['checking','downloading','verifying','restarting'].includes(phase);
             checkUpdatesBtn.disabled = busy;
             checkUpdatesBtn.textContent = busy ? (phase === 'downloading' ? 'Downloading… '+(state.progress || 0)+'%' : 'Please wait…')

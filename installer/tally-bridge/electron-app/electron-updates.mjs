@@ -10,6 +10,7 @@ export function createElectronConnectorUpdater({engine, version, directory, onSt
   let inFlight = null;
   let prepared = false;
   const receipt = path.join(directory, 'electron-update-pending.json');
+  const historyFile = path.join(directory, 'electron-update-history.json');
   const emit = patch => { state = {...state, ...patch}; onState({...state}); return state; };
   const exclusive = action => {
     if (inFlight) return inFlight;
@@ -47,9 +48,24 @@ export function createElectronConnectorUpdater({engine, version, directory, onSt
     message: 'Update downloaded and verified. Ready to restart the connector.', progress: 100, detail: null}));
   engine.on('error', fail);
   try {
+    const history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+    if (history.version === version && Number.isFinite(Date.parse(history.updatedAt))) {
+      state.lastUpdatedAt = history.updatedAt;
+      state.lastInstallDurationMs = history.installDurationMs ?? null;
+    }
+  } catch (error) { if (error.code !== 'ENOENT') logger.error(error); }
+  try {
     const pending = JSON.parse(fs.readFileSync(receipt, 'utf8'));
     if (pending.version === version) {
-      emit({phase: 'installed', message: `Updated successfully to ${version}.`, progress: 100});
+      const updatedAt = new Date().toISOString();
+      const startedAt = Date.parse(pending.requestedAt);
+      const installDurationMs = Number.isFinite(startedAt) ? Math.max(0, Date.parse(updatedAt) - startedAt) : null;
+      const history = {version, updatedAt, requestedAt:pending.requestedAt ?? null, installDurationMs};
+      try { fs.writeFileSync(historyFile, JSON.stringify(history, null, 2)); }
+      catch (error) { logger.error(`Could not save connector update history: ${error.message}`); }
+      logger.info?.(`Connector update completed: ${JSON.stringify(history)}`);
+      emit({phase: 'installed', message: `Updated successfully to ${version}.`, progress: 100,
+        lastUpdatedAt:updatedAt, lastInstallDurationMs:installDurationMs});
       fs.rmSync(receipt, {force: true});
     } else {
       emit({phase: 'error', message: 'The previous update did not finish. Please check for updates and try again.', progress: null});

@@ -11,7 +11,7 @@ const tools = path.join(installer, 'nsis');
 const payload = path.join(installer, 'payload-clean');
 const app = path.join(payload, 'resources/app');
 const versionIndex = process.argv.indexOf('--version');
-const version = versionIndex < 0 ? '0.1.85' : process.argv[versionIndex + 1];
+const version = versionIndex < 0 ? '0.1.86' : process.argv[versionIndex + 1];
 if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Provide a numeric connector version.');
 if (!process.argv.includes('--reuse-payload')) {
   execFileSync(process.execPath, [path.join(root, 'scripts/build-tally-connector-installer.mjs'), '--payload-only'], {cwd: root, stdio: 'inherit'});

@@ -138,3 +138,32 @@ Local artifact: `installer/tally-bridge/output/nsis/0.1.85/GajkesariTallyConnect
 The installer, blockmap and latest.yml are local only. The user's running 0.1.84
 was not closed, replaced or uninstalled by these tests. The one-time Inno
 migration/release-workflow limitations above still apply.
+
+## GitHub update trial, 0.1.85 to 0.1.86
+
+The user authorised publishing an update for the installed 0.1.85 and plans to
+retire the old Inno connector. Version 0.1.86 adds a persistent "Last updated"
+line to Connector updates. The timestamp is recorded only when the pending
+update's target version is running; it survives further launches/checks. The
+receipt also records installation/restart duration for diagnostics. No bank
+statement, duplicate detection, posting or matching behavior changes.
+
+All eight updater unit tests pass. The final 812-file installed payload matches
+the staging hashes; native modules, standalone bill-reference import and the
+six-row bank PDF/balances pass. The exact 0.1.85/0.1.86 blockmaps produce a plan
+of 424,713 downloaded installer bytes and 106,525,381 reused bytes (99.60%
+reused). Reconstructing the 106,950,094-byte 0.1.86 installer from those operations
+matches its SHA512 and latest.yml. Metadata/blockmap traffic is additional.
+
+Publish the immutable 0.1.85 baseline and 0.1.86 as plain numeric NSIS release
+tags, with the installer, external blockmap and latest.yml together. Publish
+0.1.85 with latest=false and 0.1.86 with latest=true. The old connector's
+prefix-filtered feed and the immutable published 0.1.82 assets remain untouched.
+Source lives on codex/electron-updater-trial; do not push main or deploy the web
+or API to exercise this connector update.
+
+0.1.86 installer SHA256:
+`17f65854ca459f9980dd4124e497ab8723f497aaee291af6caecddf68cf7de17`.
+The user performs the live update through the installed connector. Record
+download and restart timing from its update log and new success receipt,
+separately from preflight estimates and isolated benchmarks.

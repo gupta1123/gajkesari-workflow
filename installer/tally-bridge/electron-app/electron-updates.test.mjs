@@ -72,3 +72,31 @@ test('restart reports success only after actually running the target version', t
   assert.equal(createElectronConnectorUpdater({...options, engine: new EventEmitter(), version: '0.1.84'}).getState().phase, 'installed');
   assert.equal(fs.existsSync(receipt), false);
 });
+
+test('successful restart saves a last-updated time that survives another launch and update check', async t => {
+  const f = fixture(t);
+  const requestedAt = new Date(Date.now() - 15000).toISOString();
+  fs.writeFileSync(path.join(f.directory, 'electron-update-pending.json'), JSON.stringify({version:'0.1.84', requestedAt}));
+  const options = {engine:new EventEmitter(), directory:f.directory, version:'0.1.84', prepareForInstall:async () => true, logger:{error(){}}};
+  const first = createElectronConnectorUpdater(options);
+  assert.equal(first.getState().phase, 'installed');
+  assert.ok(first.getState().lastInstallDurationMs >= 15000);
+  const persisted = JSON.parse(fs.readFileSync(path.join(f.directory, 'electron-update-history.json')));
+  assert.equal(persisted.updatedAt, first.getState().lastUpdatedAt);
+  const engine = new EventEmitter();
+  engine.checkForUpdates = async () => {engine.emit('update-not-available'); return {};};
+  const reopened = createElectronConnectorUpdater({...options, engine});
+  assert.equal(reopened.getState().lastUpdatedAt, persisted.updatedAt);
+  await reopened.check();
+  assert.equal(reopened.getState().lastUpdatedAt, persisted.updatedAt);
+});
+
+test('a mismatched pending version or old history cannot claim the current version was updated', t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.directory, 'electron-update-history.json'), JSON.stringify({version:'0.1.82', updatedAt:new Date().toISOString()}));
+  fs.writeFileSync(path.join(f.directory, 'electron-update-pending.json'), JSON.stringify({version:'0.1.84', requestedAt:new Date().toISOString()}));
+  const updater = createElectronConnectorUpdater({engine:new EventEmitter(), directory:f.directory, version:'0.1.83', prepareForInstall:async () => true, logger:{error(){}}});
+  assert.equal(updater.getState().phase, 'error');
+  assert.equal(updater.getState().lastUpdatedAt, undefined);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.directory, 'electron-update-history.json'))).version, '0.1.82');
+});
