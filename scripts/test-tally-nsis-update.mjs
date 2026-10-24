@@ -23,6 +23,10 @@ const userData = path.join(root, 'user data');
 const resultFile = path.join(root, 'completed.json');
 const requests = [];
 fs.mkdirSync(output, {recursive: true});
+const legacyRoot = path.join(root, 'legacy connector');
+fs.mkdirSync(legacyRoot, {recursive: true});
+const includeFile = path.join(root, 'installer-ux.nsh');
+fs.copyFileSync(path.join(tools, 'installer-ux.nsh'), includeFile);
 const server = http.createServer((request, response) => {
   const name = path.basename(decodeURIComponent(new URL(request.url, 'http://localhost').pathname));
   const file = path.join(output, name);
@@ -45,6 +49,7 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const feed = `http://127.0.0.1:${server.address().port}/`;
 const appId = `com.gajkesari.updater-test-${run}`;
 let oldProcess;
+let legacyProcess;
 try {
   for (const version of ['0.0.1', '0.0.2']) {
     const payload = path.join(root, `payload-${version}`);
@@ -85,7 +90,7 @@ app.whenReady().then(async () => {
     const config = {appId, productName: 'Gajkesari Updater Test', electronVersion: '31.7.7',
       directories: {app, output}, extraMetadata: {version}, npmRebuild: false, asar: false,
       win: {target: ['nsis'], executableName: 'Gajkesari Updater Test', signAndEditExecutable: false},
-      nsis: {oneClick: true, perMachine: false, allowElevation: false, runAfterFinish: false,
+      nsis: {oneClick: false, perMachine: false, allowElevation: false, runAfterFinish: true, include: includeFile,
         createDesktopShortcut: false, createStartMenuShortcut: false, deleteAppDataOnUninstall: false,
         differentialPackage: true, artifactName: 'UpdaterTest-${version}.${ext}'},
       publish: [{provider: 'generic', url: feed}],
@@ -96,7 +101,17 @@ app.whenReady().then(async () => {
       '--projectDir', tools, '--prepackaged', payload, '--config', configPath, '--win', 'nsis', '--x64', '--publish', 'never'],
     repo);
   }
+  const legacyExe = path.join(legacyRoot, 'Gajkesari Updater Test.exe');
+  const legacyCode = path.join(root, 'LegacyConnector.cs');
+  fs.writeFileSync(legacyCode, 'class LegacyConnector { static void Main() { System.Threading.Thread.Sleep(300000); } }');
+  const compiler = path.join(process.env.SystemRoot || 'C:/Windows', 'Microsoft.NET/Framework64/v4.0.30319/csc.exe');
+  execFileSync(compiler, ['/nologo', '/target:winexe', `/out:${legacyExe}`, legacyCode], {windowsHide: true});
+  legacyProcess = spawn(legacyExe, [], {windowsHide: true, stdio: 'ignore'});
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(legacyProcess.exitCode, null, 'Legacy test connector must be running before installation.');
   execFileSync(path.join(output, 'UpdaterTest-0.0.1.exe'), ['/S', `/D=${installation}`], {windowsHide: true, timeout: 120000});
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.notEqual(legacyProcess.exitCode, null, 'Installer did not close the old-location test connector.');
   assert.equal(JSON.parse(fs.readFileSync(path.join(installation, 'resources/app/package.json'))).version, '0.0.1');
   console.log('Installed isolated test version 0.0.1. Starting actual update.');
   oldProcess = spawn(path.join(installation, 'Gajkesari Updater Test.exe'), [], {windowsHide: true, stdio: 'ignore'});
@@ -111,10 +126,11 @@ app.whenReady().then(async () => {
   const fullBytes = fs.statSync(path.join(output, 'UpdaterTest-0.0.2.exe')).size;
   const ranges = requests.filter(item => item.name === 'UpdaterTest-0.0.2.exe' && item.range).length;
   assert.ok(ranges > 0 && bytes < fullBytes * 0.8, 'Expected a differential download, not a full installer download.');
-  const summary = {...result, bytesDownloaded: bytes, fullInstallerBytes: fullBytes, rangeRequests: ranges, savedPercent: Number(((1 - bytes / fullBytes) * 100).toFixed(2)), root};
+  const summary = {...result, legacyConnectorClosed: true, bytesDownloaded: bytes, fullInstallerBytes: fullBytes, rangeRequests: ranges, savedPercent: Number(((1 - bytes / fullBytes) * 100).toFixed(2)), root};
   fs.writeFileSync(path.join(root, 'summary.json'), JSON.stringify(summary, null, 2));
   console.log(JSON.stringify(summary, null, 2));
 } finally {
   server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   if (oldProcess && oldProcess.exitCode === null) oldProcess.kill();
+  if (legacyProcess && legacyProcess.exitCode === null) legacyProcess.kill();
 }

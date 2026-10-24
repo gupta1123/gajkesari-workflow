@@ -11,7 +11,7 @@ Install the independent packaging toolchain with
 and electron-updater 6.8.11. The normal repository dependencies must also be
 installed for the existing connector payload builder.
 
-Run `npm run installer:tally-bridge:nsis`. The default trial version is 0.1.83;
+Run `npm run installer:tally-bridge:nsis`. The default trial version is 0.1.84;
 `node scripts/build-tally-connector-nsis.mjs --version X.Y.Z` selects another
 unpublished trial version. It reuses the current runtime/native-module payload,
 adds electron-updater and its dependencies, and builds with `--publish never`.
@@ -27,6 +27,15 @@ library's download verification, caching, differential requests, silent install,
 and restart. It disables installation on normal app exit, waits for Tally work
 to finish, and closes native database handles before the explicit update.
 Diagnostic logs are written to `connector-update.log` in Electron user data.
+
+Manual setup in 0.1.84 uses a guided wizard: branded welcome with an Install
+button, installation progress, and a success page with a checked option to open
+the connector. The per-user scope is selected automatically. Before replacing
+files, native Windows tools close exact-name connector processes belonging to
+the current user, covering the old Inno and current NSIS locations. The welcome
+page asks the user to finish current Tally work before clicking Install. If a
+connector cannot be closed, setup stops before replacing files. In-app updates
+still run silently and restart automatically after the existing Tally busy guard.
 
 ## Verification
 
@@ -75,3 +84,12 @@ through five range requests instead of the full 84,424,444 bytes (99.72% saved).
 This is a measured small-change test, not a guarantee for every future release.
 The application update adapter and existing updater/bridge regression suite
 passed 99 tests. The currently installed production connector remained 0.1.81.
+
+After the user installed the 0.1.83 trial, the 0.1.84 guided setup was built and
+its shared welcome/finish page definitions were visually inspected through a
+non-installing preview. A real isolated assisted-NSIS update test also passed:
+the installer closed a running test connector outside the new installation,
+then updated 0.0.1 to 0.0.2 silently and restarted successfully. It fetched
+263,121 bytes instead of 84,468,827 bytes (99.69% saved). No real connector was
+closed or replaced during this test. The full regression run had one legacy
+PowerShell-helper timeout; the seven helper tests passed on recheck.

@@ -11,7 +11,7 @@ const tools = path.join(installer, 'nsis');
 const payload = path.join(installer, 'payload-clean');
 const app = path.join(payload, 'resources/app');
 const versionIndex = process.argv.indexOf('--version');
-const version = versionIndex < 0 ? '0.1.83' : process.argv[versionIndex + 1];
+const version = versionIndex < 0 ? '0.1.84' : process.argv[versionIndex + 1];
 if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Provide a numeric connector version.');
 execFileSync(process.execPath, [path.join(root, 'scripts/build-tally-connector-installer.mjs'), '--payload-only'], {cwd: root, stdio: 'inherit'});
 
@@ -42,7 +42,10 @@ const config = {
   protocols: [{name: 'Gajkesari Tally Protocol', schemes: ['gajkesari-tally']}],
   win: {target: ['nsis'], executableName: 'Gajkesari Tally Connector', signAndEditExecutable: false,
     icon: path.join(tools, 'assets/gajkesari.ico')},
-  nsis: {oneClick: true, perMachine: false, allowElevation: false, runAfterFinish: false,
+  nsis: {oneClick: false, perMachine: false, allowElevation: false, runAfterFinish: true,
+    include: path.join(tools, 'installer-ux.nsh'),
+    installerSidebar: path.join(tools, 'assets/installer-sidebar.bmp'),
+    uninstallerSidebar: path.join(tools, 'assets/installer-sidebar.bmp'),
     installerIcon: path.join(tools, 'assets/gajkesari.ico'), uninstallerIcon: path.join(tools, 'assets/gajkesari.ico'),
     deleteAppDataOnUninstall: false, differentialPackage: true,
     artifactName: 'GajkesariTallyConnectorSetup-${version}.${ext}'},
