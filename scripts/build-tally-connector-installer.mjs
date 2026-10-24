@@ -261,7 +261,7 @@ if (process.platform !== "win32") {
 }
 
 const { runtimeSource, executable: runtimeExecutable } = findRuntime();
-const innoCompiler = findInnoCompiler();
+const innoCompiler = process.argv.includes("--payload-only") ? null : findInnoCompiler();
 
 resetDir(payloadDir);
 resetDir(stagingDir);
@@ -298,6 +298,7 @@ const appDir = path.join(payloadDir, "resources", "app");
 fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "updates.mjs"), path.join(appDir, "updates.mjs"));
+fs.copyFileSync(path.join(electronAppSource, "electron-updates.mjs"), path.join(appDir, "electron-updates.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "update-helper.ps1"), path.join(appDir, "update-helper.ps1"));
 const installerVersion = JSON.parse(fs.readFileSync(path.join(electronAppSource, "package.json"), "utf8")).version;
 const stagedWrapper = path.join(appDir, "main.mjs");
@@ -356,6 +357,10 @@ fs.writeFileSync(
   )}\n`
 );
 
+if (process.argv.includes("--payload-only")) {
+  console.log(`Connector payload created: ${payloadDir}`);
+  process.exit(0);
+}
 if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
 const outputBaseName = path.basename(setupName, path.extname(setupName));
 execFileSync(innoCompiler, [innoDefinition, `/F${outputBaseName}`], {

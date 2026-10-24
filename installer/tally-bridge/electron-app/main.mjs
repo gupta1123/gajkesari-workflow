@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { createConnectorUpdater } from "./updates.mjs";
+import { createElectronConnectorUpdater } from "./electron-updates.mjs";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
 import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, upsertGroups, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
 import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable, closeZvecCollections } from "./src/local-matching/vector.mjs";
@@ -79,8 +80,35 @@ async function installConnectorUpdate(update) {
   app.quit();
 }
 
-function startConnectorUpdater() {
+async function startConnectorUpdater() {
   const directory = path.join(app.getPath("userData"), "updates");
+  const metadata = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+  if (metadata.connectorUpdater === "electron-updater") {
+    const {default: electronUpdater} = await import("electron-updater");
+    const writeUpdateLog = (...values) => appendLog(path.join(app.getPath("userData"), "connector-update.log"), values.map(String).join(" "));
+    updater = createElectronConnectorUpdater({
+      engine: electronUpdater.autoUpdater, version: CONNECTOR_VERSION, directory, onState: sendUpdateState,
+      logger: {info: writeUpdateLog, warn: writeUpdateLog, error: writeUpdateLog, debug: writeUpdateLog},
+      prepareForInstall: async () => {
+        if (localSyncInFlight || vectorising || updateInstalling) return false;
+        if (runner && !runner.stopped && !runner.prepareForUpdate()) return false;
+        updateInstalling = true;
+        return true;
+      },
+      beforeQuit: () => closeZvecCollections(),
+      resumeAfterFailure: () => {
+        updateInstalling = false;
+        if (runner?.stopped) void startRunner().catch(error => appendLog(errPath, error.message));
+      },
+    });
+    ipcMain.handle("updates:state", () => updater.getState());
+    ipcMain.handle("updates:check", () => updater.check());
+    ipcMain.handle("updates:download", () => updater.download());
+    ipcMain.handle("updates:install", () => updater.apply());
+    setTimeout(() => { if (!['installed', 'error'].includes(updater.getState().phase)) void updater.check(); }, 15000).unref();
+    setInterval(() => { if (!['downloading', 'ready', 'waiting', 'restarting'].includes(updater.getState().phase)) void updater.check(); }, 4 * 60 * 60 * 1000).unref();
+    return;
+  }
   updater = createConnectorUpdater({version:CONNECTOR_VERSION,directory,fetch:(url,options)=>net.fetch(url,options),onState:sendUpdateState,
     prepareForInstall:async()=>{
       if (localSyncInFlight || vectorising || updateInstalling) return false;
@@ -1251,9 +1279,9 @@ if (!gotLock) {
     if (mainWindow) handleProtocolUrl(url);
     else pendingProtocolUrl = url;
   });
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     installSystemNetworkFetch();
-    startConnectorUpdater();
+    await startConnectorUpdater();
     ipcMain.on("window:minimize", () => mainWindow?.minimize());
     ipcMain.on("window:toggle-maximize", () => {
       if (!mainWindow) return;

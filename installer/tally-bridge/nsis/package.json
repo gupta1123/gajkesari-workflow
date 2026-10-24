@@ -1,0 +1,13 @@
+{
+  "name": "gajkesari-tally-connector-nsis",
+  "version": "0.1.83",
+  "private": true,
+  "description": "Gajkesari Tally Connector NSIS packaging trial",
+  "author": "Gajkesari",
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "devDependencies": {
+    "electron-builder": "26.18.0"
+  }
+}
