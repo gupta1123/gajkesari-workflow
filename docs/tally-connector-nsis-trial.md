@@ -93,3 +93,48 @@ then updated 0.0.1 to 0.0.2 silently and restarted successfully. It fetched
 263,121 bytes instead of 84,468,827 bytes (99.69% saved). No real connector was
 closed or replaced during this test. The full regression run had one legacy
 PowerShell-helper timeout; the seven helper tests passed on recheck.
+
+## Installer performance, local 0.1.85
+
+The user installed 0.1.84 and reported slow installation. The full archive
+benchmark measured 120.447 seconds with the upstream extraction/copy macro:
+24.312 seconds unpacking and 94.375 seconds copying the unpacked app again.
+The same archive with same-volume moves took 35.553 seconds overall. The final
+0.1.85 payload, with 39,213,513 bytes of unused Chromium UI locales removed,
+took 26.326 seconds. These are full-payload **file-installation benchmarks**,
+including startup integrity verification and temporary-file cleanup, not a
+promise for the entire interactive wizard or old-version removal on every PC.
+
+The installer still unpacks before replacing files, retains a checked copy
+fallback for existing destinations/other volumes, and aborts on locked files.
+Welcome, finish and automatic restart behavior remain. Each installation stage
+now updates the visible header and appends its tick count to
+`%TEMP%/<app-package-name>-<version>-setup.log`. CRC remains enabled.
+
+The version-pinned build adapter redirects the upstream file-install section
+without editing node_modules or replacing electron-builder's main script;
+normal uninstaller signing, installer validation and blockmap generation remain
+in that pipeline. Re-review the adapter when changing electron-builder versions.
+
+Verification commands:
+
+```powershell
+node scripts/test-connector-nsis-files.mjs
+node scripts/test-tally-nsis-update.mjs
+node scripts/benchmark-connector-install.mjs <installer.exe> optimized
+node scripts/verify-connector-install.mjs <prepared-payload> <benchmark-install> <test.pdf>
+```
+
+Fresh installation, merging existing folders without removing retained files,
+and safe failure on a locked file passed. All 812 final installed files matched
+the staged payload by SHA256. Native Zvec/canvas loading, the standalone bill
+reference module and the six-row bank PDF passed, with verified balances. The
+six update-adapter unit tests also passed. The real isolated update/restart test
+downloaded 271,056 / 77,485,183 bytes (99.65% saved); future release savings vary.
+
+Local artifact: `installer/tally-bridge/output/nsis/0.1.85/GajkesariTallyConnectorSetup-0.1.85.exe`,
+106,949,394 bytes, SHA256
+`775423bdd79442abec7d451621bef30c4d5d8392139797aa73eee24715af11cf`.
+The installer, blockmap and latest.yml are local only. The user's running 0.1.84
+was not closed, replaced or uninstalled by these tests. The one-time Inno
+migration/release-workflow limitations above still apply.

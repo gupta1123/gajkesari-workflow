@@ -3,7 +3,8 @@ import {execFileSync} from 'node:child_process';
 export async function runNsisBuilder(cli, args, cwd) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const output = execFileSync(process.execPath, [cli, ...args], {cwd, encoding: 'utf8', windowsHide: true,
+      const register = new URL('./register-connector-nsis.mjs', import.meta.url).href;
+      const output = execFileSync(process.execPath, ['--import', register, cli, ...args], {cwd, encoding: 'utf8', windowsHide: true,
         maxBuffer: 8 * 1024 * 1024, env: {...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false'}});
       process.stdout.write(output);
       return;

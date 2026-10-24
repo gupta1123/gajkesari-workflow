@@ -8,6 +8,30 @@
 !define MUI_FINISHPAGE_RUN_TEXT "Open Gajkesari Tally Connector"
 !define MUI_FINISHPAGE_NOAUTOCLOSE
 
+; Visible stages and an append-only timing log make a slow installation
+; diagnosable. Never disable CRC/integrity checks to hide startup verification.
+!macro GajkesariStage TEXT
+  DetailPrint "${TEXT}"
+  !insertmacro MUI_HEADER_TEXT "Installing your connector" "${TEXT}"
+  Push $0
+  Push $1
+  System::Call 'kernel32::GetTickCount() i.r0'
+  FileOpen $1 "$TEMP\${APP_PACKAGE_NAME}-${VERSION}-setup.log" a
+  FileSeek $1 0 END
+  FileWrite $1 "$0 ${TEXT}$\r$\n"
+  FileClose $1
+  Pop $1
+  Pop $0
+!macroend
+
+!macro customInit
+  !insertmacro GajkesariStage "Setup ready"
+!macroend
+
+!macro customInstall
+  !insertmacro GajkesariStage "Your connector is ready"
+!macroend
+
 !macro customWelcomePage
   !define MUI_PAGE_CUSTOMFUNCTION_SHOW GajkesariWelcomeShown
   !insertmacro MUI_PAGE_WELCOME
@@ -52,6 +76,7 @@
   BrandingText "Gajkesari"
   !ifndef BUILD_UNINSTALLER
     Function GajkesariCloseRunningConnectors
+      !insertmacro GajkesariStage "Checking for a running connector..."
       !insertmacro GajkesariFindProcess
       ${If} $R0 == 0
         DetailPrint "Closing the running Gajkesari connector..."
