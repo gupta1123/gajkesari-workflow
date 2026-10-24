@@ -307,6 +307,7 @@ fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, 
 copyDir(path.join(electronAppSource, "assets"), path.join(appDir, "assets"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
+fs.copyFileSync(path.join(repoRoot, "packages/shared/src/lib/bank-bill-reference.mjs"), path.join(appDir, "src/local-matching/bill-reference.mjs"));
 copyDir(documentParsingSource, path.join(appDir, "src", "document-parsing"));
 const documentParsingLogicDir = path.join(appDir, "src", "document-parsing", "backend-logic");
 fs.mkdirSync(documentParsingLogicDir, { recursive: true });

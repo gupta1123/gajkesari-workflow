@@ -1,3 +1,5 @@
+import { resolveBankBillReference } from "./bill-reference.mjs";
+
 function normalized(value) {
   return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
@@ -10,26 +12,11 @@ function referenceToken(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function preferredBillReference(bills, transaction) {
-  const narration = referenceToken(`${transaction.narration || ""} ${transaction.referenceNumber || ""}`);
-  const matches = (bills || []).filter((bill) => {
-    const reference = referenceToken(bill.referenceName);
-    return reference.length >= 5 && narration.includes(reference);
-  }).sort((left, right) =>
-    referenceToken(right.referenceName).length - referenceToken(left.referenceName).length
-  );
-  if (matches.length === 0) return "";
-  const longestLength = referenceToken(matches[0].referenceName).length;
-  const longestMatches = matches.filter(
-    (bill) => referenceToken(bill.referenceName).length === longestLength
-  );
-  return longestMatches.length === 1 ? normalized(longestMatches[0].referenceName) : "";
-}
-
 function orderBills(bills, preferredReference = "") {
+  const preferredKey = normalized(preferredReference);
   return [...(bills || [])].sort((left, right) =>
-    (normalized(left.referenceName) === preferredReference ? -1 : 0) -
-      (normalized(right.referenceName) === preferredReference ? -1 : 0) ||
+    (normalized(left.referenceName) === preferredKey ? -1 : 0) -
+      (normalized(right.referenceName) === preferredKey ? -1 : 0) ||
     String(left.dueDate || left.invoiceDate || "9999-12-31").localeCompare(
       String(right.dueDate || right.invoiceDate || "9999-12-31")
     ) || String(left.referenceName || "").localeCompare(String(right.referenceName || ""))
@@ -101,13 +88,17 @@ export function planChronologicalBillAllocations({ transactions, verificationRow
     const bills = working.get(ledgerKey) || (bucket.openBills || []).map((bill) => ({ ...bill }));
     const amount = amountFor(transaction);
     if (amount <= 0 || (bucket.existingAdvances || []).length > 0) continue;
+    const reference = resolveBankBillReference(bills, transaction);
+    // Leave uncertain invoice references to the browser's review flow. Falling
+    // back to FIFO here would silently select an invoice the user did not name.
+    if (["ambiguous", "unresolved"].includes(reference.status)) continue;
     const date = String(transaction.voucherDate || "").replace(/-/g, "");
     const suffix = referenceToken(transaction.referenceNumber || transactionId).slice(-8) || transactionId.slice(0, 8);
     const allocation = allocate(
       amount,
       bills,
       `ADV-${date}-${suffix}`.slice(0, 80),
-      preferredBillReference(bills, transaction)
+      reference.referenceName
     );
     const totalAllocatedAmount = Number(allocation.allocations.reduce((sum, item) => sum + item.allocatedAmount, 0).toFixed(2));
     plans[transactionId] = {
@@ -116,7 +107,7 @@ export function planChronologicalBillAllocations({ transactions, verificationRow
       newAdvanceAmount: allocation.newAdvanceAmount,
       unallocatedAmount: Number(Math.max(0, amount - totalAllocatedAmount).toFixed(2)),
       allocations: allocation.allocations,
-      candidateBills: orderBills(bills, preferredBillReference(bills, transaction)),
+      candidateBills: orderBills(bills, reference.referenceName),
       existingAdvances: bucket.existingAdvances || [],
       source: "connector_chronological_fifo",
     };
