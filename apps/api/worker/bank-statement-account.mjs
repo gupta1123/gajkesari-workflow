@@ -54,7 +54,7 @@ function headerMarkdown(markdown) {
   const lines = String(markdown ?? "").split(/\r?\n/);
   const transactionHeaderIndex = lines.findIndex((line) => {
     const normalized = normalizeHeader(line);
-    return /(?:transaction|txn|post) date/.test(normalized) &&
+    return /\bdate\b/.test(normalized) &&
       /(?:debit|withdrawal|dr amount)/.test(normalized) &&
       /(?:credit|deposit|cr amount)/.test(normalized);
   });
@@ -97,6 +97,59 @@ function bankNameFromHeader(markdown) {
   // only in the legal footer after the transaction table.
   if (/\bHDFC BANK LIMITED\b/i.test(plainMarkdownText(markdown))) return "HDFC Bank";
   return "";
+}
+
+function holderFromHeader(markdown) {
+  const header = headerMarkdown(markdown);
+  const text = plainMarkdownText(header);
+  // Plain-text labels are common in PNB exports. Stop before the next field,
+  // rather than treating the customer's address as part of their name.
+  const labelled = text.match(/\b(?:account\s+(?:holder(?:\s+name)?|name)|customer\s+name)\s*:\s*(.{3,160}?)(?=\s+(?:(?:customer|account|bank|branch)\s+(?:address|number|no\.?|type|name)|account|address|city|pin|ifsc|currency|nominee|statement|period)\s*[:\-]|$)/i);
+  if (labelled) return cleanText(labelled[1]);
+
+  // HDFC puts the account number and holder in the first column, alongside
+  // a separate branch-address column. Read only the name rows above ADDRESS.
+  const lines = header.split(/\r?\n/);
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const cells = markdownCells(lines[index]);
+    if (!/^\d{6,34}$/.test(cells[0] ?? "") || normalizeHeader(cells[1]) !== "branch address" || !isMarkdownSeparator(lines[index + 1])) continue;
+    const pieces = [];
+    for (let row = index + 2; row < Math.min(index + 8, lines.length); row += 1) {
+      const values = markdownCells(lines[row]);
+      const value = values[0];
+      if (values.length !== cells.length || !value || /^address\b/i.test(value)) break;
+      if (!/^[A-Za-z][A-Za-z0-9 .,&'()/-]*$/.test(value)) break;
+      pieces.push(value);
+    }
+    if (pieces.length) return cleanText(pieces.join(" "));
+  }
+
+  // Central Bank explicitly repeats the customer name in its generated footer.
+  const downloadedBy = plainMarkdownText(markdown).match(/\bStatement\s+Downloaded\s+By\s+(.{3,160}?)\s+on\s+(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b|\d{1,2}[/-])/i);
+  return cleanText(downloadedBy?.[1]);
+}
+
+function statementDate(value) {
+  const match = String(value).match(/^(?:(\d{4})[-/](\d{1,2})[-/](\d{1,2})|(\d{1,2})[-/ ]([A-Za-z]{3,9}|\d{1,2})[-/ ](\d{2,4}))$/);
+  if (!match) return null;
+  const yearText = match[1] || match[6];
+  const year = Number(yearText.length === 2 ? `20${yearText}` : yearText);
+  const monthText = match[2] || match[5];
+  const month = /^\d+$/.test(monthText) ? Number(monthText) : ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(monthText.slice(0, 3).toLowerCase()) + 1;
+  const day = Number(match[3] || match[4]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? date.toISOString().slice(0, 10) : null;
+}
+
+export function extractBankStatementPeriodFromMarkdown(markdown) {
+  const date = "(?:\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}|\\d{1,2}[-/ ](?:[A-Za-z]{3,9}|\\d{1,2})[-/ ]\\d{2,4})";
+  const pattern = new RegExp(`(?:statement(?:\\s+of\\s+account)?\\s+(?:for\\s+)?period|statement\\s+of\\s+account\\s+from|period)\\s*[:=-]?\\s*(${date})\\s*(?:to|through|[-–—])\\s*(${date})`, "i");
+  const match = plainMarkdownText(headerMarkdown(markdown)).match(pattern);
+  const start = match ? statementDate(match[1]) : null;
+  const end = match ? statementDate(match[2]) : null;
+  return start && end && start <= end
+    ? { statementPeriodStart: start, statementPeriodEnd: end }
+    : { statementPeriodStart: null, statementPeriodEnd: null };
 }
 
 /**
@@ -167,6 +220,7 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
   );
   result.ifscCode ||= cleanText(fullText.match(/\bIFSC(?:\s+CODE)?\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})\b/i)?.[1]).toUpperCase();
   result.bankName ||= bankNameFromHeader(markdown);
+  result.accountHolderName ||= holderFromHeader(markdown);
 
   return result;
 }

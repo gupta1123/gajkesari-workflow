@@ -69,14 +69,32 @@ export function parseBankStatementMoney(value) {
 
 function extractOpeningBalance(markdown) {
   const lines = String(markdown ?? "").split(/\r?\n/);
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
     const cells = markdownCells(line);
     if (cells) {
       for (let index = 0; index < cells.length; index += 1) {
         if (!/\b(?:opening balance|balance brought forward|balance b\/?f|brought forward balance)\b/i.test(cells[index])) continue;
-        const sameCell = cells[index].replace(/^.*?\b(?:opening balance|balance brought forward|balance b\/?f|brought forward balance)\b\s*[:=-]?/i, "");
+        const sameCell = cells[index].replace(/^.*?\b(?:opening balance|balance brought forward|balance b\/?f|brought forward balance)\b\s*[:=]?/i, "");
         const amount = parseBankStatementMoney(sameCell) ?? parseBankStatementMoney(cells[index + 1]);
         if (amount !== null) return amount;
+        // HDFC's summary places the amount below its column heading. Only
+        // follow a summary header; a transaction row is not summary metadata.
+        if (cells.some(cell => /^(?:debit count|credit count|total debit|total credit|closing balance)$/i.test(cell)) && isSeparatorRow(markdownCells(lines[lineIndex + 1]))) {
+          const values = markdownCells(lines[lineIndex + 2]);
+          if (values?.length === cells.length) {
+            const summaryAmount = parseBankStatementMoney(values[index]);
+            if (summaryAmount !== null) return summaryAmount;
+            // Some HDFC PDFs introduce one empty leading header cell while
+            // placing the opening amount in that cell in the next row.
+            // Accept only that exact blank boundary, never another labelled
+            // column (such as Debit Count or Total Debit).
+            if (index === 1 && !cells[0] && !values[index]) {
+              const leadingAmount = parseBankStatementMoney(values[0]);
+              if (leadingAmount !== null) return leadingAmount;
+            }
+          }
+        }
       }
     }
     const label = line.match(/\b(?:opening balance|balance brought forward|balance b\/?f|brought forward balance)\b/i);

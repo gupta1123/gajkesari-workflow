@@ -235,6 +235,7 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
   const references = amounts.restoreSourceBankReferences(normalized.transactions, source.rows);
   normalized.transactions = references.transactions;
   const accountFromMarkdown = account.extractAccountFromBankStatementMarkdown(markdown);
+  const statementPeriod = account.extractBankStatementPeriodFromMarkdown(markdown);
   let balanceValidation = runningBalance.validateRunningBalanceContinuity(
     normalized.transactions,
     source.openingBalance,
@@ -262,8 +263,7 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
   return {
     parsed: {
       account: account.mergeBankStatementAccount({}, accountFromMarkdown),
-      statementPeriodStart: null,
-      statementPeriodEnd: null,
+      ...statementPeriod,
       openingBalance: source.openingBalance,
       transactions: pipeline === "physical_pdf_columns"
         ? normalized.transactions
@@ -281,6 +281,19 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
       headers: normalized.headers,
       normalized: true,
       referenceValidation: references.diagnostics,
+      statementDetails: {
+        fields: {
+          accountHolderName: Boolean(accountFromMarkdown.accountHolderName),
+          statementPeriod: Boolean(statementPeriod.statementPeriodStart && statementPeriod.statementPeriodEnd),
+          openingBalance: source.openingBalance !== null,
+        },
+        warnings: [
+          ...(!accountFromMarkdown.accountHolderName ? ["Account-holder name could not be read."] : []),
+          ...(!statementPeriod.statementPeriodStart ? ["The statement period could not be read."] : []),
+          ...(source.openingBalance === null && /\b(?:opening balance|balance brought forward|balance b\/?f|brought forward balance)\b/i.test(markdown)
+            ? ["The printed opening balance could not be read."] : []),
+        ],
+      },
       balanceValidation,
       used: true,
     },

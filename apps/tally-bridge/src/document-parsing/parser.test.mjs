@@ -5,6 +5,41 @@ import path from "node:path";
 import test from "node:test";
 import { parseDocumentLocal, processBankStatementMarkdownLocal } from "./parser.mjs";
 
+test("recovers statement details and validates a reverse-order HDFC summary against its opening", async () => {
+  const markdown = `Account Name: EXAMPLE INDUSTRIES Customer Address: PLOT 18
+Statement of Account For Period: 01-Oct-2026 to 24-Oct-2026
+|Transaction Date|Description|Reference|Debit|Credit|Balance|
+|---|---|---|---|---|---|
+|24-Oct-2026|Receipt|REF2||25.00|-925.00|
+|23-Oct-2026|Receipt|REF1||50.00|-950.00|
+
+|Opening Balance|Debit Count|Credit Count|Total Debit|Total Credit|Closing Balance|
+|---|---|---|---|---|---|
+|-1000.00|0|2|0.00|75.00|-925.00|`;
+  const result = await processBankStatementMarkdownLocal(markdown);
+  assert.equal(result.parsed.account.accountHolderName, "EXAMPLE INDUSTRIES");
+  assert.equal(result.parsed.statementPeriodStart, "2026-10-01");
+  assert.equal(result.parsed.statementPeriodEnd, "2026-10-24");
+  assert.equal(result.parsed.openingBalance, -1000);
+  assert.equal(result.diagnostics.balanceValidation.checkedTransitions, 2);
+  assert.equal(result.diagnostics.balanceValidation.valid, true);
+  assert.deepEqual(result.diagnostics.statementDetails.warnings, []);
+});
+
+test("exposes missing statement details separately from valid transaction balances", async () => {
+  const result = await processBankStatementMarkdownLocal(`Statement Period: 31/02/2026 to 01/03/2026
+|Opening Balance|Debit Count|Credit Count|Closing Balance|
+|---|---|---|---|
+||1|0|90.00|
+
+|Date|Description|Reference|Debit|Credit|Balance|
+|---|---|---|---|---|---|
+|24-Oct-2026|Payment|REF1|10.00||90.00|`);
+  assert.equal(result.parsed.openingBalance, null);
+  assert.equal(result.parsed.statementPeriodStart, null);
+  assert.equal(result.diagnostics.statementDetails.warnings.length, 3);
+});
+
 test('Bank reference preserves cross-date UTR and numeric Suspense identity in normalized connector output', async () => {
  const markdown = `Opening balance 1000.00\n| Date | Transaction description | Bank reference | Debit (INR) | Credit (INR) | Balance (INR) |\n|---|---|---|---|---|---|\n|08-Oct-26|Payment to Deccan Sponge and Minerals|UTRAX261009006|506.66||493.34|\n|08-Oct-26|Credit from Suspense|123261009001||607.77|1101.11|`;
  const result = await processBankStatementMarkdownLocal(markdown);

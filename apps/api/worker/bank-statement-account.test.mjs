@@ -5,6 +5,7 @@ import {
   bankStatementAccountDiagnostics,
   combinedLedgerCatalogueDecision,
   extractAccountFromBankStatementMarkdown,
+  extractBankStatementPeriodFromMarkdown,
   mergeBankStatementAccount,
 } from "./bank-statement-account.mjs";
 
@@ -25,6 +26,51 @@ test("recovers the latest Axis statement identity from AnyDoc Markdown", () => {
     ifscCode: "",
   });
 });
+
+test("reads a plain-text customer name without absorbing the address or other fields", () => {
+  assert.equal(extractAccountFromBankStatementMarkdown(`Account Name: EXAMPLE STEELS PRIVATE LIMITED Customer Address: PLOT NO 18 MIDC City: JALNA`).accountHolderName, "EXAMPLE STEELS PRIVATE LIMITED");
+  assert.equal(extractAccountFromBankStatementMarkdown(`Account holder: Solution Nyx Account: 42861007319 IFSC: SBIN0000456`).accountHolderName, "Solution Nyx");
+});
+
+test("reads the holder column in HDFC headers, preserving wrapped names", () => {
+  const markdown = `|07352320000222|BRANCH ADDRESS|
+|---|---|
+|EXAMPLE STEELS AND ALLOYS|SHOPPING CENTRE|
+|PVT LTD|BRANCH ROAD|
+|ADDRESS|JALNA|
+|F-18 ADDITIONAL MIDC|431203|
+
+Account Number: 07352320000222 Currency: INR`;
+  assert.equal(extractAccountFromBankStatementMarkdown(markdown).accountHolderName, "EXAMPLE STEELS AND ALLOYS PVT LTD");
+});
+
+test("reads Central Bank's explicit downloaded-by name without the timestamp", () => {
+  assert.equal(extractAccountFromBankStatementMarkdown(`Central Bank of India Product type: C C General-Corporate
+* Statement Downloaded By EXAMPLE STEELS PRIVATE on Sat Oct 24 11:04:18 IST 2026 Unless a constituent notifies the Bank ...`).accountHolderName, "EXAMPLE STEELS PRIVATE");
+});
+
+test("does not derive a holder or statement period from transaction narrations", () => {
+  const markdown = `|Date|Description|Debit|Credit|Balance|
+|---|---|---|---|---|
+|24-Oct-26|Account Name: WRONG NAME Statement Period: 01-10-2026 to 24-10-2026|10||90|`;
+  assert.equal(extractAccountFromBankStatementMarkdown(markdown).accountHolderName, "");
+  assert.deepEqual(extractBankStatementPeriodFromMarkdown(markdown), { statementPeriodStart: null, statementPeriodEnd: null });
+});
+
+for (const [header, start, end] of [
+  ["Statement of Account For Period: 23-Oct-2026 to 24-Oct-2026", "2026-10-23", "2026-10-24"],
+  ["STATEMENT OF ACCOUNT from 23/10/2026 to 24/10/2026", "2026-10-23", "2026-10-24"],
+  ["## Nominee : Statement Period : 01-10-2026 to 01-10-2026", "2026-10-01", "2026-10-01"],
+  ["|Statement period|01 September 2026 - 30 September 2026|", "2026-09-01", "2026-09-30"],
+  ["Period: 2026-10-01 to 2026-10-24", "2026-10-01", "2026-10-24"],
+  ["Period: 31/02/2026 to 01/03/2026", null, null],
+  ["Period: 24/10/2026 to 23/10/2026", null, null],
+  ["Statement date: 24/10/2026", null, null],
+]) {
+  test(`reads only valid printed periods: ${header}`, () => {
+    assert.deepEqual(extractBankStatementPeriodFromMarkdown(header), { statementPeriodStart: start, statementPeriodEnd: end });
+  });
+}
 
 test("recovers explicit account and IFSC fields from a key-value table", () => {
   const markdown = `|Bank Name|Account No.|Account Holder Name|IFSC Code|
