@@ -6724,6 +6724,12 @@ export function BankStatementsPage() {
       if (queueRows.length === 0) {
         const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
         const savedResults = markPreviouslyConfirmedPostings(refreshedImport.postedTransactions ?? [], preview.postedTransactions ?? []);
+        if (selectedTallyWorkTransactions.some(row =>
+          tallyPresenceByTransactionId[row.id]?.status === "missing" &&
+          savedResults.some(saved => statementRowKey(saved) === statementRowKey(row) && savedPostingOutcome(saved).status === "confirmed")
+        )) {
+          throw new Error("This payment is missing from Tally, but its earlier posting is still recorded. Recheck Tally before posting again. No replacement was queued.");
+        }
         const summary = summarizeStatementPostings(validTransactions, savedResults, tallyPresenceByTransactionId);
         if (summary.confirmed || summary.needsCheck) {
           setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
@@ -6793,6 +6799,7 @@ export function BankStatementsPage() {
               ];
             }),
           ]),
+          reconcileAgainstLiveTally: true,
           outgoingAction: "post",
           transactions: queueRows.map((transaction) => ({
             transactionId: transaction.id,

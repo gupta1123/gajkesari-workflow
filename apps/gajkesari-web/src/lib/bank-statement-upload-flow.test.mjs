@@ -173,3 +173,14 @@ test('Resume reads the original job and restores full results without confirmati
   assert.equal(review.state.persistedPostedTransactions.length,23);
   assert.equal(review.state.statementDoneSummary.tone,'info');
 });
+
+test('an empty queue cannot turn a freshly missing historical voucher into a completed success',async()=>{
+  const {rows,saved}=fixtures(1);
+  const review=reviewHarness(rows,saved,{tallyPresenceByTransactionId:{[rows[0].id]:{status:'missing'}},
+    console:{error:()=>{}}});
+  review.applyPreviewPayload(review.payload);
+  await review.sendToTally('post_all');
+  assert.notEqual(review.state.statementDoneSummary?.tone,'success');
+  assert.equal(review.state.persistedPostedTransactions.length,0,'old success is not restored over fresh absence');
+  assert.ok(review.toasts.some(([tone,text])=>tone==='error'&&text.includes('missing from Tally')));
+});

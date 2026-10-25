@@ -79,25 +79,32 @@ export function summarizeStatementPostings(
 // Results known before this upload's Post action are existing entries, even
 // when an identical PDF reuses the original import and transaction IDs.
 export function markPreviouslyConfirmedPostings<T extends SavedPostingRow>(saved: T[], previous: SavedPostingRow[]) {
-  const existingIds = new Set(previous.filter(row => savedPostingOutcome(row).status === "confirmed").map(row => row.id));
-  return saved.map(row => existingIds.has(row.id) && savedPostingOutcome(row).status === "confirmed"
-    ? { ...row, postingResult: { ...row.postingResult, alreadyInTally: true } } : row);
+  const existing = new Map(previous.filter(row => savedPostingOutcome(row).status === "confirmed").map(row => [row.id, row]));
+  return saved.map(row => {
+    const prior = existing.get(row.id);
+    const samePosting = prior && !(row.postingCommandId && prior.postingCommandId && row.postingCommandId !== prior.postingCommandId) &&
+      !(row.voucherNumber && prior.voucherNumber && row.voucherNumber !== prior.voucherNumber);
+    return samePosting && savedPostingOutcome(row).status === "confirmed"
+      ? { ...row, postingResult: { ...row.postingResult, alreadyInTally: true } } : row;
+  });
 }
 
 export function mergeCompletedPostingEvidence<T extends SavedPostingRow>(saved: T[], commands: Array<{
-  commandType?: string; command_type?: string; status?: string; result?: Record<string, unknown> | null;
+  id?: string; commandType?: string; command_type?: string; status?: string; result?: Record<string, unknown> | null;
 }>) {
   const confirmed = new Map(commands.flatMap(command => {
     const result = command.result;
     return (command.commandType || command.command_type) === "post_bank_voucher" &&
       bankPostingOutcome(command).status === "confirmed" && typeof result?.transactionId === "string"
-      ? [[result.transactionId, result] as const] : [];
+      ? [[result.transactionId, { result, commandId: command.id }] as const] : [];
   }));
   return saved.map(row => {
-    const result = confirmed.get(row.id);
+    const evidence = confirmed.get(row.id);
+    const result = evidence?.result;
     // Read-back belongs to this exact posting command, never to another
     // preview row that merely matched the same voucher during a bulk check.
-    return result ? { ...row, postingStatus: "verified", postingResult: { ...row.postingResult, ...result },
+    return result ? { ...row, postingStatus: "verified", postingCommandId: evidence?.commandId || row.postingCommandId,
+      postingResult: { ...row.postingResult, ...result, alreadyInTally: result.alreadyInTally === true },
       voucherNumber: typeof result.voucherNumber === "string" ? result.voucherNumber : row.voucherNumber } : row;
   });
 }

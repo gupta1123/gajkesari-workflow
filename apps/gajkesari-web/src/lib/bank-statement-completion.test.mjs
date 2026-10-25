@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 import { summarizeStatementPostings, resolveStatementPostings, savedPostingPresence,
-  savedPostingOutcome, markPreviouslyConfirmedPostings, postingFooterSegments, buildStatementBankBook } from './statement-bank-book.ts';
+  savedPostingOutcome, markPreviouslyConfirmedPostings, postingFooterSegments, buildStatementBankBook, mergeCompletedPostingEvidence } from './statement-bank-book.ts';
 import { bankPostingMessage, bankPostingTitle } from '@gajkesari/shared/lib/bank-posting-outcome';
 
 const rows = [1371.25,1371.25,1371.25,2382.5,2382.5,3493.75].map((amount,i)=>({
@@ -104,4 +104,18 @@ test('actual restoration and footer remain completed after the final live check 
   restoreActual(saved);
   assert.equal(state.done.tone,'success');assert.doesNotMatch(state.done.text,/processing|not sent/);
   assert.equal(state.postedIds.size,4);
+});
+
+test('a replacement command for the same transaction remains newly posted after restoring old history',()=>{
+  const old={...rows[0],id:'saved-row',postingStatus:'verified',postingCommandId:'old-command',voucherNumber:'5319',postingResult:{created:1}};
+  const fresh={...old,postingCommandId:'new-command',voucherNumber:'5320'};
+  assert.equal(markPreviouslyConfirmedPostings([fresh],[old])[0].postingResult.alreadyInTally,undefined);
+  assert.equal(markPreviouslyConfirmedPostings([old],[old])[0].postingResult.alreadyInTally,true);
+  const restored=mergeCompletedPostingEvidence([{...old,postingResult:{alreadyInTally:true}}],[{
+    id:'new-command',commandType:'post_bank_voucher',status:'succeeded',
+    result:{transactionId:'saved-row',created:1,verificationStatus:'verified',voucherNumber:'5320'},
+  }]);
+  assert.equal(restored[0].postingCommandId,'new-command');assert.equal(restored[0].postingResult.alreadyInTally,false);
+  assert.equal(markPreviouslyConfirmedPostings(restored,[old])[0].postingResult.alreadyInTally,false);
+  assert.equal(summarizeStatementPostings([rows[0]],restored).alreadyExisting,0);
 });

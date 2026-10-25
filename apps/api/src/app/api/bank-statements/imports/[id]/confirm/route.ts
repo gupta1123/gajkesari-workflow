@@ -675,7 +675,8 @@ export async function POST(
         row.id &&
         row.fingerprint &&
         (reconcileAgainstLiveTally || row.statement_import_id === id) &&
-        ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
+        (["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "") ||
+          (reconcileAgainstLiveTally && row.tally_status === "verified"))
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
     const postedByFingerprint = new Map(
@@ -795,7 +796,9 @@ export async function POST(
       .eq("company_dataset_id", importRow.company_dataset_id)
       .eq("bank_account_id", accountId)
       .eq("statement_import_id", id)
-      .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
+      .in("tally_status", reconcileAgainstLiveTally
+        ? ["pending", "failed", "missing_in_tally", "verification_failed", "verified"]
+        : ["pending", "failed", "missing_in_tally", "verification_failed"])
       .or("debit_amount.gt.0,credit_amount.gt.0")
       .order("transaction_date", { ascending: true })
       .order("id", { ascending: true });

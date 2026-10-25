@@ -1,3 +1,4 @@
+import { verifyBankReplacements, ReplacementCheckError } from "@/lib/bank-statement-replacement";
 import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { validateBankVoucherBillPolicy } from "@/lib/bank-voucher-bill-policy";
 import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
@@ -21,6 +22,7 @@ import { wakeTallyConnector } from "@/lib/tally/command-wake";
 export const runtime = "nodejs";
 
 type QueuePayload = {
+  reconcileAgainstLiveTally?: boolean;
   async?: boolean;
   connectionId?: string;
   companyName?: string;
@@ -550,7 +552,9 @@ export async function POST(request: Request) {
       .select("*")
       .eq("owner_user_id", user.id)
       .eq("company_dataset_id", target.companyDatasetId)
-      .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
+      .in("tally_status", body.reconcileAgainstLiveTally === true && requestedTransactionIds.length > 0
+        ? ["pending", "failed", "missing_in_tally", "verification_failed", "verified"]
+        : ["pending", "failed", "missing_in_tally", "verification_failed"])
       .order("transaction_date", { ascending: true })
       .limit(100);
 
@@ -686,7 +690,7 @@ export async function POST(request: Request) {
       postingLogs
         .filter((row) =>
           row.status === "posted" ||
-          row.status === "verified" ||
+          (row.status === "verified" && body.reconcileAgainstLiveTally !== true) ||
           row.status === "needs_tally_review" ||
           (row.command_id && activeCommandIds.has(row.command_id))
         )
@@ -1248,6 +1252,11 @@ export async function POST(request: Request) {
     }
     preparationTimingsMs.mappingPersistence = Date.now() - mappingStartedAt;
 
+    await verifyBankReplacements({
+      db: supabase, owner: user.id, dataset: target.companyDatasetId,
+      connection: connectionId, target, commands: voucherCommands, prior: postingLogs,
+    });
+
     const queueJobId = request.headers.get("x-tally-queue-job-id")?.trim() || null;
     const enqueueStartedAt = Date.now();
     const { data: createdCommands, error: commandError } = await supabase.rpc("enqueue_bank_tally_commands", {
@@ -1302,7 +1311,7 @@ export async function POST(request: Request) {
     return jsonWithCors(
       request,
       { error: serializeError(error) },
-      { status: 500 }
+      { status: error instanceof ReplacementCheckError ? 409 : 500 }
     );
   }
 }
