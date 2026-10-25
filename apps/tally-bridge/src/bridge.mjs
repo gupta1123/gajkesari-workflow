@@ -14,6 +14,7 @@ import { parseDocumentAndSuggestLedgers } from "./document-parsing/parse-and-sug
 import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs";
 import { warmZvecCollection } from "./local-matching/vector.mjs";
 import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
+import { applySeparatePaymentDecision } from "./local-matching/duplicate-resolution.mjs";
 import {
   activeVouchers,
   ensureVoucherPartition,
@@ -1999,7 +2000,7 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
       return {
         outcome: {
           success: false,
-          error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
+          error: existingResult.reason || "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
           result: {
             possibleDuplicateInTally: true,
             duplicateCheck: existingResult,
@@ -2367,7 +2368,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         if (preflight?.verificationStatus === "ambiguous") {
           await sendCommandResult(config, command, {
             success: false,
-            error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
+            error: preflight.reason || "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
             result: {
               possibleDuplicateInTally: true,
               duplicateCheck: preflight,
@@ -3413,7 +3414,7 @@ function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, re
 function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null) {
   const { bankReference, trackingReference } = bankTransactionReferences(transaction);
   const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
-  const baseCandidates = baseBankTransactionCandidates(
+  let baseCandidates = baseBankTransactionCandidates(
     vouchers,
     transaction,
     bankLedgerName,
@@ -3434,14 +3435,37 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
         ((!/^\d+$/.test(normalizeExactReference(reference)) && reference !== trackingReference) ||
           normalizeDateForCompare(voucher.effectiveDate || voucher.date) === normalizeDateForCompare(transaction.voucherDate)));
       if (!matchedReference) return [];
-      const bankEntry = getBankLedgerEntry(
-        voucher,
-        bankLedgerName,
-        Number(transaction.amount || 0),
-        transaction.expectedDirection
-      );
-      return bankEntry ? [{ voucher, index, bankEntry }] : [];
+      // A reliable reference identifies a possible existing transaction even
+      // when its amount, party or payment/receipt direction was edited in Tally.
+      // Keep that evidence for review instead of treating it as permission to post.
+      const bankEntries = voucher.ledgerEntries.filter(entry =>
+        normalizeLooseName(entry.ledgerName) === normalizeLooseName(bankLedgerName));
+      const bankEntry = getBankLedgerEntry(voucher, bankLedgerName,
+        Number(transaction.amount || 0), transaction.expectedDirection) || bankEntries[0];
+      if (!bankEntry) return [];
+      const referenceConflicts = [];
+      if (!amountMatches(bankEntry.amount, Number(transaction.amount || 0))) referenceConflicts.push("amount");
+      if (bankEntry.isDebit !== (transaction.expectedDirection === "incoming")) referenceConflicts.push("direction");
+      if (hasUsableCounterparty && !voucherHasLedger(voucher, counterpartyLedgerName)) referenceConflicts.push("party");
+      return [{ voucher, index, bankEntry, referenceConflicts }];
     });
+  let decisionStale = false;
+  const ownTrackingVoucher = trackingReference && candidates.some(candidate =>
+    String(candidate.voucher.masterId) !== String(transaction.duplicateResolution?.candidates?.[0]?.masterId) &&
+    voucherHasExactReference(candidate.voucher, trackingReference));
+  if (transaction.duplicateResolution?.action === "separate" && !ownTrackingVoucher) {
+    const possible = [...new Map([...baseCandidates, ...candidates].map(candidate => [candidate.index, candidate])).values()];
+    const review = applySeparatePaymentDecision(transaction.duplicateResolution, transaction,
+      possible.map(serializeStrictVoucherMatch), bankLedgerName, counterpartyLedgerName);
+    decisionStale = review.stale;
+    if (!decisionStale) {
+      const allowed = new Set(review.candidates.map(candidate => String(candidate.masterId)));
+      baseCandidates = baseCandidates.filter(candidate => allowed.has(String(candidate.voucher.masterId)));
+      candidates = candidates.filter(candidate => allowed.has(String(candidate.voucher.masterId)));
+    }
+  }
+  const referenceConflicts = [...new Set(candidates.flatMap(candidate => candidate.referenceConflicts || []))];
+  identityInsufficient = referenceConflicts.length > 0;
   if (candidates.length === 0) {
     // A manual voucher can have no UTR or only an unrelated app tracking ID.
     // A different genuine reference, however, identifies a separate transaction.
@@ -3483,10 +3507,39 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
     hasUsableCounterparty,
     identityInsufficient,
     matchBasis,
+    referenceConflicts,
+    decisionStale,
   };
 }
 
+function bankVerificationReason(transaction, match, status) {
+  if (match.decisionStale) return "The voucher reviewed for this separate payment changed or is unavailable. Recheck Tally and review your choice again. Nothing was posted.";
+  if (status === "found") return "Already entered in Tally.";
+  if (status !== "ambiguous") return "No matching entry found in Tally.";
+  if (match.referenceConflicts.length) {
+    let details = match.referenceConflicts.includes("amount") && match.candidates.length === 1
+      ? ` Statement: Rs. ${Number(transaction.amount).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}; Tally: Rs. ${Math.abs(Number(match.candidates[0].bankEntry.amount)).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}.`
+      : "";
+    if (match.referenceConflicts.includes("party") && match.candidates.length === 1) {
+      const voucher = match.candidates[0].voucher;
+      const bankKey = normalizeLooseName(transaction.bankLedgerName || match.candidates[0].bankEntry.ledgerName);
+      const tallyParty = voucher.partyLedgerName || voucher.ledgerNames
+        .filter(name => normalizeLooseName(name) !== bankKey).join(", ") || "not recorded";
+      details += ` Statement party: ${transaction.counterpartyLedgerName}; Tally party: ${tallyParty}.`;
+    }
+    const differences = [];
+    if (match.referenceConflicts.includes("amount")) differences.push("a different amount");
+    if (match.referenceConflicts.includes("direction")) differences.push("a different payment or receipt direction");
+    if (match.referenceConflicts.includes("party")) differences.push("a different party ledger");
+    const difference = differences.length > 1
+      ? `${differences.slice(0, -1).join(", ")} and ${differences.at(-1)}` : differences[0];
+    return `A Tally voucher has the same reference but ${difference}.${details} Review the voucher in Tally before posting.`;
+  }
+  return "Possible existing entry — please review.";
+}
+
 function bankCandidateVerificationStatus(match) {
+  if (match.decisionStale) return "ambiguous";
   if (match.candidates.length === 0) return "missing";
   if (match.identityInsufficient || match.candidates.length > 1) return "ambiguous";
   return "found";
@@ -3563,15 +3616,14 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       duplicateVoucherCount: duplicateInTally ? candidates.length : 0,
       baseCandidateCount,
       matchBasis,
+      referenceConflicts: strictResult.referenceConflicts,
       scannedCount: vouchers.length,
       voucherId: selectedCandidate ? selectedCandidate.voucher.masterId || selectedCandidate.voucher.voucherNumber : null,
       voucherNumber: selectedCandidate ? selectedCandidate.voucher.voucherNumber : null,
       voucherDate: selectedCandidate
         ? normalizeDateForCompare(selectedCandidate.voucher.effectiveDate || selectedCandidate.voucher.date)
         : null,
-      reason: verificationStatus === "found" ? "Already entered in Tally."
-        : verificationStatus === "ambiguous" ? "Possible existing entry — please review."
-          : "No matching entry found in Tally.",
+      reason: bankVerificationReason(transaction, strictResult, verificationStatus),
       matches: candidates.slice(0, 5).map(serializeStrictVoucherMatch),
     };
   });
@@ -3616,6 +3668,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
     success: true,
     result: {
       mode: "bank_statement_batch",
+      duplicateResolutionVersion: 1,
       dateFrom,
       dateTo,
       bankLedgerName,
@@ -3744,6 +3797,7 @@ async function verifyBankTransactionInTally(config, commandPayload = {}, depende
       queryDiagnostics,
       matchCount: strictMatches.length,
       matchBasis: strictResult.matchBasis,
+      referenceConflicts: strictResult.referenceConflicts,
       duplicateInTally,
       duplicateVoucherCount: duplicateInTally ? strictMatches.length : 0,
       voucherId: selectedVoucher?.masterId || selectedVoucher?.voucherNumber || null,
@@ -3752,9 +3806,7 @@ async function verifyBankTransactionInTally(config, commandPayload = {}, depende
       voucherDate: selectedVoucher
         ? normalizeDateForCompare(selectedVoucher.effectiveDate || selectedVoucher.date)
         : null,
-      reason: verificationStatus === "found" ? "Already entered in Tally."
-        : verificationStatus === "ambiguous" ? "Possible existing entry — please review."
-          : "No matching entry found in Tally.",
+      reason: bankVerificationReason(normalizedTransaction, strictResult, verificationStatus),
       matches: strictMatches.slice(0, 5).map(serializeStrictVoucherMatch),
     },
   };
@@ -4559,7 +4611,17 @@ async function refreshCachedBankVouchers(
     financialYear: fy.key,
   });
   const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
-  const fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
+  const strongReferences = (transactions || []).map(bankTransactionReferences)
+    .map(({ bankReference }) => bankReference).filter(isStrongBankReference);
+  const needsCrossDateRead = strongReferences.some(
+    (reference) => !/^\d+$/.test(normalizeExactReference(reference))
+  );
+  // Recheck must observe references whose voucher date/amount changed since
+  // the last snapshot, including vouchers moved outside the statement period.
+  // A scoped refresh cannot prove that a cached cross-date UTR is current or
+  // absent. Refresh this bank's financial year whenever that identity is used.
+  const fullRefresh = needsCrossDateRead || !partition.lastFullRefreshAt ||
+    Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
   const mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
   partition.status = "refreshing";
   saveOperationalCache(db, options);
@@ -4590,8 +4652,6 @@ async function refreshCachedBankVouchers(
     saveOperationalCache(db, options);
     dependencies.operationalContext = { db, key, partition, options };
 
-    const strongReferences = (transactions || []).map(bankTransactionReferences)
-      .map(({ bankReference }) => bankReference).filter(isStrongBankReference);
     const vouchers = activeVouchers(partition).filter((voucher) => {
       const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
       return (date >= dateFrom && date <= dateTo) ||
@@ -4603,6 +4663,7 @@ async function refreshCachedBankVouchers(
       diagnostics: {
         source: "connector_voucher_index",
         refreshMode: mode,
+        crossDateReferenceRead: needsCrossDateRead,
         exportMs: Date.now() - exportStartedAt,
         totalMs: Date.now() - startedAt,
         changedVoucherCount: changedVouchers.length,
@@ -4663,13 +4724,9 @@ async function fetchBankReconciliationVouchers(
   const financialYear = financialYearBounds(dateFrom);
   if (crossDateTransactions.length > 0 && financialYear) {
     const crossDateStartedAt = Date.now();
-    const filterName = "GajkesariBankReferenceIdentity";
-    // Filter by bank entry amount, not Reference. The UTR can be in bank
-    // allocations or narration, and is compared exactly after export.
-    const entryFilterName = "GajkesariBankIdentityAmount";
-    const amountFormula = Array.from(new Set(crossDateTransactions.map((row) => Number(row.amount))))
-      .map((amount) => `($Amount = ${amount} OR $Amount = ${-amount})`)
-      .join(" OR ");
+    // A voucher can have both its date and amount edited. Read this bank's
+    // financial year without an amount filter, then compare exact references
+    // locally, including references in bank allocations and narration.
     const crossDateXml = await exportCollection(tallyUrl, {
       collectionName: "Gajkesari Bank Reference Identity",
       tallyType: "Vouchers : Ledger",
@@ -4679,11 +4736,6 @@ async function fetchBankReconciliationVouchers(
       companyName,
       dateFrom: financialYear.dateFrom,
       dateTo: financialYear.dateTo,
-      formulae: [
-        { name: entryFilterName, formula: `($$IsEqual:$LedgerName:${tallyFormulaString(bankLedgerName)}) AND (${amountFormula})` },
-        { name: filterName, formula: `$$FilterCount:AllLedgerEntries:${entryFilterName} > 0` },
-      ],
-      filterNames: [filterName],
       timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
       maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
     });
@@ -4691,7 +4743,9 @@ async function fetchBankReconciliationVouchers(
       throw new Error("Tally did not return a complete financial-year duplicate lookup.");
     }
     crossDateVouchers = parseVoucherCollection(crossDateXml).filter(
-      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || "")) &&
+        crossDateTransactions.some(transaction =>
+          voucherHasExactReference(voucher, bankTransactionReferences(transaction).bankReference))
     );
     crossDateExportMs = Date.now() - crossDateStartedAt;
   }
@@ -4719,7 +4773,7 @@ async function fetchBankReconciliationVouchers(
       detailBatchCount: 0,
       primaryIncludesBankReferences: true,
       queryMode: crossDateTransactions.length > 0
-        ? "bank_ledger_plus_financial_year_amount"
+        ? "bank_ledger_plus_financial_year_reference"
         : "bank_ledger_child_of",
     },
   };
@@ -7324,6 +7378,8 @@ export {
   pairBridge,
   parseBankStatementMasterCollection,
   parseTallyImportResult,
+  postBankVoucher,
+  runBankVoucherCommandBatch,
   purchaseVoucherReadbackComparison,
   readConfig,
   reconcileBankTransactionsInTally,

@@ -4,8 +4,8 @@ import type { RefObject } from "react";
 import { Filter, Search, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
-export type ReviewWorkStatusFilter = "all" | "needs_action" | "ready" | "completed";
-export type ReviewTallyResultFilter = "all" | "pending" | "found" | "missing" | "review" | "failed";
+export type ReviewWorkStatusFilter = "all" | "needs_action" | "ready" | "completed" | "skipped";
+export type ReviewTallyResultFilter = "all" | "pending" | "found" | "missing" | "review" | "failed" | "skipped";
 export type ReviewLedgerFilter = "all" | "needs_action" | "automatic" | "manual" | "suspense";
 export type ReviewAllocationFilter = "all" | "needs_action" | "ready" | "completed" | "not_applicable";
 type Direction = "all" | "debit" | "credit";
@@ -13,7 +13,7 @@ type Direction = "all" | "debit" | "credit";
 type Props = {
   total: number;
   visible: number;
-  counts: { ready: number; completed: number; needsAction: number };
+  counts: { ready: number; completed: number; needsAction: number; skipped?: number };
   checkAttempted: boolean;
   checkMessage: string;
   hasPayments: boolean;
@@ -43,7 +43,7 @@ type Props = {
 
 const tallyLabels = {
   all: "All check results", pending: "Check pending", found: "Found in Tally",
-  missing: "Not found in Tally", review: "Possible duplicates", failed: "Could not check",
+  missing: "Not found in Tally", review: "Possible duplicates", failed: "Could not check", skipped: "Skipped by you",
 };
 const ledgerLabels = {
   all: "All ledger selections", needs_action: "Needs ledger review", automatic: "Automatically selected",
@@ -73,6 +73,7 @@ export function BankStatementReviewToolbar(p: Props) {
     { value: "needs_action", label: "Needs review", count: p.counts.needsAction },
     { value: "ready", label: p.checkAttempted ? "Ready to post" : "Prepared", count: p.counts.ready },
     { value: "completed", label: "In Tally", count: p.counts.completed },
+    { value: "skipped", label: "Skipped", count: p.counts.skipped || 0 },
   ];
   const inputClass = "mt-1 h-9 w-full min-w-0 rounded-lg border border-[#ddd3c5] bg-white px-2.5 text-xs font-semibold text-[#2b241d] outline-none focus-visible:ring-2 focus-visible:ring-amber-400";
 

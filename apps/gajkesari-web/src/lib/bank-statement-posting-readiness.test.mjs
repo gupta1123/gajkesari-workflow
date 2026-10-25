@@ -185,7 +185,7 @@ test("UI and submission use ready scopes, with no unresolved advance fallback", 
   assert.match(page, /need review/);
   assert.doesNotMatch(page, /Direct vouchers · No bill allocation or Advance/);
   assert.match(page, /const directPosting = !billMatchingRequested/);
-  assert.match(page, /async function matchPendingBills\(\) \{\s*setBillMatchingRequested\(true\)/);
+  assert.match(page, /async function matchPendingBills\([^)]*\) \{\s*setBillMatchingRequested\(true\)/);
   assert.match(page, /!directPosting && billAllocation\?\.status === "ready_to_post"/);
   assert.equal((page.match(/setBillMatchingRequested\(false\)/g) || []).length, 2,
     "only clearing or loading a statement resets direct mode; failed checks must not reset it");

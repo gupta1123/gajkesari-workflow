@@ -1,11 +1,27 @@
 import type { PostingMatch } from "./statement-bank-book";
+import { isTrackingReference } from "@gajkesari/shared/lib/bank-duplicate-resolution";
 
 export type ReviewStatement = { date: string; amount: number; ledger: string; bank: string; reference: string; direction: "incoming" | "outgoing" };
 const normalize = (value: string) => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
 const money = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(value);
 const date = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.split("-").reverse().join("/") : value;
-export function comparePostingVoucher(statement: ReviewStatement, match: Partial<PostingMatch>) {
+export function uniquePostingReferences(match: Partial<PostingMatch>) {
   const refs = match.bankReferences?.length ? match.bankReferences : match.reference ? [match.reference] : [];
+  const seen = new Set<string>();
+  return refs.map(ref => ref.trim()).filter(ref => {
+    const key = normalize(ref);
+    if (!key || seen.has(key) || isTrackingReference(ref)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function showSeparateVoucherReference(match: Partial<PostingMatch>) {
+  return Boolean(match.reference && !uniquePostingReferences(match).some(ref => normalize(ref) === normalize(match.reference!)));
+}
+
+export function comparePostingVoucher(statement: ReviewStatement, match: Partial<PostingMatch>) {
+  const refs = uniquePostingReferences(match);
   const fields = [
     { label: "Date", statement: date(statement.date), tally: match.date ? date(match.date) : null, equal: statement.date === match.date },
     { label: "Amount", statement: money(statement.amount), tally: typeof match.amount === "number" ? money(match.amount) : null,

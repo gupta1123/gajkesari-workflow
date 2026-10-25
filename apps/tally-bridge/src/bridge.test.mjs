@@ -3,6 +3,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { candidateIdentity, duplicateContext } from '../../../packages/shared/src/lib/bank-duplicate-resolution.mjs';
 
 import {
   buildCollectionExportXml,
@@ -22,6 +23,8 @@ import {
   parseBankStatementMasterCollection,
   parseLedgerClosingBalance,
   parseTallyImportResult,
+  postBankVoucher,
+  runBankVoucherCommandBatch,
   purchaseVoucherReadbackComparison,
   reconcileBankTransactionsInTally,
   verifyBankTransactionInTally,
@@ -658,7 +661,7 @@ function bankVoucher({ reference = "", party = "Customer A" } = {}) {
   };
 }
 
-test("strict bank presence uses exact reference independently of a wrong selected party", () => {
+test("strict bank presence retains the exact reference but holds a wrong selected party", () => {
   const result = strictBankTransactionCandidates(
     [bankVoucher({ reference: "UTR-123456", party: "Actual Customer" })],
     {
@@ -673,6 +676,8 @@ test("strict bank presence uses exact reference independently of a wrong selecte
   );
   assert.equal(result.candidates.length, 1);
   assert.equal(result.hasUsableReference, true);
+  assert.equal(result.identityInsufficient, true);
+  assert.deepEqual(result.referenceConflicts, ["party"]);
 });
 
 test("a clearly different party without a matching reference is a separate transaction", () => {
@@ -717,8 +722,8 @@ test("numeric bank references verify Suspense only with exact date, bank amount 
   assert.equal(check([voucher]).hasUsableReference, true);
   assert.equal(check([voucher]).identityInsufficient, false);
   assert.equal(check([voucher]).candidates.length, 1);
-  assert.equal(check([voucher], { ...transaction, amount: 1251 }).candidates.length, 0);
-  assert.equal(check([voucher], { ...transaction, expectedDirection: "outgoing" }).candidates.length, 0);
+  assert.equal(check([voucher], { ...transaction, amount: 1251 }).identityInsufficient, true);
+  assert.equal(check([voucher], { ...transaction, expectedDirection: "outgoing" }).identityInsufficient, true);
   assert.equal(check([{ ...voucher, date: "20260731", effectiveDate: "20260731" }]).candidates.length, 0);
   assert.equal(check([voucher], { ...transaction, referenceNumber: "1967486048" }).candidates.length, 0);
   assert.equal(check([bankVoucher({ reference: "00000000", party: "Suspense" })], { ...transaction, referenceNumber: "00000000" }).identityInsufficient, true);
@@ -818,10 +823,12 @@ test("unavailable party evidence stays under review rather than assuming a diffe
   assert.equal((await checkManualBankVouchers([withoutPartyField])).verificationStatus, "missing");
 });
 
-test("an exact reference still detects the same transaction even when the selected party differs", async () => {
+test("an exact reference identifies a party conflict instead of confirming a full match", async () => {
   const row = await checkManualBankVouchers([bankVoucher({ party: "Arvind", reference: "UTR-123456" })], { counterpartyLedgerName: "BluePeak", referenceNumber: "UTR-123456" });
-  assert.equal(row.verificationStatus, "found");
+  assert.equal(row.verificationStatus, "ambiguous");
   assert.equal(row.matchBasis, "reference");
+  assert.deepEqual(row.referenceConflicts, ["party"]);
+  assert.match(row.reason, /different party ledger/);
 });
 
 test("generated tracking references do not hide a unique manually entered voucher", async () => {
@@ -978,7 +985,7 @@ test("an incomplete or unavailable duplicate read never becomes missing", async 
   }
 });
 
-test("statement reconciliation reads manual entries and a bounded amount-filtered financial year", async () => {
+test("statement reconciliation reads manual entries and finds financial-year references independently of amount", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -1014,12 +1021,13 @@ test("statement reconciliation reads manual entries and a bounded amount-filtere
   assert.equal(calls[0].formulae, undefined);
   assert.equal(calls[1].dateFrom, "2026-04-01");
   assert.equal(calls[1].dateTo, "2027-03-31");
-  assert.equal(calls[1].formulae.length, 2);
-  assert.match(calls[1].formulae[0].formula, /\$Amount = 1250/);
-  assert.ok(calls[1].formulae.every(({ formula }) => !formula.includes("$Reference")));
+  assert.equal(calls[1].tallyType, "Vouchers : Ledger");
+  assert.equal(calls[1].childOf, '\"ICICI Current Account\"');
+  assert.equal(calls[1].formulae, undefined);
+  assert.equal(calls[1].filterNames, undefined);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
-  assert.equal(outcome.result.queryDiagnostics.queryMode, "bank_ledger_plus_financial_year_amount");
+  assert.equal(outcome.result.queryDiagnostics.queryMode, "bank_ledger_plus_financial_year_reference");
 });
 
 test("statement reconciliation reads bank allocations from the primary export", async () => {
@@ -1331,4 +1339,371 @@ test("Purchase voucher verification includes the attached source PDF identity", 
       payload
     ).some((difference) => /outstanding bill date/i.test(difference))
   );
+});
+
+
+const bank='ICICI Bank - 8822014500',reference='UTIBN26300002502';
+const row={transactionId:'changed-payment',voucherDate:'2026-10-25',amount:2382.5,
+  expectedDirection:'outgoing',bankLedgerName:bank,counterpartyLedgerName:'Deccan Sponge and Minerals',
+  referenceNumber:reference,bankReferenceNumber:reference,voucherType:'Payment'};
+function voucher({amount=2383.5,direction='outgoing',ref=reference,name=bank,date='20261025'}={}) {
+  return {date,effectiveDate:date,voucherType:'Payment',voucherNumber:'5310',masterId:'28778',reference:ref,
+    bankReferences:[],partyLedgerName:row.counterpartyLedgerName,ledgerNames:[name,row.counterpartyLedgerName],
+    ledgerEntries:[{ledgerName:name,amount:direction==='incoming'?-amount:amount,isDebit:direction==='incoming'},
+      {ledgerName:row.counterpartyLedgerName,amount:direction==='incoming'?amount:-amount,isDebit:direction!=='incoming'}]};
+}
+async function check(vouchers, transaction=row) {
+  return (await reconcileBankTransactionsInTally({}, {bankLedgerName:bank,includeBalanceProof:false,transactions:[transaction]},
+    {voucherProvider:async()=>({vouchers,diagnostics:{}})})).result.transactions[0];
+}
+function xml(v) {
+  return `<ENVELOPE><COLLECTION><VOUCHER><DATE>${v.date}</DATE><VOUCHERTYPENAME>Payment</VOUCHERTYPENAME><MASTERID>${v.masterId}</MASTERID><VOUCHERNUMBER>${v.voucherNumber}</VOUCHERNUMBER><REFERENCE>${v.reference}</REFERENCE><PARTYLEDGERNAME>${v.partyLedgerName}</PARTYLEDGERNAME>${v.ledgerEntries.map(e=>`<ALLLEDGERENTRIES.LIST><LEDGERNAME>${e.ledgerName}</LEDGERNAME><AMOUNT>${e.amount}</AMOUNT><ISDEEMEDPOSITIVE>${e.isDebit?'Yes':'No'}</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST>`).join('')}</VOUCHER></COLLECTION></ENVELOPE>`;
+}
+
+function partyEditedVoucher(options={}) {
+  const v=voucher({amount:2382.5,...options});
+  return {...v,partyLedgerName:'Balaji Alloy Traders',ledgerNames:[bank,'Balaji Alloy Traders'],
+    ledgerEntries:v.ledgerEntries.map(e=>({...e,ledgerName:e.ledgerName===row.counterpartyLedgerName?'Balaji Alloy Traders':e.ledgerName}))};
+}
+
+async function separateDecision(existing=voucher({amount:2382.5,ref:''})) {
+  const transaction={...row,referenceNumber:'',bankReferenceNumber:null};
+  const observation=await check([existing],transaction);
+  return {action:'separate',context:duplicateContext(transaction,bank,row.counterpartyLedgerName),
+    candidates:[candidateIdentity(observation.matches[0])],decidedBy:'owner',decidedAt:'2026-10-25T12:00:00Z'};
+}
+
+test('a reviewed separate payment is missing in both the batch screen and final single check',async()=>{
+  const existing=voucher({amount:2382.5,ref:''}),duplicateResolution=await separateDecision(existing);
+  const transactions=[{...row,transactionId:'original',referenceNumber:'',bankReferenceNumber:null},
+    {...row,transactionId:'separate',referenceNumber:'',bankReferenceNumber:null,duplicateResolution}];
+  const outcome=await reconcileBankTransactionsInTally({}, {bankLedgerName:bank,includeBalanceProof:false,transactions},
+    {voucherProvider:async()=>({vouchers:[existing],diagnostics:{}})});
+  assert.deepEqual(outcome.result.transactions.map(r=>r.verificationStatus),['found','missing']);
+  assert.equal((await verifyBankTransactionInTally({},transactions[1],{exportCollection:async()=>xml(existing)})).result.verificationStatus,'missing');
+});
+
+test('edited or deleted reviewed vouchers invalidate a separate-payment decision',async()=>{
+  const duplicateResolution=await separateDecision();
+  for(const vouchers of [[],[voucher({amount:2383.5,ref:''})],[partyEditedVoucher({ref:''})],[voucher({amount:2382.5,ref:'UTR123456'})]]){
+    const result=await check(vouchers,{...row,referenceNumber:'',bankReferenceNumber:null,duplicateResolution});
+    assert.equal(result.verificationStatus,'ambiguous');assert.match(result.reason,/reviewed.*changed or is unavailable/);
+  }
+});
+
+test('the separate-payment choice never overrides a genuine bank UTR',async()=>{
+  const existing=voucher({amount:2382.5,ref:''}),duplicateResolution=await separateDecision(existing);
+  const result=await check([existing],{...row,duplicateResolution});
+  assert.equal(result.verificationStatus,'ambiguous');
+});
+
+test('a newly appeared manual payment stays visible despite approval of another voucher',async()=>{
+  const existing=voucher({amount:2382.5,ref:''}),duplicateResolution=await separateDecision(existing);
+  const newer={...existing,masterId:'new-manual',voucherNumber:'new-manual'};
+  const result=await check([existing,newer],{...row,referenceNumber:'',bankReferenceNumber:null,duplicateResolution});
+  assert.equal(result.verificationStatus,'found');assert.equal(result.voucherNumber,'new-manual');
+});
+
+test('retrying a posted separate payment finds its own tracking reference instead of creating again',async()=>{
+  const existing=voucher({amount:2382.5,ref:''}),duplicateResolution=await separateDecision(existing);
+  const tracking='PMT-ICICI-AAAAAAAAAAAAAAAAAAAA';
+  const posted={...voucher({amount:2382.5,ref:tracking}),masterId:'new-posted',voucherNumber:'new-posted'};
+  const transaction={...row,referenceNumber:tracking,bankReferenceNumber:null,referenceSource:'generated',duplicateResolution};
+  const result=await check([existing,posted],transaction);
+  assert.equal(result.verificationStatus,'found');assert.equal(result.voucherNumber,'new-posted');
+});
+
+test('same-UTR party changes retain both parties and require review for payments and receipts',async()=>{
+  for(const direction of ['outgoing','incoming']){
+    const result=await check([partyEditedVoucher({direction})],{...row,expectedDirection:direction});
+    assert.equal(result.verificationStatus,'ambiguous');assert.deepEqual(result.referenceConflicts,['party']);
+    assert.equal(result.matches[0].partyLedgerName,'Balaji Alloy Traders');
+    assert.equal(result.matches[0].voucherNumber,'5310');assert.equal(result.voucherId,null);
+    assert.match(result.reason,/different party ledger/);
+    assert.match(result.reason,/Statement party: Deccan Sponge and Minerals; Tally party: Balaji Alloy Traders/);
+  }
+});
+
+test('party conflicts preserve amount and direction conflicts instead of hiding them',async()=>{
+  const result=await check([partyEditedVoucher({amount:2383.5,direction:'incoming'})]);
+  assert.equal(result.verificationStatus,'ambiguous');
+  assert.deepEqual(result.referenceConflicts,['amount','direction','party']);
+  assert.match(result.reason,/different amount/);assert.match(result.reason,/direction/);assert.match(result.reason,/party ledger/);
+  assert.match(result.reason,/2,382.50.*2,383.50/);
+});
+
+test('unknown statement parties do not invent a same-UTR party mismatch',async()=>{
+  for(const counterpartyLedgerName of ['', 'Suspense', 'Suspense A/c']){
+    assert.equal((await check([partyEditedVoucher()],{...row,counterpartyLedgerName})).verificationStatus,'found');
+  }
+  const original=voucher({amount:2382.5});
+  assert.equal((await check([original],{...row,counterpartyLedgerName:'  deccan sponge and minerals  '})).verificationStatus,'found');
+});
+
+test('a party conflict cannot block a genuinely different UTR or another bank',async()=>{
+  assert.equal((await check([partyEditedVoucher({ref:'UTIBN26300999999'})])).verificationStatus,'missing');
+  const otherBank=partyEditedVoucher();otherBank.ledgerNames=['Other Bank','Balaji Alloy Traders'];
+  otherBank.ledgerEntries=otherBank.ledgerEntries.map(e=>({...e,ledgerName:e.ledgerName===bank?'Other Bank':e.ledgerName}));
+  assert.equal((await check([otherBank])).verificationStatus,'missing');
+});
+
+test('live screen rechecks refresh a changed party and never prepare bill allocation',async(t)=>{
+  const baseDir=fs.mkdtempSync(path.join(os.tmpdir(),'gajkesari-party-conflict-'));
+  t.after(()=>fs.rmSync(baseDir,{recursive:true,force:true}));
+  let changed=false;let billReads=0;
+  const dependencies={localMatchingBaseDir:baseDir,voucherProvider:refreshCachedBankVouchers,
+    exportCollection:async(_url,options)=>{
+      if(options.tallyType!=='Vouchers : Ledger'){billReads++;throw Error('Conflict must not load bills');}
+      return xml(changed?partyEditedVoucher():voucher({amount:2382.5}));
+    }};
+  const request={bankLedgerName:bank,includeBalanceProof:false,transactions:[row],billEligibleTransactionIds:[row.transactionId]};
+  assert.equal((await matchBankStatementInTally({},request,dependencies)).result.transactions[0].verificationStatus,'found');
+  changed=true;
+  for(let i=0;i<2;i++){
+    const {result}=await matchBankStatementInTally({},request,dependencies);
+    assert.equal(result.transactions[0].verificationStatus,'ambiguous');
+    assert.deepEqual(result.transactions[0].referenceConflicts,['party']);assert.deepEqual(result.billLedgerNames,[]);
+  }
+  assert.equal(billReads,0);
+});
+
+test('single-payment final preflight blocks a same-UTR party change without importing',async()=>{
+  let imports=0;const blocked=()=>{imports++;throw Error('must not import')};
+  const execute=new Function('resolveBankVoucherLedgerPayloads','validateBankVoucherBillAllocationsLive',
+    'verifyBankTransactionInTally','buildBankVoucherXml','invokeTallyXml',`return (${postBankVoucher.toString()});`)(
+    async(_,rows)=>rows,async(_,rows)=>rows,
+    (config,payload)=>verifyBankTransactionInTally(config,payload,{exportCollection:async()=>xml(partyEditedVoucher())}),blocked,blocked);
+  const result=await execute('http://unused',row,'Solution Nyx');
+  assert.equal(result.outcome.success,false);assert.equal(result.outcome.result.possibleDuplicateInTally,true);
+  assert.match(result.outcome.error,/different party ledger/);assert.equal(result.xml,null);assert.equal(imports,0);
+});
+
+test('batch final preflight holds a party conflict and skips an exact existing row without import',async()=>{
+  const outcomes=[],imports=[];
+  const dependencies={getBankVoucherCommandBatchKey,
+    resolveBankVoucherLedgerPayloads:async(_,rows)=>rows.map(payload=>({payload})),
+    validateBankVoucherBillAllocationsLive:async(_,rows)=>rows,assertCommandTarget:async()=>{},
+    reconcileBankTransactionsInTally:async(config,payload)=>reconcileBankTransactionsInTally(config,payload,
+      {voucherProvider:async()=>({vouchers:[partyEditedVoucher()],diagnostics:{}})}),
+    sendCommandResult:async(_,command,outcome)=>outcomes.push({command,outcome}),
+    sendCommandResults:async(_,rows)=>outcomes.push(...rows),
+    buildBankVoucherBatchXml:()=>{imports.push('build');throw Error('must not build')},
+    console:{log(){},warn(){},error(){}},
+  };
+  const execute=new Function(...Object.keys(dependencies),`return (${runBankVoucherCommandBatch.toString()});`)(...Object.values(dependencies));
+  await execute({tallyUrl:'http://unused',companyName:'Solution Nyx'},[
+    {id:'party-conflict',payload:row},
+    {id:'exact',payload:{...row,transactionId:'exact',counterpartyLedgerName:'Balaji Alloy Traders'}},
+  ]);
+  assert.equal(outcomes.length,2);assert.equal(imports.length,0);
+  const conflict=outcomes.find(r=>r.command.id==='party-conflict').outcome;
+  assert.equal(conflict.success,false);assert.deepEqual(conflict.result.duplicateCheck.referenceConflicts,['party']);
+  const exact=outcomes.find(r=>r.command.id==='exact').outcome;
+  assert.equal(exact.success,true);assert.equal(exact.result.alreadyInTally,true);assert.equal(exact.result.created,0);
+});
+
+test('changed Tally payment retains the same-UTR candidate and both real amounts',async()=>{
+  const result=await check([voucher()]);
+  assert.equal(result.verificationStatus,'ambiguous');assert.equal(result.matchBasis,'reference');
+  assert.deepEqual(result.referenceConflicts,['amount']);assert.equal(result.voucherNumber,null);
+  assert.equal(result.matches[0].voucherNumber,'5310');assert.equal(result.matches[0].amount,2383.5);
+  assert.match(result.reason,/same reference.*different amount/);assert.match(result.reason,/2,382.50.*2,383.50/);
+});
+
+test('single-voucher final checks return the same conflict as the statement check',async()=>{
+  const {result}=await verifyBankTransactionInTally({},row,{exportCollection:async()=>xml(voucher())});
+  assert.equal(result.verificationStatus,'ambiguous');assert.deepEqual(result.referenceConflicts,['amount']);
+  assert.equal(result.matches[0].amount,2383.5);assert.equal(result.voucherId,null);
+});
+
+test('incoming receipts and reversed directions also require review for the same reference',async()=>{
+  const incoming=await check([voucher({direction:'incoming'})],{...row,expectedDirection:'incoming'});
+  assert.equal(incoming.verificationStatus,'ambiguous');assert.equal(incoming.matches[0].amount,2383.5);
+  const reversed=await check([voucher({direction:'incoming',amount:2382.5})]);
+  assert.equal(reversed.verificationStatus,'ambiguous');assert.deepEqual(reversed.referenceConflicts,['direction']);
+});
+
+test('bank-allocation and narration references cannot lose a changed amount',async()=>{
+  for(const v of [{...voucher({ref:''}),bankReferences:[reference]},
+    {...voucher({ref:''}),narration:'Bank payment UTR: '+reference}]) {
+    assert.equal((await check([v])).verificationStatus,'ambiguous');
+  }
+});
+
+test('exact matching and conflicting vouchers with one UTR cannot confirm either',async()=>{
+  const result=await check([voucher(),{...voucher({amount:2382.5}),masterId:'other',voucherNumber:'other'}]);
+  assert.equal(result.verificationStatus,'ambiguous');assert.equal(result.matchCount,2);
+  assert.equal(result.duplicateInTally,true);
+});
+
+test('same references in other banks and different genuine UTRs do not block new payments',async()=>{
+  for(const v of [voucher({name:'Another Bank'}),voucher({ref:'UTIBN26300999999'})]) {
+    assert.equal((await check([v])).verificationStatus,'missing');
+  }
+  assert.equal((await check([voucher({amount:2382.5})])).verificationStatus,'found');
+});
+
+test('numeric and generated references retain their existing date scope',async()=>{
+  for(const ref of ['1967486047','PMT-ICICI-6AFE8144CC2DB5FEABCF']) {
+    const transaction={...row,referenceNumber:ref,bankReferenceNumber:ref.startsWith('PMT-')?null:ref};
+    assert.equal((await check([voucher({ref})],transaction)).verificationStatus,'ambiguous');
+    assert.equal((await check([voucher({ref,date:'20261024'})],transaction)).verificationStatus,'missing');
+  }
+});
+
+test('same-amount receipts with another known party and no matching UTR stay new',async()=>{
+  const result=await check([voucher({amount:2382.5,ref:''})],{...row,referenceNumber:null,bankReferenceNumber:null,counterpartyLedgerName:'Another Supplier'});
+  assert.equal(result.verificationStatus,'missing');
+});
+
+test('single-payment execution returns before building or importing a conflicting voucher',async()=>{
+  let imports=0;
+  const blocked=()=>{imports++;throw new Error('must not import a conflict')};
+  const execute=new Function('resolveBankVoucherLedgerPayloads','validateBankVoucherBillAllocationsLive',
+    'verifyBankTransactionInTally','buildBankVoucherXml','invokeTallyXml',`return (${postBankVoucher.toString()});`)(
+    async(_,rows)=>rows,async(_,rows)=>rows,async()=>({success:true,result:await check([voucher()])}),blocked,blocked);
+  const result=await execute('http://unused',row,'Solution Nyx');
+  assert.equal(result.outcome.success,false);assert.equal(result.outcome.result.possibleDuplicateInTally,true);
+  assert.equal(result.xml,null);assert.equal(imports,0);assert.match(result.outcome.error,/different amount/);
+});
+
+test('batch final preflight blocks the changed payment and skips the genuine existing one without import',async()=>{
+  const outcomes=[],imports=[];
+  const dependencies={getBankVoucherCommandBatchKey,
+    resolveBankVoucherLedgerPayloads:async(_,rows)=>rows.map(payload=>({payload})),
+    validateBankVoucherBillAllocationsLive:async(_,rows)=>rows,assertCommandTarget:async()=>{},
+    reconcileBankTransactionsInTally:async(config,payload)=>reconcileBankTransactionsInTally(config,payload,
+      {voucherProvider:async()=>({vouchers:[voucher()],diagnostics:{}})}),
+    sendCommandResult:async(_,command,outcome)=>outcomes.push({command,outcome}),
+    sendCommandResults:async(_,rows)=>outcomes.push(...rows),
+    buildBankVoucherBatchXml:()=>{imports.push('build');throw Error('must not build conflicting batch')},
+    console:{log(){},warn(){},error(){}},
+  };
+  const execute=new Function(...Object.keys(dependencies),`return (${runBankVoucherCommandBatch.toString()});`)(...Object.values(dependencies));
+  await execute({tallyUrl:'http://unused',companyName:'Solution Nyx'},[
+    {id:'changed',payload:row},
+    {id:'existing',payload:{...row,transactionId:'existing',amount:2383.5}},
+  ]);
+  assert.equal(outcomes.length,2);assert.equal(imports.length,0);
+  const changed=outcomes.find(r=>r.command.id==='changed').outcome;
+  assert.equal(changed.success,false);assert.equal(changed.result.duplicateCheck.verificationStatus,'ambiguous');
+  const existing=outcomes.find(r=>r.command.id==='existing').outcome;
+  assert.equal(existing.success,true);assert.equal(existing.result.alreadyInTally,true);assert.equal(existing.result.created,0);
+});
+
+
+// The exporter must model the date scope. Returning every fixture for every
+// query would hide an amount filter that excludes the edited voucher in Tally.
+function movedPaymentExport(content, calls = []) {
+  return async (_url, options) => {
+    calls.push(options);
+    if (options.dateFrom === '2026-10-25' && options.dateTo === '2026-10-25') {
+      return '<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>';
+    }
+    assert.equal(options.dateFrom, '2026-04-01');
+    assert.equal(options.dateTo, '2027-03-31');
+    assert.equal(options.tallyType, 'Vouchers : Ledger');
+    assert.equal(options.childOf, '"ICICI Bank - 8822014500"');
+    assert.equal(options.formulae, undefined, 'An amount filter would hide this same-UTR voucher');
+    return content;
+  };
+}
+
+test('date-and-amount edits are found in the actual wider-date export before deciding presence', async () => {
+  const calls=[];
+  const check=await verifyBankTransactionInTally({}, row, {
+    exportCollection:movedPaymentExport(xml(voucher({date:'20261024'})), calls),
+  });
+  assert.equal(calls.length,2);
+  assert.equal(check.result.verificationStatus,'ambiguous');
+  assert.equal(check.result.matches[0].voucherNumber,'5310');
+  assert.equal(check.result.matches[0].date,'2026-10-24');
+  assert.equal(check.result.matches[0].amount,2383.5);
+  assert.deepEqual(check.result.referenceConflicts,['amount']);
+});
+
+test('wider-date lookup retains changed amounts when the UTR is in bank details or narration', async () => {
+  const original=xml(voucher({date:'20261024'}));
+  for(const content of [
+    original.replace('<REFERENCE>'+reference+'</REFERENCE>', '<REFERENCE></REFERENCE><NARRATION>UTR: '+reference+'</NARRATION>'),
+    original.replace('<REFERENCE>'+reference+'</REFERENCE>', '<REFERENCE></REFERENCE>').replace('<AMOUNT>2383.5</AMOUNT>', '<AMOUNT>2383.5</AMOUNT><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>'+reference+'</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST>'),
+  ]) {
+    const check=await verifyBankTransactionInTally({},row,{exportCollection:movedPaymentExport(content)});
+    assert.equal(check.result.verificationStatus,'ambiguous');
+    assert.equal(check.result.matches[0].amount,2383.5);
+  }
+});
+
+test('wider-date conflicts do not turn unrelated references into duplicate warnings', async () => {
+  const check=await reconcileBankTransactionsInTally({}, {bankLedgerName:bank,includeBalanceProof:false,
+    transactions:[row,{...row,transactionId:'new-payment',referenceNumber:'UTIBN26300999999',bankReferenceNumber:'UTIBN26300999999'}]},
+    {exportCollection:movedPaymentExport(xml(voucher({date:'20261024'})))});
+  assert.deepEqual(check.result.transactions.map(r=>r.verificationStatus),['ambiguous','missing']);
+  assert.equal(check.result.balanceProof.tallyMovement,0);
+});
+
+test('an incomplete wider-date read fails instead of authorising another payment', async () => {
+  await assert.rejects(verifyBankTransactionInTally({},row,{exportCollection:movedPaymentExport('<ENVELOPE><COLLECTION>')}), /complete financial-year/);
+});
+
+test('final posting preflight stops a changed date and amount without building an import', async () => {
+  let imports=0;
+  const blocked=()=>{imports++;throw Error('must not import')};
+  const execute=new Function('resolveBankVoucherLedgerPayloads','validateBankVoucherBillAllocationsLive',
+    'verifyBankTransactionInTally','buildBankVoucherXml','invokeTallyXml',`return (${postBankVoucher.toString()});`)(
+    async(_,rows)=>rows,async(_,rows)=>rows,
+    (config,payload)=>verifyBankTransactionInTally(config,payload,{exportCollection:movedPaymentExport(xml(voucher({date:'20261024'})))}),
+    blocked,blocked);
+  const result=await execute('http://unused',row,'Solution Nyx');
+  assert.equal(result.outcome.success,false);
+  assert.equal(result.outcome.result.possibleDuplicateInTally,true);
+  assert.equal(result.outcome.result.duplicateCheck.matches[0].voucherNumber,'5310');
+  assert.equal(result.xml,null);assert.equal(imports,0);
+});
+
+test('the live match operation rechecks a moved and edited UTR even with a warm voucher cache', async (t) => {
+  const baseDir=fs.mkdtempSync(path.join(os.tmpdir(),'gajkesari-moved-utr-'));
+  t.after(()=>fs.rmSync(baseDir,{recursive:true,force:true}));
+  let edited=false;const calls=[];
+  const dependencies={localMatchingBaseDir:baseDir,companyGuid:'test-company',
+    voucherProvider:refreshCachedBankVouchers,exportCollection:async(_url,options)=>{
+      calls.push(options);
+      if(options.tallyType!=='Vouchers : Ledger')return '<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>';
+      if(!edited)return xml(voucher({amount:2382.5}));
+      return options.dateFrom==='2026-04-01' ? xml(voucher({date:'20261024'})) : '<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>';
+    }};
+  const request={companyName:'Solution Nyx',bankLedgerName:bank,includeBalanceProof:false,
+    billEligibleTransactionIds:[row.transactionId],transactions:[row]};
+  assert.equal((await matchBankStatementInTally({},request,dependencies)).result.transactions[0].verificationStatus,'found');
+  edited=true;const {result}=await matchBankStatementInTally({},request,dependencies);
+  assert.equal(result.transactions[0].verificationStatus,'ambiguous');
+  assert.equal(result.transactions[0].matches[0].date,'2026-10-24');
+  assert.equal(result.transactions[0].matches[0].amount,2383.5);
+  assert.deepEqual(result.billLedgerNames,[],'A conflicting payment must not open bill allocation');
+  assert.equal(calls.length,2);assert.equal(calls[1].dateFrom,'2026-04-01');
+  assert.equal(calls[1].dateTo,'2027-03-31');assert.equal(calls[1].formulae,undefined);
+});
+
+test('live matching removes a deleted out-of-period UTR instead of trusting the warm cache', async (t) => {
+  const baseDir=fs.mkdtempSync(path.join(os.tmpdir(),'gajkesari-deleted-utr-'));
+  t.after(()=>fs.rmSync(baseDir,{recursive:true,force:true}));
+  let deleted=false;
+  const dependencies={localMatchingBaseDir:baseDir,voucherProvider:refreshCachedBankVouchers,
+    exportCollection:async()=>deleted ? '<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>' : xml(voucher({date:'20261024',amount:2382.5}))};
+  const request={bankLedgerName:bank,includeBalanceProof:false,transactions:[row]};
+  assert.equal((await matchBankStatementInTally({},request,dependencies)).result.transactions[0].verificationStatus,'found');
+  deleted=true;
+  assert.equal((await matchBankStatementInTally({},request,dependencies)).result.transactions[0].verificationStatus,'missing');
+});
+
+test('live matching refuses an incomplete fresh UTR read despite a previously complete cache', async (t) => {
+  const baseDir=fs.mkdtempSync(path.join(os.tmpdir(),'gajkesari-incomplete-utr-'));
+  t.after(()=>fs.rmSync(baseDir,{recursive:true,force:true}));
+  let incomplete=false;
+  const dependencies={localMatchingBaseDir:baseDir,voucherProvider:refreshCachedBankVouchers,
+    exportCollection:async(_url,options)=>incomplete && options.dateFrom==='2026-04-01'
+      ? '<ENVELOPE><COLLECTION>' : xml(voucher({amount:2382.5}))};
+  const request={bankLedgerName:bank,includeBalanceProof:false,transactions:[row]};
+  await matchBankStatementInTally({},request,dependencies);incomplete=true;
+  await assert.rejects(matchBankStatementInTally({},request,dependencies),/complete voucher collection/);
 });

@@ -6,6 +6,7 @@ export type BankPostingCommand = {
 };
 
 export function bankPostingOutcome(command: BankPostingCommand) {
+  if (command.status === "user_skipped") return { status: "skipped", accepted: false } as const;
   const result = command.result ?? {};
   const check = result.duplicateCheck as Record<string, unknown> | undefined;
   const verified = ["verified", "found", "matched"].includes(String(result.verificationStatus ?? check?.verificationStatus ?? ""));
@@ -28,7 +29,7 @@ export function bankPostingOutcome(command: BankPostingCommand) {
 
 export function summarizeBankPostings(commands: BankPostingCommand[]) {
   const summary = { total: commands.length, confirmed: 0, needsCheck: 0, failed: 0, pending: 0, accepted: 0, alreadyExisting: 0,
-    held: 0, confirmationPending: 0, outcomeUnknown: 0 };
+    held: 0, confirmationPending: 0, outcomeUnknown: 0, skipped: 0 };
   for (const command of commands) {
     const outcome = bankPostingOutcome(command);
     if (outcome.accepted) summary.accepted++;
@@ -42,6 +43,7 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
       else if (outcome.accepted) summary.confirmationPending++;
       else summary.outcomeUnknown++;
     }
+    else if (outcome.status === "skipped") summary.skipped++;
     else if (outcome.status === "failed") summary.failed++;
     else summary.pending++;
   }
@@ -50,6 +52,7 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
 
 export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>) {
   const progress = [`${summary.confirmed - summary.alreadyExisting} newly posted`, `${summary.alreadyExisting} already entered in Tally`];
+  if (summary.skipped) progress.push(`${summary.skipped} skipped by you`);
   if (summary.held) progress.push(`${summary.held} not posted: possible duplicates need review`);
   if (summary.confirmationPending) progress.push(`${summary.confirmationPending} accepted by Tally: confirmation pending`);
   if (summary.outcomeUnknown) progress.push(`${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown: check Tally before retrying`);
@@ -57,6 +60,7 @@ export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPosti
   if (summary.pending) progress.push(`${summary.pending} still processing`);
   if (summary.pending || summary.needsCheck || summary.failed) return `${progress.join("; ")}.`;
   if (!summary.total) return "No entries were posted.";
+  if (summary.skipped) return `${progress.join("; ")}.`;
   if (summary.alreadyExisting === summary.total && summary.total > 0) return `${summary.alreadyExisting} ${summary.alreadyExisting === 1 ? "entry was" : "entries were"} already entered in Tally. No new entries were posted.`;
   if (summary.alreadyExisting > 0) {
     const posted = summary.confirmed - summary.alreadyExisting;
@@ -70,5 +74,6 @@ export function bankPostingTitle(summary: ReturnType<typeof summarizeBankPosting
   if (summary.pending) return "Processing entries in Tally";
   if (summary.held) return "Some entries need review";
   if (summary.needsCheck) return "Some posting confirmations need checking";
+  if (summary.skipped) return "Statement review complete";
   return "Entries confirmed in Tally";
 }

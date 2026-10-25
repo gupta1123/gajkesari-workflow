@@ -17,7 +17,7 @@ test('17 confirmations and 1 accepted but unconfirmed entry is a needs-check out
   } };
   const summary = summarizeBankPostings([...Array(17).fill(confirmed), uncertain]);
   assert.deepEqual(summary, { total: 18, confirmed: 17, needsCheck: 1, failed: 0, pending: 0, accepted: 18, alreadyExisting: 0,
-    held: 0, confirmationPending: 1, outcomeUnknown: 0 });
+    held: 0, confirmationPending: 1, outcomeUnknown: 0, skipped: 0 });
   assert.equal(bankPostingMessage(summary), '17 newly posted; 0 already entered in Tally; 1 accepted by Tally: confirmation pending.');
 });
 

@@ -3,14 +3,18 @@
 import { useState } from "react";
 import { AlertTriangle, Loader2, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { comparePostingVoucher, type ReviewStatement } from "@/lib/bank-posting-review";
+import { comparePostingVoucher, showSeparateVoucherReference, type ReviewStatement } from "@/lib/bank-posting-review";
 import type { PostingMatch } from "@/lib/statement-bank-book";
+import { isTrackingReference } from "@gajkesari/shared/lib/bank-duplicate-resolution";
 
 type Props = {
   statement: ReviewStatement; title: string; label: string; reason: string;
   matches: Array<Partial<PostingMatch>>; confirmed: boolean; held: boolean;
   checkedAt?: string | null; checkFailed?: boolean; canRecheck: boolean; busy: boolean;
   notice?: string | null;
+  canResolveDuplicate?: boolean; separatePaymentSupported?: boolean; duplicateDecision?: "skip" | "separate";
+  onResolveDuplicate?: (action: "skip" | "separate" | "clear") => void;
+  onReviewAllocation?: () => void;
   ledgers: string[]; onRecheck: (ledgerName?: string) => void; onClose: () => void; onNext: () => void; hasNext: boolean;
 };
 
@@ -18,6 +22,8 @@ export function BankPostingReview(props: Props) {
   const [editingLedger, setEditingLedger] = useState(false);
   const [ledgerName, setLedgerName] = useState(props.statement.ledger);
   const [search, setSearch] = useState("");
+  const [confirmSeparate, setConfirmSeparate] = useState(false);
+  const [separateAcknowledged, setSeparateAcknowledged] = useState(false);
   const filteredLedgers = props.ledgers.filter(name => name !== props.statement.bank && name.toLowerCase().includes(search.toLowerCase()));
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/20">
@@ -45,7 +51,7 @@ export function BankPostingReview(props: Props) {
               return <div key={`${match.masterId || match.voucherNumber || index}`} className="mt-3 overflow-hidden rounded-lg border border-[#e5ddd0]">
                 <div className="flex flex-wrap items-center justify-between gap-2 bg-[#faf8f4] px-3 py-2.5">
                   <h4 className="text-sm font-bold">{match.voucherNumber ? `Voucher ${match.voucherNumber}` : `Possible voucher ${index + 1}`}{match.voucherType ? ` · ${match.voucherType}` : ""}</h4>
-                  <span className="text-xs text-slate-500">{props.confirmed ? "Confirmed in Tally" : "Possible match"}</span>
+                  <span className="text-xs text-slate-500">{props.confirmed ? "Confirmed in Tally" : comparison.some(field => field.label === "Amount" && field.state === "different") ? "Amount differs" : "Possible match"}</span>
                 </div>
                 <table className="w-full table-fixed text-left text-xs sm:text-sm">
                   <thead><tr className="border-b border-[#e5ddd0]"><th className="w-[28%] p-3 font-semibold">Compare</th><th className="w-[36%] p-3 font-semibold">Statement</th><th className="w-[36%] p-3 font-semibold">Tally voucher</th></tr></thead>
@@ -55,7 +61,7 @@ export function BankPostingReview(props: Props) {
                     <td className={`break-words p-3 align-top ${field.state === "different" ? "font-semibold text-amber-900" : !field.tally ? "text-slate-500" : ""}`}>{field.tally || (field.label === "Bank reference / UTR" ? "Not recorded" : "Not returned by this check")}</td>
                   </tr>)}</tbody>
                 </table>
-                {match.reference ? <p className="border-t border-[#eee8df] px-3 py-2 text-xs text-slate-600">Voucher reference: <span className="break-all font-medium">{match.reference}</span></p> : null}
+                {showSeparateVoucherReference(match) ? <p className="border-t border-[#eee8df] px-3 py-2 text-xs text-slate-600">{isTrackingReference(match.reference) ? "Connector tracking reference" : "Voucher reference"}: <span className="break-all font-medium">{match.reference}</span></p> : null}
               </div>;
             }) : <div className="mt-3 rounded-lg border border-[#e5ddd0] p-4 text-sm leading-6">
               <dl className="grid gap-3 sm:grid-cols-2">
@@ -64,6 +70,35 @@ export function BankPostingReview(props: Props) {
               <p className="mt-4 text-slate-600">No candidate voucher details were returned. Check the bank ledger in Tally for this date, amount and reference. A missing match alone does not mean it is safe to post again.</p>
             </div>}
           </section>
+          {props.canResolveDuplicate || props.duplicateDecision ? <section className="border-t border-[#e5ddd0] px-5 py-4">
+            <h3 className="text-sm font-bold">Resolve this repeated entry</h3>
+            {props.duplicateDecision ? <div className="mt-3 rounded-lg border border-[#ddd3c5] bg-[#faf8f4] p-3">
+              <p className="text-sm font-semibold">{props.duplicateDecision === "skip" ? "Skipped by you" : "Separate payment selected"}</p>
+              <p className="mt-1 text-sm leading-6 text-slate-600">{props.duplicateDecision === "skip"
+                ? "This row stays visible in the statement. No voucher will be created for it."
+                : "You confirmed this was another payment. Normal bill allocation and the final Tally check still apply."}</p>
+              <Button className="mt-3" variant="outline" disabled={props.busy} onClick={() => { setConfirmSeparate(false); setSeparateAcknowledged(false); props.onResolveDuplicate?.("clear"); }}>Undo decision</Button>
+              {props.onReviewAllocation ? <Button className="ml-2 mt-3" disabled={props.busy} onClick={props.onReviewAllocation}>Review bill allocation</Button> : null}
+            </div> : <>
+              <p className="mt-2 text-sm leading-6 text-slate-600">One existing voucher cannot confirm both rows. Choose whether this is a repeated row or another genuine bank payment.</p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <button type="button" disabled={props.busy} onClick={() => props.onResolveDuplicate?.("skip")}
+                  className="rounded-lg border border-[#ddd3c5] p-4 text-left hover:bg-[#faf8f4] focus-visible:outline-2 focus-visible:outline-offset-2 disabled:opacity-50">
+                  <span className="block text-sm font-bold">Skip this row</span><span className="mt-1 block text-xs leading-5 text-slate-600">It repeats the payment already recorded. Keep it visible as skipped.</span>
+                </button>
+                <button type="button" disabled={props.busy || !props.separatePaymentSupported} onClick={() => setConfirmSeparate(true)}
+                  className="rounded-lg border border-[#ddd3c5] p-4 text-left hover:bg-[#faf8f4] focus-visible:outline-2 focus-visible:outline-offset-2 disabled:opacity-50">
+                  <span className="block text-sm font-bold">Post as a separate payment</span><span className="mt-1 block text-xs leading-5 text-slate-600">There were two real payments. Prepare this one for normal posting.</span>
+                </button>
+              </div>
+              {!props.separatePaymentSupported ? <p className="mt-2 text-xs text-amber-800">Install connector 0.1.92 or later and recheck Tally to prepare a separate payment.</p> : null}
+              {confirmSeparate ? <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
+                <label className="flex items-start gap-3 text-sm leading-6"><input type="checkbox" checked={separateAcknowledged} onChange={event => setSeparateAcknowledged(event.target.checked)} disabled={props.busy} className="mt-1.5" />I checked the bank statement and confirmed this was a separate payment.</label>
+                <p className="mt-2 text-xs leading-5 text-slate-600">Saving this choice does not post. Review the allocation, then use the main Post button.</p>
+                <div className="mt-3 flex gap-2"><Button disabled={props.busy || !separateAcknowledged} onClick={() => props.onResolveDuplicate?.("separate")}>Use as separate payment</Button><Button variant="outline" disabled={props.busy} onClick={() => { setConfirmSeparate(false); setSeparateAcknowledged(false); }}>Cancel</Button></div>
+              </div> : null}
+            </>}
+          </section> : null}
           {!props.confirmed && props.canRecheck ? <section className="border-t border-[#e5ddd0] px-5 py-4">
             <h3 className="text-sm font-bold">What to do next</h3>
             <p className="mt-2 text-sm leading-6 text-slate-600">{props.held ? "Compare the voucher in Tally with this statement entry. If the selected ledger is wrong, correct it below. If Tally needs a correction, make it there, then recheck." : "Keep Tally and the connector open on this company, then recheck the voucher confirmation. This entry may already have been posted."}</p>

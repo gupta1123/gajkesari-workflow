@@ -1,7 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { comparePostingVoucher, recheckResultMessage } from './bank-posting-review.ts';
-import { savedPostingPresence, summarizeSavedPostings } from './statement-bank-book.ts';
+import { comparePostingVoucher, recheckResultMessage, uniquePostingReferences, showSeparateVoucherReference } from './bank-posting-review.ts';
+import { savedPostingPresence, summarizeSavedPostings, heldPostingLabel, heldPostingReason } from './statement-bank-book.ts';
+import { summarizeStatementPostings, postingFooterSegments, recordedTrackingReference } from './statement-bank-book.ts';
+
+test('skipped statement rows remain visible, count separately and never appear as processing or confirmed',()=>{
+ const rows=[{id:'existing',transactionDate:'2026-10-25',description:'Payment',debitAmount:10,balanceAmount:100},
+   {id:'skip',transactionDate:'2026-10-25',description:'Payment',debitAmount:10,balanceAmount:90}];
+ const summary=summarizeStatementPostings(rows,[],{existing:{status:'found',voucherNumber:'1'},skip:{status:'skipped'}});
+ assert.equal(summary.total,2);assert.equal(summary.confirmed,1);assert.equal(summary.skipped,1);assert.equal(summary.pending,0);assert.equal(summary.needsCheck,0);
+ assert.deepEqual(postingFooterSegments(summary,false).map(r=>r.text),['1 already entered','1 skipped by you']);
+});
+
+test('recorded tracking references identify prior app postings without pretending they are bank UTRs',()=>{
+ const row={transactionDate:'2026-10-25',description:'Payment',debitAmount:10,balanceAmount:100};
+ const tracking='PMT-ICICI-0BF8EA4652030502EE99';
+ const saved={...row,id:'saved',postingStatus:'verified',voucherNumber:'5322',postingResult:{duplicateCheck:{matches:[{voucherNumber:'5322',reference:tracking,bankReferences:[tracking],ledgerNames:[]}]}}};
+ assert.equal(recordedTrackingReference(row,[saved]),tracking);
+ assert.equal(recordedTrackingReference({...row,balanceAmount:90},[saved]),'');
+ assert.equal(recordedTrackingReference(row,[{...saved,postingStatus:'needs_tally_review'}]),'');
+ const comparison=comparePostingVoucher({date:row.transactionDate,amount:10,ledger:'Deccan',bank:'ICICI',reference:'',direction:'outgoing'},saved.postingResult.duplicateCheck.matches[0]);
+ assert.equal(comparison.find(r=>r.label==='Bank reference / UTR').tally,null);
+ assert.equal(showSeparateVoucherReference(saved.postingResult.duplicateCheck.matches[0]),true);
+});
 
 const row = { id: 'held', transactionDate: '2026-10-08', description: 'Credit BluePeak', creditAmount: 1101.11, selectedLedgerName: 'BluePeak' };
 const statement = { date: row.transactionDate, amount: row.creditAmount, ledger: 'BluePeak', bank: 'Axis', reference: 'UTR12345678', direction: 'incoming' };
@@ -46,4 +67,42 @@ test('recheck messages distinguish new confirmations, no change, failure and com
   assert.match(recheckResultMessage({ confirmed: 0, checked: 1, remaining: 1, checkFailed: 1 }), /couldn't be checked/);
   assert.match(recheckResultMessage({ confirmed: 1, checked: 1, remaining: 0 }), /All entries are confirmed.*No vouchers were posted/);
   assert.equal(summarizeSavedPostings([{ ...row, postingStatus: 'verified', postingResult: { alreadyInTally: true } }]).alreadyExisting, 1);
+});
+
+
+test('duplicate UTRs appear once and an identical voucher-reference footer is hidden', () => {
+  const match = { reference: 'UTIBN26300002502', bankReferences: [' UTIBN26300002502 ', 'utibn26300002502', 'UTIBN-26300002502'] };
+  assert.deepEqual(uniquePostingReferences(match), ['UTIBN26300002502']);
+  assert.equal(showSeparateVoucherReference(match), false);
+  assert.equal(comparePostingVoucher({ ...statement, reference: match.reference }, match).find(field => field.label === 'Bank reference / UTR').tally, 'UTIBN26300002502');
+});
+
+test('a different invoice or voucher reference remains visible', () => {
+  assert.equal(showSeparateVoucherReference({ reference: 'INV-1001', bankReferences: ['UTIBN26300002502'] }), true);
+  assert.equal(showSeparateVoucherReference({ reference: 'UTIBN26300002502', bankReferences: [] }), false);
+  assert.equal(showSeparateVoucherReference({ bankReferences: ['UTIBN26300002502'] }), false);
+});
+
+test('same-UTR amount mismatches name the voucher and both amounts without suggesting a separate payment', () => {
+  const payment = { ...row, referenceNumber: 'UTIBN26300002502', debitAmount: 2382.5, creditAmount: 0 };
+  const candidate = { ...match, reference: payment.referenceNumber, bankReferences: [payment.referenceNumber], amount: 2383.5, voucherNumber: '5310' };
+  assert.equal(heldPostingLabel(payment, [candidate]), 'Amount mismatch');
+  const reason = heldPostingReason(payment, [payment], [candidate]);
+  assert.match(reason, /Voucher 5310.*same bank reference.*different amount/);
+  assert.match(reason, /2,382.50.*2,383.50/);
+  assert.match(reason, /Resolve the difference, then recheck Tally/);
+  assert.doesNotMatch(reason, /separate transaction/);
+  assert.equal(heldPostingLabel(payment, [{ ...candidate, amount: 2382.5 }]), 'Possible Match');
+  assert.equal(heldPostingLabel(payment, [{ ...candidate, reference: 'UTIBN99999999999', bankReferences: [] }]), 'Possible Match');
+  assert.equal(heldPostingLabel(payment, [{ ...candidate, amount: null }]), 'Possible Match');
+});
+
+test('reopening a held amount conflict preserves its specific label and review status', () => {
+  const payment = { ...row, referenceNumber: 'UTIBN26300002502', debitAmount: 2382.5, creditAmount: 0 };
+  const candidate = { ...match, reference: payment.referenceNumber, bankReferences: [payment.referenceNumber], amount: 2383.5, voucherNumber: '5310' };
+  const saved = { ...payment, postingStatus: 'needs_tally_review', postingResult: { possibleDuplicateInTally: true, duplicateCheck: { verificationStatus: 'ambiguous', matches: [candidate] } } };
+  const presence = savedPostingPresence([payment], [saved]).held;
+  assert.equal(presence.label, 'Amount mismatch');
+  assert.equal(presence.status, 'verification_pending');
+  assert.match(presence.reason, /2,382.50.*2,383.50/);
 });

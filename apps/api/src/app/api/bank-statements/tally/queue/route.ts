@@ -18,6 +18,7 @@ import {
 } from "@/lib/bank-statement-ledger-safety";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
+import { resolutionForRow, type DuplicateDecision } from "@gajkesari/shared/lib/bank-duplicate-resolution";
 
 export const runtime = "nodejs";
 
@@ -96,6 +97,7 @@ type BankAccountRow = {
 type BankStatementImportRow = {
   id: string;
   extracted_bank_name: string | null;
+  processing_meta?: { duplicateResolutions?: Record<string, DuplicateDecision> };
 };
 
 type PostingLogRow = {
@@ -636,7 +638,7 @@ export async function POST(request: Request) {
       importIds.length
         ? supabase
           .from("bank_statement_imports")
-          .select("id, extracted_bank_name")
+          .select("id, extracted_bank_name, processing_meta")
           .eq("owner_user_id", user.id)
           .eq("company_dataset_id", target.companyDatasetId)
           .in("id", importIds)
@@ -1001,6 +1003,9 @@ export async function POST(request: Request) {
         // The voucher tracking reference must not replace the bank's identity
         // when checking for vouchers that were entered manually.
         const bankReferenceNumber = transaction.reference_number || null;
+        const duplicateResolution = resolutionForRow(statementImport?.processing_meta?.duplicateResolutions || {},
+          transaction, bankLedgerName, counterpartyLedgerName);
+        if (duplicateResolution?.action === "skip") return skipTransaction(transaction, "alreadyPostedOrActive");
         const referenceSource = bankReferenceNumber ? "bank" : "generated";
         const review = transaction.raw_payload?.review && typeof transaction.raw_payload.review === "object"
           ? transaction.raw_payload.review as Record<string, unknown>
@@ -1140,6 +1145,7 @@ export async function POST(request: Request) {
             billAllocations,
             expectedDirection: outgoingPayment ? "outgoing" : "incoming",
             preflightVerifyExisting: true,
+            ...(duplicateResolution?.action === "separate" ? { duplicateResolution } : {}),
           },
         });
 

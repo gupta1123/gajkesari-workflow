@@ -1,5 +1,6 @@
 import { bankPostingOutcome, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
 import type { BankBookRow } from "./bank-book-csv";
+import { isTrackingReference } from "@gajkesari/shared/lib/bank-duplicate-resolution";
 
 type StatementRow = {
   transactionDate?: string | null;
@@ -34,6 +35,14 @@ export function savedPostingOutcome(row: SavedPostingRow) {
   return bankPostingOutcome({ status: row.postingStatus, result: row.postingResult });
 }
 
+export function recordedTrackingReference(row: StatementRow, saved: SavedPostingRow[]) {
+  const posting = saved.find(value => statementRowKey(value) === statementRowKey(row));
+  if (!posting || savedPostingOutcome(posting).status !== "confirmed") return "";
+  const matches = postingMatches(posting.postingResult);
+  if (matches.length !== 1 || (posting.voucherNumber && matches[0].voucherNumber !== posting.voucherNumber)) return "";
+  return [matches[0].reference, ...matches[0].bankReferences].find(isTrackingReference) || "";
+}
+
 export function summarizeSavedPostings(rows: SavedPostingRow[]) {
   return summarizeBankPostings(rows.map(row => ({ status: row.postingStatus === "verified" ? "succeeded" : row.postingStatus,
     reconciliationRequired: row.postingStatus === "needs_tally_review",
@@ -57,8 +66,10 @@ export function resolveStatementPostings(
   return rows.map((row, index) => {
     // A live match must never erase an unresolved or failed posting attempt.
     const posting = byKey.get(statementRowKey(row));
-    if (posting) return posting;
     const check = row.id ? presence[row.id] : undefined;
+    if (check?.status === "skipped" && (!posting || posting.postingResult?.possibleDuplicateInTally === true)) return { ...row, id: row.id || `skipped-${index}`, postingStatus: "user_skipped",
+      voucherNumber: null, postingResult: { skippedByUser: true } };
+    if (posting) return posting;
     const existing = check?.status === "found" && !check.duplicateInTally && !check.checkFailed && !check.reviewKind;
     return {
       ...row,
@@ -114,6 +125,7 @@ export function postingFooterSegments(summary: ReturnType<typeof summarizeBankPo
   const newlyPosted = summary.confirmed - summary.alreadyExisting;
   if (newlyPosted > 0) segments.push({ text: `${newlyPosted} posted`, tone: "success" });
   if (summary.alreadyExisting > 0) segments.push({ text: `${summary.alreadyExisting} already entered`, tone: "neutral" });
+  if (summary.skipped > 0) segments.push({ text: `${summary.skipped} skipped by you`, tone: "neutral" });
   if (summary.held > 0) segments.push({ text: `${summary.held} ${summary.held === 1 ? "needs" : "need"} review`, tone: "review" });
   if (summary.confirmationPending > 0) segments.push({ text: `${summary.confirmationPending} awaiting confirmation`, tone: "review" });
   if (summary.outcomeUnknown > 0) segments.push({ text: `${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown`, tone: "review" });
@@ -146,11 +158,32 @@ export function postingMatches(result?: Record<string, unknown> | null): Posting
   }) : [];
 }
 
+function amountMismatchMatch(row: StatementRow, matches: PostingMatch[]) {
+  if (matches.length !== 1 || !row.referenceNumber) return null;
+  const match = matches[0];
+  const normalizeReference = (value: string) => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const sameReference = [match.reference, ...match.bankReferences].some(reference =>
+    reference && normalizeReference(reference) === normalizeReference(row.referenceNumber!));
+  const amount = Math.abs(Number(row.debitAmount || 0) || Number(row.creditAmount || 0));
+  return sameReference && Number.isFinite(amount) && typeof match.amount === "number" &&
+    Number.isFinite(match.amount) && Math.round(amount * 100) !== Math.round(Math.abs(match.amount) * 100) ? match : null;
+}
+
+export function heldPostingLabel(row: StatementRow, matches: PostingMatch[], fallback = "Possible Match") {
+  return amountMismatchMatch(row, matches) ? "Amount mismatch" : fallback;
+}
+
 export function heldPostingReason(row: StatementRow, rows: StatementRow[], matches: PostingMatch[]) {
   const normalize = (value?: string | null) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const sameRows = rows.filter(candidate => candidate.transactionDate === row.transactionDate &&
     candidate.description === row.description && !candidate.referenceNumber &&
     Number(candidate.debitAmount || 0) === Number(row.debitAmount || 0) && Number(candidate.creditAmount || 0) === Number(row.creditAmount || 0));
+  const amountMismatch = amountMismatchMatch(row, matches);
+  if (amountMismatch) {
+    const money = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(value);
+    const amount = Math.abs(Number(row.debitAmount || 0) || Number(row.creditAmount || 0));
+    return `${amountMismatch.voucherNumber ? `Voucher ${amountMismatch.voucherNumber}` : "A Tally voucher"} has the same bank reference but a different amount. Statement: ${money(amount)}; Tally: ${money(Math.abs(amountMismatch.amount!))}. Resolve the difference, then recheck Tally. Nothing was posted for this row.`;
+  }
   let reason = "Possible existing entry in Tally. Compare the voucher details before deciding whether this is a separate transaction.";
   if (matches.length > 1) reason = `${matches.length} Tally vouchers could match this transaction. Compare their dates, parties and references to identify the correct voucher.`;
   else if (!row.referenceNumber && sameRows.length > 1 && matches.length === 1) reason = "This statement repeats the same transaction details without a bank reference. One existing Tally voucher cannot confirm both rows. Check whether this row is a separate transaction.";
@@ -209,7 +242,7 @@ export function savedPostingPresence(rows: Array<StatementRow & { id: string }>,
       alreadyInTally: posting.postingResult?.alreadyInTally === true, ...evidence }]];
     if (outcome.status === "needs_check") return [[row.id, { status: "verification_pending" as const,
       label: evidence.checkFailed ? "Couldn't recheck in Tally"
-        : posting.postingResult?.possibleDuplicateInTally === true ? recheck?.verification?.verificationStatus === "missing" ? "Still needs review" : "Possible existing entry"
+        : posting.postingResult?.possibleDuplicateInTally === true ? recheck?.verification?.verificationStatus === "missing" ? "Still needs review" : heldPostingLabel(row, matches, "Possible existing entry")
         : outcome.accepted ? "Accepted by Tally; confirmation pending" : "Posting outcome unknown",
       reason: evidence.checkFailed ? "The latest Tally check couldn't finish. Any voucher details below are from the previous check. Keep Tally and the connector open, then recheck."
         : posting.postingResult?.possibleDuplicateInTally === true ? recheck?.verification?.verificationStatus === "missing"

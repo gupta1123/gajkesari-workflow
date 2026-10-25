@@ -458,6 +458,7 @@ export async function GET(
       transactionsPage,
       transactionsPageSize,
       postedTransactions,
+      duplicateResolutions: readRecord(processingMeta.duplicateResolutions),
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,

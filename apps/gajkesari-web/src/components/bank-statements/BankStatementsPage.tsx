@@ -24,6 +24,7 @@ import {
 import { AppShell } from "@/components/dashboard/AppShell";
 import { BankStatementReviewToolbar, type ReviewWorkStatusFilter, type ReviewTallyResultFilter, type ReviewLedgerFilter, type ReviewAllocationFilter } from "@/components/bank-statements/BankStatementReviewToolbar";
 import { BankPostingReview } from "@/components/bank-statements/BankPostingReview";
+import { canResolveRepeatedPayment, duplicateRowKey, resolutionForRow, type DuplicateDecision } from "@gajkesari/shared/lib/bank-duplicate-resolution";
 import { recheckResultMessage } from "@/lib/bank-posting-review";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,7 +35,7 @@ import { readPostingStatus, PostingStatusUnavailable } from "@/lib/bank-posting-
 import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { bankPostingOutcome, bankPostingMessage, bankPostingTitle, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
 import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
-import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings,
+import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings, recordedTrackingReference,
   heldPostingReason, statementCheckMessage, statementBalanceMessage, postingFooterSegments, summarizeStatementPostings, resolveStatementPostings, mergeCompletedPostingEvidence, markPreviouslyConfirmedPostings } from "@/lib/statement-bank-book";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
@@ -363,6 +364,7 @@ type BankLedgerResolution = {
 };
 
 type PreviewResponse = {
+  duplicateResolutions?: Record<string, DuplicateDecision>;
   duplicateUpload?: boolean;
   message?: string;
   bankLedgerResolution?: BankLedgerResolution;
@@ -660,6 +662,7 @@ type OutgoingVerificationDraft = {
     | "checking"
     | "found"
     | "ambiguous"
+    | "skipped"
     | "missing"
     | "failed"
     | "cannot_check_yet";
@@ -2221,6 +2224,7 @@ function getLedgerReviewFilterValue(transaction: ReviewTransaction): Exclude<Rev
 function getTallyResultFilterValue(
   draft?: OutgoingVerificationDraft | null
 ): Exclude<ReviewTallyResultFilter, "all"> {
+  if (draft?.status === "skipped") return "skipped";
   if (draft?.reviewKind === "held") return "review";
   if (draft?.status === "verification_pending") return "pending";
   if (!draft || draft.status === "not_checked" || draft.status === "checking") return "pending";
@@ -2343,6 +2347,7 @@ function getOutgoingVerificationLabel(draft?: OutgoingVerificationDraft | null) 
 }
 
 function getOutgoingVerificationClass(draft?: OutgoingVerificationDraft | null) {
+  if (draft?.status === "skipped") return "border-slate-200 bg-slate-50 text-slate-600";
   if (!draft || draft.status === "not_checked") return "border-blue-200 bg-blue-50 text-blue-800";
   if (draft.status === "checking") return "border-blue-200 bg-blue-50 text-blue-800";
   if (draft.status === "found") return "border-emerald-250 bg-emerald-50 text-emerald-800";
@@ -2353,6 +2358,7 @@ function getOutgoingVerificationClass(draft?: OutgoingVerificationDraft | null) 
 }
 
 function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null) {
+  if (draft?.status === "skipped") return "Repeated row · No voucher created";
   if (!draft) return "Find existing payment";
   if (draft.status === "checking") return "Checking Tally...";
   if (draft.status === "found") {
@@ -2362,7 +2368,7 @@ function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null
     const voucher = draft.voucherNumber ? `Voucher ${draft.voucherNumber}` : "Existing voucher found";
     return draft.voucherDate ? `${voucher} - ${formatShortDate(draft.voucherDate)}` : voucher;
   }
-  if (draft.status === "ambiguous") return "Review possible vouchers";
+  if (draft.status === "ambiguous") return draft.label === "Amount mismatch" ? "Compare statement and Tally amounts" : "Review possible vouchers";
   if (draft.status === "missing") return "No existing payment found";
   return draft.reason || "Could not check";
 }
@@ -2446,7 +2452,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
   if (verificationStatus === "ambiguous") {
     return {
       status: "ambiguous",
-      label: "Possible Match",
+      label: Array.isArray(result.referenceConflicts) && result.referenceConflicts.includes("amount") ? "Amount mismatch" : "Possible Match",
       reason: reason || "Multiple Tally vouchers look similar. Review manually.",
       voucherNumber,
       voucherDate,
@@ -2580,7 +2586,7 @@ function getReviewPostingAction(
   ledgerMasters: TallyMaster[],
   tallyPresence?: OutgoingVerificationDraft | null
 ): ReviewPostingAction {
-  if (tallyPresence && ["found", "ambiguous", "verification_pending"].includes(tallyPresence.status)) return "outgoing";
+  if (tallyPresence && ["found", "skipped", "ambiguous", "verification_pending"].includes(tallyPresence.status)) return "outgoing";
 
   const outgoingPayment = isOutgoingPaymentRow(transaction);
   const billMatchEligible = isBillMatchEligibleTransaction(transaction, ledgerMasters);
@@ -3357,6 +3363,9 @@ export function BankStatementsPage() {
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [duplicateResolutions, setDuplicateResolutions] = useState<Record<string, DuplicateDecision>>({});
+  const [savingDuplicateDecision, setSavingDuplicateDecision] = useState(false);
+  const [duplicateResolutionSupported, setDuplicateResolutionSupported] = useState(false);
   const [analysisEngineSource, setAnalysisEngineSource] = useState<string | null>(null);
   const [, setRecentImports] = useState<BankStatementImport[]>([]);
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
@@ -3693,6 +3702,18 @@ export function BankStatementsPage() {
     setBankLedgerManuallyConfirmed(false);
   }, [bankLedgerChangeMode, bankLedgerName, exactBankLedgerMatch, preview]);
 
+  useEffect(() => {
+    setTallyPresenceByTransactionId(current => {
+      let changed = false; const next = { ...current };
+      for (const row of transactions) {
+        const decision = resolutionForRow(duplicateResolutions, row, bankLedgerName, row.selectedLedgerName);
+        if (decision?.action === "skip" && current[row.id]?.status !== "skipped") {
+          next[row.id] = { status: "skipped", label: "Skipped by you", reason: "You marked this as a repeated statement row. No voucher will be created.", matches: [] }; changed = true;
+        } else if (current[row.id]?.status === "skipped" && decision?.action !== "skip") { delete next[row.id]; changed = true; }
+      }
+      return changed ? next : current;
+    });
+  }, [duplicateResolutions, bankLedgerName, transactions]);
   const uploadContextReady = Boolean(selectedCompanyId && tallyCompanyContextVerified);
   const workflowStep = preview ? 3 : documentPreview ? 1 : loading ? 2 : 0;
   const setupErrorMessage = !tallyConnectionId
@@ -3760,7 +3781,7 @@ export function BankStatementsPage() {
     () => validTransactions.filter(
       (transaction) =>
         isBillMatchEligibleTransaction(transaction, ledgerMasters) &&
-        tallyPresenceByTransactionId[transaction.id]?.status !== "found"
+        !["found", "skipped"].includes(tallyPresenceByTransactionId[transaction.id]?.status || "")
     ),
     [ledgerMasters, tallyPresenceByTransactionId, validTransactions]
   );
@@ -3774,7 +3795,7 @@ export function BankStatementsPage() {
   const transactionsNeedingTallyWork = useMemo(
     () => validTransactions.filter((transaction) => {
       const status = tallyPresenceByTransactionId[transaction.id]?.status;
-      if (status === "found" || status === "ambiguous" || status === "verification_pending") return false;
+      if (status === "found" || status === "skipped" || status === "ambiguous" || status === "verification_pending") return false;
       return tallyCheckAttempted ? status === "missing" : true;
     }),
     [tallyCheckAttempted, tallyPresenceByTransactionId, validTransactions]
@@ -3806,9 +3827,10 @@ export function BankStatementsPage() {
   const newReceiptCount = readyReceiptTransactions.length;
   const missingOutgoingCount = readyPaymentTransactions.length;
   const heldPostingRowCount = validTransactions.filter((transaction) =>
-    tallyPresenceByTransactionId[transaction.id]?.status !== "found" &&
+    !["found", "skipped"].includes(tallyPresenceByTransactionId[transaction.id]?.status || "") &&
     !readyPostingIds.has(transaction.id)
   ).length;
+  const skippedByUserCount = validTransactions.filter(row => tallyPresenceByTransactionId[row.id]?.status === "skipped").length;
   const statementCompletedCleanly = Boolean(
     statementDoneSummary && statementDoneSummary.tone === "success"
   );
@@ -3862,6 +3884,7 @@ export function BankStatementsPage() {
       const presence = tallyPresenceByTransactionId[transaction.id];
       const isIncoming = isIncomingReceiptRow(transaction);
       const isOutgoing = isOutgoingPaymentRow(transaction);
+      if (presence?.status === "skipped") continue;
       if (presence?.status === "found") {
         counts.alreadyInTally += 1;
       } else if (isIncoming && readyPostingIds.has(transaction.id)) {
@@ -3880,10 +3903,11 @@ export function BankStatementsPage() {
     validTransactions,
   ]);
   const reviewWorkStatusCounts = useMemo(() => {
-    const counts = { needsAction: 0, ready: 0, completed: 0 };
+    const counts = { needsAction: 0, ready: 0, completed: 0, skipped: 0 };
     for (const transaction of validTransactions) {
       const completed = tallyPresenceByTransactionId[transaction.id]?.status === "found";
-      if (completed) counts.completed += 1;
+      if (tallyPresenceByTransactionId[transaction.id]?.status === "skipped") counts.skipped += 1;
+      else if (completed) counts.completed += 1;
       else if (readyPostingIds.has(transaction.id)) counts.ready += 1;
       else counts.needsAction += 1;
     }
@@ -3895,7 +3919,7 @@ export function BankStatementsPage() {
       const ledgerReview = getLedgerReviewFilterValue(transaction);
       const tallyResult = getTallyResultFilterValue(tallyPresenceByTransactionId[transaction.id]);
       const completed = tallyPresenceByTransactionId[transaction.id]?.status === "found";
-      const workStatus: Exclude<ReviewWorkStatusFilter, "all"> | null = completed
+      const workStatus: Exclude<ReviewWorkStatusFilter, "all"> | null = tallyPresenceByTransactionId[transaction.id]?.status === "skipped" ? "skipped" : completed
         ? "completed"
         : readyPostingIds.has(transaction.id) ? "ready" : "needs_action";
       if (reviewWorkStatusFilter !== "all" && workStatus !== reviewWorkStatusFilter) {
@@ -4150,6 +4174,7 @@ export function BankStatementsPage() {
             ? `${readyPostingTransactions.length} ready to post`
             : heldPostingRowCount > 0
               ? "No entries ready"
+              : skippedByUserCount > 0 ? `${skippedByUserCount} skipped by you`
               : alreadyInTallyCount > 0
                 ? "All entries already in Tally"
                 : "Nothing to post";
@@ -4172,6 +4197,7 @@ export function BankStatementsPage() {
               ].filter(Boolean).join(" · ")
             : heldPostingRowCount > 0
               ? "Resolve the entries that need review."
+              : skippedByUserCount > 0 ? `${alreadyInTallyCount} already entered in Tally. No new vouchers are required.`
               : alreadyInTallyCount > 0
                 ? "No new vouchers are required."
                 : "No posting action is available.";
@@ -4187,13 +4213,13 @@ export function BankStatementsPage() {
       if (statementReviewDrawerLocked) return;
 
       setEditingLedgerIds(new Set());
-      if (postingAction === "outgoing") {
+      if (postingAction === "outgoing" || resolutionForRow(duplicateResolutions, transaction, bankLedgerName, transaction.selectedLedgerName)?.action === "separate") {
         setOutgoingReviewTransactionId(transaction.id);
       } else {
         setBillAllocationReviewTransactionId(transaction.id);
       }
     },
-    [ledgerMasters, statementReviewDrawerLocked, tallyPresenceByTransactionId]
+    [ledgerMasters, statementReviewDrawerLocked, tallyPresenceByTransactionId, duplicateResolutions, bankLedgerName]
   );
   useEffect(() => {
     setReviewPage(1);
@@ -4425,6 +4451,11 @@ export function BankStatementsPage() {
       null
     : null;
   const tallyResultReviewAlreadyInTally = tallyResultReviewDraft?.status === "found" && !tallyResultReviewDraft.duplicateInTally;
+  const reviewDuplicateDecision = outgoingReviewTransaction
+    ? resolutionForRow(duplicateResolutions, outgoingReviewTransaction, bankLedgerName, outgoingReviewTransaction.selectedLedgerName) : null;
+  const canChooseDuplicateResolution = Boolean(outgoingReviewTransaction && tallyResultReviewDraft?.status === "ambiguous" &&
+    !tallyResultReviewDraft.duplicateInTally && canResolveRepeatedPayment(outgoingReviewTransaction, validTransactions,
+      tallyResultReviewDraft.matches || [], bankLedgerName, outgoingReviewTransaction.selectedLedgerName));
   const tallyResultReviewIsIncoming = outgoingReviewTransaction
     ? isIncomingReceiptRow(outgoingReviewTransaction)
     : false;
@@ -5474,6 +5505,7 @@ export function BankStatementsPage() {
     );
 
     setPreview(payload);
+    setDuplicateResolutions(payload.duplicateResolutions || {});
     setAccount({
       bankName: payload.account.bankName ?? fallbackAccount.bankName,
       accountNumber: payload.account.accountNumber ?? fallbackAccount.accountNumber,
@@ -6150,11 +6182,14 @@ export function BankStatementsPage() {
       signal?: AbortSignal;
       billEligibleTransactionIds?: string[];
       asOfDate?: string | null;
+      duplicateDecisions?: Record<string, DuplicateDecision>;
     } = {}
   ) {
     if (!bankLedgerName.trim()) {
       throw new Error("Select the Tally bank ledger before checking the statement.");
     }
+    const decisions = options.duplicateDecisions || duplicateResolutions;
+    const decisionFor = (row: ReviewTransaction) => resolutionForRow(decisions, row, bankLedgerName, row.selectedLedgerName);
     const relevantLedgerNames = Array.from(
       new Set(
         [
@@ -6169,6 +6204,7 @@ export function BankStatementsPage() {
     );
     const result = await runCashDiscountLiveRequest<{
       transactions?: Array<Record<string, unknown>>;
+      duplicateResolutionVersion?: number;
       balanceProof?: Record<string, unknown>;
       billLedgerNames?: string[];
       openBillsByLedger?: Record<string, unknown>;
@@ -6191,7 +6227,7 @@ export function BankStatementsPage() {
         includeBalanceProof: false,
         billEligibleTransactionIds: options.billEligibleTransactionIds,
         asOfDate: options.asOfDate || undefined,
-        transactions: rows.map((transaction) => {
+        transactions: rows.filter(transaction => decisionFor(transaction)?.action !== "skip").map((transaction) => {
             const incoming = isIncomingReceiptRow(transaction);
             const debitAmount = parseNumber(transaction.debitAmount) ?? 0;
             const creditAmount = parseNumber(transaction.creditAmount) ?? 0;
@@ -6208,12 +6244,16 @@ export function BankStatementsPage() {
                 ? null
                 : transaction.selectedLedgerName,
               narration: transaction.description,
-              referenceNumber: transaction.referenceNumber || getTransactionReference(transaction),
+              referenceNumber: transaction.referenceNumber || getTransactionReference(transaction) || recordedTrackingReference(transaction, persistedPostedTransactions),
+              bankReferenceNumber: getTransactionReference(transaction) || null,
+              referenceSource: getTransactionReference(transaction) ? "bank" : "generated",
+              ...(decisionFor(transaction)?.action === "separate" ? { duplicateResolution: decisionFor(transaction) } : {}),
             };
         }),
       },
     });
     const resultRows = Array.isArray(result.transactions) ? result.transactions : [];
+    setDuplicateResolutionSupported(Number(result.duplicateResolutionVersion) >= 1);
     const drafts = Object.fromEntries(resultRows.flatMap((value) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
       const row = value as Record<string, unknown>;
@@ -6238,6 +6278,11 @@ export function BankStatementsPage() {
       "openBillsByLedger"
     );
     Object.assign(drafts, savedPostingPresence(rows, persistedPostedTransactions));
+    for (const transaction of rows) {
+      if (decisionFor(transaction)?.action === "skip") drafts[transaction.id] = {
+        status: "skipped", label: "Skipped by you", reason: "You marked this as a repeated statement row. No Tally voucher will be created.", matches: [],
+      };
+    }
     setTallyPresenceByTransactionId(drafts);
     setOutgoingVerificationsByTransactionId(Object.fromEntries(
       rows.filter(isOutgoingPaymentRow).flatMap((transaction) => {
@@ -6342,7 +6387,7 @@ export function BankStatementsPage() {
     return { ...nextDrafts, ...completedDrafts };
   }
 
-  async function matchPendingBills() {
+  async function matchPendingBills(duplicateDecisions = duplicateResolutions) {
     setBillMatchingRequested(true);
     if (previewExtractionIncomplete) {
       const unresolvedPages = preview?.extractionDiagnostics?.unresolvedPages ?? [];
@@ -6393,6 +6438,7 @@ export function BankStatementsPage() {
         signal: matchController.signal,
         billEligibleTransactionIds,
         asOfDate,
+        duplicateDecisions,
       });
       const receiptTransactionsToMatch = billEligibleRows.filter(
         (transaction) => presenceDrafts[transaction.id]?.status === "missing"
@@ -6500,14 +6546,15 @@ export function BankStatementsPage() {
       }).length;
       const readyIncomingRows = Math.max(0, missingReceiptRows - incomingBillReviews);
       const readyOutgoingRows = Math.max(0, missingOutgoingRows - outgoingBillReviews);
-      const uncheckedRows = validTransactions.length - foundCount - ambiguousCount - missingReceiptRows - missingOutgoingRows;
+      const skippedRows = Object.values(presenceDrafts).filter(draft => draft.status === "skipped").length;
+      const uncheckedRows = validTransactions.length - foundCount - ambiguousCount - missingReceiptRows - missingOutgoingRows - skippedRows;
       const hasRowReviewIssues =
         duplicateCount > 0 ||
         ambiguousCount > 0 ||
         uncheckedRows > 0 || incomingBillReviews > 0 || outgoingBillReviews > 0;
       setBanner({
         tone: hasRowReviewIssues ? "info" : "success",
-        text: `Statement checked. ${readyIncomingRows > 0
+        text: `Statement checked.${skippedRows ? ` ${skippedRows} skipped by you.` : ""} ${readyIncomingRows > 0
           ? `${readyIncomingRows} receipt${readyIncomingRows === 1 ? " is" : "s are"} ready to post.`
           : "No new receipts to post."} ${readyOutgoingRows > 0
             ? `${readyOutgoingRows} outgoing payment${readyOutgoingRows === 1 ? " is" : "s are"} ready to post.`
@@ -6528,6 +6575,31 @@ export function BankStatementsPage() {
       setMatchingBills(false);
       if (matchAbortRef.current === matchController) matchAbortRef.current = null;
     }
+  }
+
+  async function resolveDuplicateChoice(action: "skip" | "separate" | "clear") {
+    const transaction = outgoingReviewTransaction;
+    if (!transaction || !preview || savingDuplicateDecision || (action !== "clear" && !canChooseDuplicateResolution)) return;
+    if (action === "separate" && !duplicateResolutionSupported) {
+      setPostingReviewNotice("Install connector 0.1.92 or later, then recheck Tally to use this choice."); return;
+    }
+    setSavingDuplicateDecision(true); setMatchingBills(true); setPostingReviewNotice(null);
+    try {
+      const response = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/duplicate-resolution`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+          action, confirmed: true, transactionId: transaction.id, rowKey: duplicateRowKey(transaction),
+          bankLedgerName, counterpartyLedgerName: transaction.selectedLedgerName, matches: tallyResultReviewDraft?.matches || [],
+        }),
+      });
+      if (!response.ok) throw new Error(await readError(response));
+      const result = await response.json() as { duplicateResolutions: Record<string, DuplicateDecision> };
+      setDuplicateResolutions(result.duplicateResolutions);
+      await matchPendingBills(result.duplicateResolutions);
+      setPostingReviewNotice(action === "skip" ? "Skipped by you. This row remains in the statement and will not create a voucher."
+        : action === "separate" ? "Your choice is saved. Review the bill allocation, then use Post to send this separate payment. Nothing has been posted yet."
+        : "Your choice was removed. The latest Tally check decides this row's status.");
+    } catch (error) { setPostingReviewNotice(error instanceof Error ? error.message : "Could not save your choice. Please try again."); }
+    finally { setSavingDuplicateDecision(false); setMatchingBills(false); }
   }
 
   async function sendToTally(mode: TallySendMode) {
@@ -8012,7 +8084,7 @@ export function BankStatementsPage() {
                             transaction.suggestedLedgerName ||
                             "-";
                           const billAllocation = billAllocationsByTransactionId[transaction.id];
-                          const outgoingVerification = outgoingVerificationsByTransactionId[transaction.id];
+                          const outgoingVerification = tallyPresenceByTransactionId[transaction.id] || outgoingVerificationsByTransactionId[transaction.id];
                           const tallyPresence = tallyPresenceByTransactionId[transaction.id];
                           const postedThisSession = postedTransactionIds.has(transaction.id);
                           const outgoingPayment = isOutgoingPaymentRow(transaction);
@@ -8928,7 +9000,13 @@ export function BankStatementsPage() {
                   checkedAt={tallyResultReviewDraft?.checkedAt}
                   checkFailed={tallyResultReviewDraft?.checkFailed}
                   canRecheck={needsPostingCheck.some(row => statementRowKey(row) === statementRowKey(outgoingReviewTransaction))}
-                  busy={recheckingPostings || tallyPostingInProgress || sending || matchingBills}
+                  busy={savingDuplicateDecision || recheckingPostings || tallyPostingInProgress || sending || matchingBills}
+                  canResolveDuplicate={canChooseDuplicateResolution}
+                  separatePaymentSupported={duplicateResolutionSupported}
+                  duplicateDecision={reviewDuplicateDecision?.action}
+                  onResolveDuplicate={action => void resolveDuplicateChoice(action)}
+                  onReviewAllocation={reviewDuplicateDecision?.action === "separate" && isBillMatchEligibleTransaction(outgoingReviewTransaction, ledgerMasters)
+                    ? () => { setOutgoingReviewTransactionId(null); setBillAllocationReviewTransactionId(outgoingReviewTransaction.id); } : undefined}
                   notice={postingReviewNotice}
                   ledgers={ledgerMasters.map(ledger => ledger.name)}
                   onRecheck={ledgerName => {
@@ -9061,7 +9139,7 @@ export function BankStatementsPage() {
                 <>
                   <Button
                     className="h-8 flex-1 rounded-lg border-[#ddd3c5] bg-white px-3 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] sm:flex-none"
-                    onClick={matchPendingBills}
+                    onClick={() => void matchPendingBills()}
                     disabled={
                       sending ||
                       matchingBills ||
