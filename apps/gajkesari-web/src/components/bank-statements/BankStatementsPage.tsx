@@ -9,10 +9,8 @@ import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   ArrowRight,
-  CalendarDays,
   Download,
   CheckCircle2,
-  Filter,
   Info,
   Landmark,
   Loader2,
@@ -24,6 +22,7 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { BankStatementReviewToolbar, type ReviewWorkStatusFilter, type ReviewTallyResultFilter, type ReviewLedgerFilter, type ReviewAllocationFilter } from "@/components/bank-statements/BankStatementReviewToolbar";
 import { BankPostingReview } from "@/components/bank-statements/BankPostingReview";
 import { recheckResultMessage } from "@/lib/bank-posting-review";
 import { Badge } from "@/components/ui/badge";
@@ -511,10 +510,6 @@ type QueueTransaction = {
 type MessageTone = "success" | "error" | "info";
 type ReviewStatusFilter = "all" | "matched" | "needs_review" | "suspense";
 type ReviewDirectionFilter = "all" | "debit" | "credit";
-type ReviewWorkStatusFilter = "all" | "needs_action" | "ready" | "completed";
-type ReviewTallyResultFilter = "all" | "pending" | "found" | "missing" | "review" | "failed";
-type ReviewLedgerFilter = "all" | "needs_action" | "automatic" | "manual" | "suspense";
-type ReviewAllocationFilter = "all" | "needs_action" | "ready" | "completed" | "not_applicable";
 type TallySendMode = "post_all" | "post_receipts" | "post_payments";
 type TallyPostingScope = "all" | "receipts" | "payments";
 
@@ -1328,11 +1323,9 @@ function getTransactionPartyTitle(transaction: ReviewTransaction) {
   const mode = getTransactionMode(transaction);
   if (mode === "ATM") return "ATM cash withdrawal";
   if (mode === "Bank charge") return "Bank charges";
-  if (mode === "Interest") return "Interest credit";
-  const matchedLedgerName = [transaction.selectedLedgerName, transaction.suggestedLedgerName]
-    .map((value) => value.trim())
-    .find((value) => value && !isSuspenseLedgerName(value));
-  if (matchedLedgerName) return matchedLedgerName;
+  if (mode === "Interest") return "Interest";
+  // Particulars describes the statement. Ledger selection must not rewrite
+  // the source party or supply a guessed name when extraction is empty.
   if (transaction.description.trim()) return transaction.description.trim();
   if (transaction.category && transaction.category !== "unknown") {
     return formatDataLabel(transaction.category);
@@ -1681,6 +1674,7 @@ function LedgerSearchSelect({
             setOpen(true);
             setActiveOptionIndex(0);
           }}
+          onClick={() => setOpen(true)}
           onFocus={(event) => {
             setOpen(true);
             setActiveOptionIndex(menuOptionIndexByName.get(normalizeName(value)) ?? 0);
@@ -1689,6 +1683,7 @@ function LedgerSearchSelect({
           onKeyDown={(event) => {
             if (event.key === "Escape") {
               event.preventDefault();
+              event.stopPropagation();
               setOpen(false);
               setQuery("");
               setHasSearchStarted(false);
@@ -1742,9 +1737,9 @@ function LedgerSearchSelect({
                       data-ledger-option-index={optionIndex}
                       id={`bank-ledger-option-${optionIndex}`}
                       key={option.name}
+                      onClick={() => chooseLedger(option.name)}
                       onMouseDown={(event) => {
                         event.preventDefault();
-                        chooseLedger(option.name);
                       }}
                       role="option"
                       type="button"
@@ -1954,7 +1949,7 @@ function LedgerReviewSelect({
       if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
 
       setOpen(false);
-      startTransition(onCancel);
+      onCancel();
     }
 
     document.addEventListener("pointerdown", handleOutsidePointerDown, true);
@@ -1973,6 +1968,7 @@ function LedgerReviewSelect({
       id="transaction-ledger-listbox"
       aria-label="Choose Tally ledger"
       className="fixed z-[1000] overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-2xl"
+      onClick={(event) => event.stopPropagation()}
       ref={popoverRef}
       role="listbox"
       style={{
@@ -2004,9 +2000,9 @@ function LedgerReviewSelect({
                   data-ledger-option-index={optionIndex}
                   id={`transaction-ledger-option-${optionIndex}`}
                   key={option.key}
+                  onClick={() => selectOption(option)}
                   onMouseDown={(event) => {
                     event.preventDefault();
-                    selectOption(option);
                   }}
                   role="option"
                   type="button"
@@ -2055,7 +2051,7 @@ function LedgerReviewSelect({
   ) : null;
 
   return (
-    <div className="relative" ref={rootRef}>
+    <div className="relative" onClick={(event) => event.stopPropagation()} ref={rootRef}>
       <div className="relative">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
         <input
@@ -2073,8 +2069,10 @@ function LedgerReviewSelect({
               nextTarget instanceof Node &&
               (rootRef.current?.contains(nextTarget) || popoverRef.current?.contains(nextTarget))
             ) return;
+            // The toggle owns closing or switching editors; blur must not race its click.
+            if (nextTarget instanceof Element && nextTarget.closest("[data-ledger-editor-toggle]")) return;
             setOpen(false);
-            startTransition(onCancel);
+            onCancel();
           }}
           onChange={(event) => {
             setQuery(event.target.value);
@@ -2082,6 +2080,7 @@ function LedgerReviewSelect({
             setActiveOptionIndex(0);
             openMenu();
           }}
+          onClick={openMenu}
           onFocus={(event) => {
             setOpen(true);
             event.currentTarget.select();
@@ -2089,8 +2088,9 @@ function LedgerReviewSelect({
           onKeyDown={(event) => {
             if (event.key === "Escape") {
               event.preventDefault();
+              event.stopPropagation();
               setOpen(false);
-              startTransition(onCancel);
+              onCancel();
               return;
             }
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -2271,8 +2271,8 @@ function getBillAllocationSubtext(
       !isBillMatchEligibleTransaction(transaction, ledgerMasters)
     ) {
       return isSuspenseLedgerName(transaction.selectedLedgerName)
-        ? "Will post to Suspense · Bill matching not applicable"
-        : "Bill matching not applicable";
+        ? "Will post to Suspense"
+        : "";
     }
     return "";
   }
@@ -3518,6 +3518,12 @@ export function BankStatementsPage() {
     () => new Map(ledgerMasters.map((ledger) => [normalizeName(ledger.name), ledger])),
     [ledgerMasters]
   );
+  const hasStatementPayments = validTransactions.some(isOutgoingPaymentRow);
+  const hasStatementReceipts = validTransactions.some(isIncomingReceiptRow);
+  const hasMixedStatementDirections = hasStatementPayments && hasStatementReceipts;
+  const hasReceiptAllocations = validTransactions.some(transaction =>
+    isIncomingReceiptRow(transaction) && isBillMatchEligibleTransaction(transaction, ledgerMasters)
+  );
   const ignoredStatementRowCount = Math.max(0, transactions.length - validTransactions.length);
   const previewExtractionIncomplete = isPreviewExtractionIncomplete(preview);
 
@@ -3856,7 +3862,6 @@ export function BankStatementsPage() {
   },
     [billAllocationsByTransactionId, ledgerMasters, outgoingTransactionsNeedingPost, tallyCheckAttempted]
   );
-  const blockingPaymentBillAllocationCount = blockingPaymentBillAllocationTransactions.length;
   const partyBillAllocationReviewTransactions = useMemo(
     () =>
       transactionsNeedingTallyWork.filter((transaction) =>
@@ -3985,6 +3990,14 @@ export function BankStatementsPage() {
   const filteredTransactionIndexById = useMemo(
     () => new Map(filteredTransactions.map((transaction, index) => [transaction.id, index])),
     [filteredTransactions]
+  );
+  const billAllocationReviewTransactions = useMemo(
+    () => partyBillAllocationReviewTransactions.filter((transaction) =>
+      filteredTransactionIndexById.has(transaction.id) ||
+      // Keep the open row as a navigation anchor if editing removes it from a filter.
+      transaction.id === billAllocationReviewTransactionId
+    ),
+    [partyBillAllocationReviewTransactions, filteredTransactionIndexById, billAllocationReviewTransactionId]
   );
   const visibleReviewTransactions = useMemo(
     () => {
@@ -4126,9 +4139,10 @@ export function BankStatementsPage() {
     transactionOutcomeCounts.needsAttention === 0 &&
     transactionOutcomeCounts.receiptsToCreate === 0 &&
     transactionOutcomeCounts.paymentsToCreate === 0;
-  const selectedPostingTransactions = tallyPostingScope === "receipts"
+  const effectivePostingScope = hasMixedStatementDirections ? tallyPostingScope : "all";
+  const selectedPostingTransactions = effectivePostingScope === "receipts"
     ? readyReceiptTransactions
-    : tallyPostingScope === "payments"
+    : effectivePostingScope === "payments"
       ? readyPaymentTransactions
       : readyPostingTransactions;
   const selectedPostingMissingLedgerCount = selectedPostingTransactions.filter(
@@ -4172,7 +4186,10 @@ export function BankStatementsPage() {
         : uncheckedTallyPresenceCount > 0
           ? tallyCheckMessage
           : readyPostingTransactions.length > 0
-            ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
+            ? [
+                newReceiptCount > 0 ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"}` : "",
+                missingOutgoingCount > 0 ? `${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}` : "",
+              ].filter(Boolean).join(" · ")
             : heldPostingRowCount > 0
               ? "Resolve the entries that need review."
               : alreadyInTallyCount > 0
@@ -4198,16 +4215,6 @@ export function BankStatementsPage() {
     },
     [ledgerMasters, statementReviewDrawerLocked, tallyPresenceByTransactionId]
   );
-  const activeReviewFilterCount = [
-    reviewSearch.trim(),
-    reviewWorkStatusFilter !== "all" ? reviewWorkStatusFilter : "",
-    reviewTallyResultFilter !== "all" ? reviewTallyResultFilter : "",
-    reviewLedgerFilter !== "all" ? reviewLedgerFilter : "",
-    reviewDirectionFilter !== "all" ? reviewDirectionFilter : "",
-    tallyCheckAttempted && reviewAllocationFilter !== "all" ? reviewAllocationFilter : "",
-    reviewDateFrom,
-    reviewDateTo,
-  ].filter(Boolean).length;
   useEffect(() => {
     setReviewPage(1);
   }, [
@@ -4315,7 +4322,7 @@ export function BankStatementsPage() {
 
       if (event.altKey && event.key.toLowerCase() === "f") {
         event.preventDefault();
-        setReviewFiltersOpen(true);
+        setReviewFiltersOpen(false);
         window.requestAnimationFrame(() => reviewSearchInputRef.current?.focus());
         return;
       }
@@ -4402,10 +4409,12 @@ export function BankStatementsPage() {
     ? isOutgoingPaymentRow(billAllocationReviewTransaction)
     : false;
   const billAllocationReviewIndex = billAllocationReviewTransaction
-    ? partyBillAllocationReviewTransactions.findIndex(
+    ? billAllocationReviewTransactions.findIndex(
         (transaction) => transaction.id === billAllocationReviewTransaction.id
       )
     : -1;
+  const billAllocationReviewHasNext = billAllocationReviewIndex >= 0 &&
+    billAllocationReviewIndex < billAllocationReviewTransactions.length - 1;
   const filteredBillAllocationCandidates = useMemo(() => {
     const bills = billAllocationReviewDraft?.candidateBills ?? [];
     const query = normalizeName(billAllocationSearch);
@@ -5281,10 +5290,31 @@ export function BankStatementsPage() {
   }
 
   function openAdjacentBillAllocation(direction: -1 | 1) {
-    if (billAllocationReviewIndex < 0 || partyBillAllocationReviewTransactions.length === 0) return;
+    if (billAllocationReviewIndex < 0) return;
     const nextIndex = billAllocationReviewIndex + direction;
-    const next = partyBillAllocationReviewTransactions[nextIndex];
-    if (next) setBillAllocationReviewTransactionId(next.id);
+    const next = billAllocationReviewTransactions[nextIndex];
+    if (!next) return;
+
+    selectReviewTransaction(next.id);
+    setReviewActionStage("posting");
+    setBillAllocationReviewTransactionId(next.id);
+    const tableIndex = filteredTransactionIndexById.get(next.id);
+    if (tableIndex !== undefined) {
+      const nextPage = Math.floor(tableIndex / rowsPerPage) + 1;
+      setReviewPage((current) => (current === nextPage ? current : nextPage));
+      scrollReviewTransactionIntoView(next.id);
+    }
+  }
+
+  function completeBillAllocationReview() {
+    if (!billAllocationReviewDraft || billAllocationReviewDraft.requiresUserReview ||
+      Math.abs(billAllocationReviewDraft.unallocatedAmount) >= 0.01) return;
+
+    if (billAllocationReviewHasNext) {
+      openAdjacentBillAllocation(1);
+    } else {
+      closeBillAllocationReview();
+    }
   }
 
   function completePostingReview(transactionId: string) {
@@ -7927,242 +7957,32 @@ export function BankStatementsPage() {
 
               </div>
               <div className="overflow-hidden border-b border-[#e5ddd0] bg-transparent">
-                <div className="border-b border-[#e5ddd0] px-4 py-2.5">
-                  <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
-                    <div className="flex flex-wrap items-center gap-2.5">
-                      <button
-                        className={`inline-flex h-8 w-fit items-center gap-1.5 rounded-lg border px-3 text-[11px] font-bold transition-all ${
-                          reviewFiltersOpen || activeReviewFilterCount > 0
-                            ? "border-amber-300 bg-amber-50 text-amber-800"
-                            : "border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
-                        }`}
-                        onClick={() => setReviewFiltersOpen((current) => !current)}
-                        type="button"
-                      >
-                        <Filter className="h-3.5 w-3.5" />
-                        Filters
-                        {activeReviewFilterCount > 0 ? (
-                          <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#2d2d2d] px-1 text-[9px] text-white">
-                            {activeReviewFilterCount}
-                          </span>
-                        ) : null}
-                      </button>
-                      <span className="text-[11px] font-bold text-slate-400">
-                        {filteredTransactions.length === validTransactions.length
-                          ? `${validTransactions.length} transaction${validTransactions.length === 1 ? "" : "s"}`
-                          : `${filteredTransactions.length} of ${validTransactions.length} transactions`}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 rounded-lg border border-[#e5ddd0] bg-[#faf8f4]/70 px-3 py-1.5 text-[10px] font-bold">
-                      <span className="inline-flex items-center gap-1.5 text-slate-700">
-                        <span className="h-1.5 w-1.5 rounded-full bg-slate-500" />
-                        {validTransactions.length} statement entries
-                      </span>
-                      <span className={`inline-flex items-center gap-1.5 ${heldPostingRowCount > 0 ? "text-amber-800" : "text-slate-600"}`}>
-                        {tallyCheckMessage}
-                      </span>
-                      {uncheckedTallyPresenceCount === 0 && !statementDoneSummary ? (
-                        <>
-                          <span className="inline-flex items-center gap-1.5 text-emerald-800">
-                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                            {alreadyInTallyCount} in Tally
-                          </span>
-                          <span className="inline-flex items-center gap-1.5 text-blue-800">
-                            <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />
-                            {transactionOutcomeCounts.receiptsToCreate} receipt{transactionOutcomeCounts.receiptsToCreate === 1 ? "" : "s"} to create
-                          </span>
-                          <span className={`inline-flex items-center gap-1.5 ${blockingPaymentBillAllocationCount > 0 ? "text-amber-800" : "text-blue-800"}`}>
-                            <span className={`h-1.5 w-1.5 rounded-full ${blockingPaymentBillAllocationCount > 0 ? "bg-amber-500" : "bg-blue-500"}`} />
-                            {transactionOutcomeCounts.paymentsToCreate} payment{transactionOutcomeCounts.paymentsToCreate === 1 ? "" : "s"} to create
-                          </span>
-                          <span className={`inline-flex items-center gap-1.5 ${transactionOutcomeCounts.needsAttention > 0 ? "text-amber-800" : "text-emerald-800"}`}>
-                            <span className={`h-1.5 w-1.5 rounded-full ${transactionOutcomeCounts.needsAttention > 0 ? "bg-amber-500" : "bg-emerald-500"}`} />
-                            {transactionOutcomeCounts.needsAttention} need review
-                          </span>
-                        </>
-                      ) : null}
-                    </div>
-                  </div>
-                  {reviewFiltersOpen ? (
-                    <div className="mt-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/70 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
-                      <div className="mb-3 flex items-start justify-between gap-3 border-b border-[#e5ddd0] pb-2.5">
-                        <div>
-                          <div className="text-[11px] font-extrabold text-[#1a1a1a]">Filter transactions</div>
-                          <div className="mt-0.5 text-[9px] font-semibold text-slate-400">
-                            Combine search, workflow, Tally, ledger, and period filters.
-                          </div>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-1.5">
-                          <button
-                            className="h-7 rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[9px] font-bold text-[#5a5046] transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-40"
-                            disabled={activeReviewFilterCount === 0}
-                            onClick={() => {
-                              setReviewSearch("");
-                              setReviewWorkStatusFilter("all");
-                              setReviewTallyResultFilter("all");
-                              setReviewLedgerFilter("all");
-                              setReviewDirectionFilter("all");
-                              setReviewAllocationFilter("all");
-                              setReviewDateFrom("");
-                              setReviewDateTo("");
-                            }}
-                            type="button"
-                          >
-                            Clear all
-                          </button>
-                          <button
-                            aria-label="Close transaction filters"
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#e5ddd0] bg-white text-slate-400 transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a]"
-                            onClick={() => setReviewFiltersOpen(false)}
-                            type="button"
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="grid gap-2.5 md:grid-cols-2 xl:grid-cols-12 xl:items-end">
-                        <label className="block xl:col-span-4">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Search</span>
-                          <div className="relative mt-1">
-                            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                            <input
-                              className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none placeholder:text-slate-400 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
-                              onChange={(event) => setReviewSearch(event.target.value)}
-                              placeholder="Narration, amount, ledger or reference"
-                              ref={reviewSearchInputRef}
-                              value={reviewSearch}
-                            />
-                          </div>
-                        </label>
-
-                        <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Work status</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewWorkStatusFilter(event.target.value as ReviewWorkStatusFilter)}
-                            title="Needs action contains only unresolved close ledger matches."
-                            value={reviewWorkStatusFilter}
-                          >
-                            <option value="all">All ({validTransactions.length})</option>
-                            <option value="needs_action">Needs action ({reviewWorkStatusCounts.needsAction})</option>
-                            <option value="ready">Ready ({reviewWorkStatusCounts.ready})</option>
-                            <option value="completed">Completed ({reviewWorkStatusCounts.completed})</option>
-                          </select>
-                        </label>
-
-                        <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Tally status</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewTallyResultFilter(event.target.value as ReviewTallyResultFilter)}
-                            value={reviewTallyResultFilter}
-                          >
-                            <option value="all">All results</option>
-                            <option value="pending">Check pending</option>
-                            <option value="found">Found in Tally</option>
-                            <option value="missing">Not found</option>
-                            <option value="review">Ambiguous / duplicate</option>
-                            <option value="failed">Failed / cannot check</option>
-                          </select>
-                        </label>
-
-                        <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Ledger review</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewLedgerFilter(event.target.value as ReviewLedgerFilter)}
-                            value={reviewLedgerFilter}
-                          >
-                            <option value="all">All reviews</option>
-                            <option value="needs_action">Close match action</option>
-                            <option value="automatic">Auto matched</option>
-                            <option value="manual">Manually confirmed</option>
-                            <option value="suspense">Suspense / no match</option>
-                          </select>
-                        </label>
-
-                        <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Money flow</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewDirectionFilter(event.target.value as ReviewDirectionFilter)}
-                            value={reviewDirectionFilter}
-                          >
-                            <option value="all">Payments + receipts</option>
-                            <option value="debit">Payments only</option>
-                            <option value="credit">Receipts only</option>
-                          </select>
-                        </label>
-
-                        <fieldset className={`min-w-0 rounded-lg border border-[#e5ddd0] bg-white px-2.5 pb-2 pt-1.5 md:col-span-2 ${tallyCheckAttempted ? "xl:col-span-8" : "xl:col-span-12"}`}>
-                          <legend className="px-1 text-[9px] font-bold uppercase tracking-wider text-slate-400">Statement period</legend>
-                          <div className="grid gap-2 sm:grid-cols-2">
-                            <label className="block min-w-0">
-                              <span className="text-[8px] font-bold uppercase tracking-wide text-slate-400">From</span>
-                              <div className="relative mt-0.5">
-                                <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                                <input
-                                  className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-[#fcfbfa] px-2.5 pl-8 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                                  onChange={(event) => setReviewDateFrom(event.target.value)}
-                                  ref={reviewPeriodInputRef}
-                                  type="date"
-                                  value={reviewDateFrom}
-                                />
-                              </div>
-                            </label>
-                            <label className="block min-w-0">
-                              <span className="text-[8px] font-bold uppercase tracking-wide text-slate-400">To</span>
-                              <div className="relative mt-0.5">
-                                <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                                <input
-                                  className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-[#fcfbfa] px-2.5 pl-8 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                                  onChange={(event) => setReviewDateTo(event.target.value)}
-                                  type="date"
-                                  value={reviewDateTo}
-                                />
-                              </div>
-                            </label>
-                          </div>
-                        </fieldset>
-
-                        {tallyCheckAttempted ? (
-                          <label className="block md:col-span-2 xl:col-span-4">
-                            <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Receipt allocation</span>
-                            <select
-                              className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                              onChange={(event) => setReviewAllocationFilter(event.target.value as ReviewAllocationFilter)}
-                              value={reviewAllocationFilter}
-                            >
-                              <option value="all">All allocations</option>
-                              <option value="needs_action">Needs allocation action</option>
-                              <option value="ready">Ready to post</option>
-                              <option value="completed">Allocation completed</option>
-                              <option value="not_applicable">Not applicable</option>
-                            </select>
-                          </label>
-                        ) : null}
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-                <div ref={reviewTableScrollRef} className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-230px)] [scrollbar-gutter:stable]">
-                  <table className="w-full min-w-full table-fixed border-collapse text-left md:min-w-[900px] xl:min-w-[1120px]">
+                <BankStatementReviewToolbar
+                  total={validTransactions.length} visible={filteredTransactions.length}
+                  counts={reviewWorkStatusCounts} checkAttempted={tallyCheckAttempted} checkMessage={tallyCheckMessage}
+                  hasPayments={hasStatementPayments} hasReceipts={hasStatementReceipts} hasReceiptAllocations={hasReceiptAllocations}
+                  open={reviewFiltersOpen} onOpenChange={setReviewFiltersOpen}
+                  search={reviewSearch} onSearchChange={setReviewSearch} searchRef={reviewSearchInputRef} periodRef={reviewPeriodInputRef}
+                  workStatus={reviewWorkStatusFilter} onWorkStatusChange={setReviewWorkStatusFilter}
+                  tallyStatus={reviewTallyResultFilter} onTallyStatusChange={setReviewTallyResultFilter}
+                  ledger={reviewLedgerFilter} onLedgerChange={setReviewLedgerFilter}
+                  direction={reviewDirectionFilter} onDirectionChange={setReviewDirectionFilter}
+                  allocation={reviewAllocationFilter} onAllocationChange={setReviewAllocationFilter}
+                  from={reviewDateFrom} to={reviewDateTo} onFromChange={setReviewDateFrom} onToChange={setReviewDateTo}
+                />
+                <div ref={reviewTableScrollRef} className="overflow-x-auto overflow-y-auto max-h-[calc(100dvh-300px)] min-h-[120px] [scrollbar-gutter:stable]">
+                  <table className={`w-full min-w-[620px] table-fixed border-collapse text-left ${hasMixedStatementDirections ? "md:min-w-[900px] xl:min-w-[1120px]" : "md:min-w-[800px] xl:min-w-[1000px]"}`}>
                     <thead className="sticky top-0 z-20">
                       <tr className="border-b border-[#d8cbbb] bg-[#f7f3ed] text-[9px] font-extrabold uppercase tracking-[0.1em] text-[#776b5f]">
-                        <th className="w-[74px] px-3 py-2">Date</th>
-                        <th className="w-auto px-2 py-2 sm:px-3 md:w-[28%]">Particulars</th>
-                        <th className="hidden w-[84px] px-2 py-2 lg:table-cell">Vch type</th>
+                        <th className="w-[72px] px-3 py-2">Date</th>
+                        <th className="w-auto px-2 py-2 sm:px-3 md:w-[30%]">Particulars</th>
+                        <th className="hidden w-[72px] px-2 py-2 lg:table-cell">Vch type</th>
                         <th className="hidden w-[120px] px-2 py-2 xl:table-cell">Reference</th>
-                        <th className="hidden w-[104px] px-3 py-2 text-right md:table-cell">
-                          <span className="block">Payment</span>
-                        </th>
-                        <th className="hidden w-[104px] px-3 py-2 text-right md:table-cell">
-                          <span className="block">Receipt</span>
-                        </th>
+                        {hasStatementPayments ? <th className="hidden w-[96px] px-3 py-2 text-right md:table-cell">Payment</th> : null}
+                        {hasStatementReceipts ? <th className="hidden w-[96px] px-3 py-2 text-right md:table-cell">Receipt</th> : null}
                         <th className="w-[92px] px-2 py-2 text-right md:hidden">Amount</th>
                         <th className="hidden w-[23%] px-3 py-2 md:table-cell">Tally ledger</th>
-                        <th className="w-[160px] px-2 py-2 sm:w-[200px] sm:px-3">Posting status</th>
+                        <th className="w-[144px] px-2 py-2 sm:w-[176px] sm:px-3">Posting status</th>
                         <th className="sticky right-0 w-10 border-l border-[#e5ddd0] bg-[#f7f3ed] px-1 py-2" aria-label="Edit ledger"></th>
                       </tr>
                     </thead>
@@ -8235,7 +8055,7 @@ export function BankStatementsPage() {
                               onClick={(event) => {
                                 const target = event.target;
                                 if (
-                                  target instanceof HTMLElement &&
+                                  target instanceof Element &&
                                   target.closest("button, input, select, textarea, [role='button']")
                                 ) {
                                   return;
@@ -8269,7 +8089,7 @@ export function BankStatementsPage() {
                                 }}
                                 title={narrationExpanded ? "Click to collapse narration" : "Click to view full narration"}
                               >
-                                <div className="truncate text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]" title={partyTitle}>
+                                <div className="line-clamp-2 break-words text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]" title={partyTitle}>
                                   {partyTitle}
                                 </div>
                                 <div
@@ -8319,12 +8139,12 @@ export function BankStatementsPage() {
                               <td className="hidden px-2 py-2 align-top text-[9px] font-bold leading-[12px] text-slate-600 xl:table-cell" title={reference}>
                                 <span className="block truncate">{reference || "-"}</span>
                               </td>
-                              <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-red-600 md:table-cell">
+                              {hasStatementPayments ? <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-red-600 md:table-cell">
                                 {debit || "-"}
-                              </td>
-                              <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-emerald-700 md:table-cell">
+                              </td> : null}
+                              {hasStatementReceipts ? <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-emerald-700 md:table-cell">
                                 {credit || "-"}
-                              </td>
+                              </td> : null}
                               <td className={`px-2 py-2 align-top text-right text-[10px] font-extrabold leading-[14px] tabular-nums md:hidden ${debit ? "text-red-600" : "text-emerald-700"}`}>
                                 {debit || credit || "-"}
                                 <span className="ml-0.5 text-[7px] font-bold uppercase text-slate-400">{debit ? "Dr" : credit ? "Cr" : ""}</span>
@@ -8379,7 +8199,7 @@ export function BankStatementsPage() {
                                   />
                                 ) : (
                                   <div className="block max-w-full text-left">
-                                    <span className="block truncate text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]" title={ledgerDisplayName}>
+                                    <span className="line-clamp-2 break-words text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]" title={ledgerDisplayName}>
                                       {ledgerDisplayName}
                                     </span>
                                     <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[8px] font-bold leading-[11px] text-slate-500">
@@ -8473,15 +8293,15 @@ export function BankStatementsPage() {
                                         setBillAllocationReviewTransactionId(transaction.id);
                                       }
                                     }}
-                                    title="Review bill allocation"
+                                    title={readyPostingIds.has(transaction.id) ? "Ready to post · view posting details" : "Review bill allocation"}
                                     type="button"
                                   >
                                     <span
                                       className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getBillAllocationBadgeClass(transaction, ledgerMasters, billAllocation)}`}
                                     >
-                                      {getBillAllocationBadgeText(transaction, ledgerMasters, billAllocation)}
+                                      {readyPostingIds.has(transaction.id) && !billAllocation ? (tallyCheckAttempted ? "Ready to post" : "Prepared") : getBillAllocationBadgeText(transaction, ledgerMasters, billAllocation)}
                                     </span>
-                                    {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters) ? (
+                                    {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters) && (billAllocation || isSuspenseLedgerName(transaction.selectedLedgerName)) ? (
                                       <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={billAllocation?.reason || "Bill matching is not required for this ledger."}>
                                         {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters)}
                                       </span>
@@ -8501,7 +8321,7 @@ export function BankStatementsPage() {
                                     setReviewActionStage("ledger");
                                     setEditingLedgerIds((current) => {
                                       const next = new Set(current);
-                                      if (next.has(transaction.id)) next.delete(transaction.id);
+                                      if (isEditingLedger) next.delete(transaction.id);
                                       else return new Set([transaction.id]);
                                       return next;
                                     });
@@ -8522,8 +8342,8 @@ export function BankStatementsPage() {
                 </div>
 
                 <div className="flex min-h-11 flex-col gap-2 border-t border-[#e5ddd0] px-2 py-2 text-xs font-semibold text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-4">
-                  <div className="flex items-center gap-2">
-                    <span className="text-slate-400 font-medium">Rows per page</span>
+                  {validTransactions.length > 25 ? <div className="flex items-center gap-2">
+                    <span className="text-slate-500 font-medium">Rows per page</span>
                     <select
                       className="h-7 rounded-lg border border-[#e5ddd0] bg-white px-2 text-xs font-bold text-[#5a5046] outline-none"
                       onChange={(event) => {
@@ -8531,6 +8351,7 @@ export function BankStatementsPage() {
                         setReviewPage(1);
                       }}
                       value={rowsPerPage}
+                      aria-label="Rows per page"
                     >
                       {[25, 50, 100, 200].map((value) => (
                         <option key={value} value={value}>
@@ -8538,15 +8359,15 @@ export function BankStatementsPage() {
                         </option>
                       ))}
                     </select>
-                  </div>
+                  </div> : null}
                   <div className="flex max-w-full flex-wrap items-center justify-end gap-2 sm:gap-3">
                     <span className="text-slate-400">
-                      Showing {reviewRangeStart}-{reviewRangeEnd} of {filteredTransactions.length}
+                      {reviewPageCount > 1 ? `Showing ${reviewRangeStart}-${reviewRangeEnd} of ${filteredTransactions.length}` : `${filteredTransactions.length} ${filteredTransactions.length === 1 ? "transaction" : "transactions"}`}
                       {ignoredStatementRowCount > 0
                         ? ` (${ignoredStatementRowCount} summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored)`
                         : ""}
                     </span>
-                    <div className="flex items-center gap-1.5">
+                    {reviewPageCount > 1 ? <div className="flex items-center gap-1.5">
                       <button
                         className="h-7 rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-40"
                         disabled={reviewPage <= 1}
@@ -8566,7 +8387,7 @@ export function BankStatementsPage() {
                       >
                         Next
                       </button>
-                    </div>
+                    </div> : null}
                   </div>
                 </div>
               </div>
@@ -8595,8 +8416,7 @@ export function BankStatementsPage() {
                           <button
                             className="h-6 px-2 text-[8px] font-extrabold uppercase tracking-wide transition hover:bg-white/60 disabled:opacity-35"
                             disabled={
-                              billAllocationReviewIndex < 0 ||
-                              billAllocationReviewIndex >= partyBillAllocationReviewTransactions.length - 1
+                              !billAllocationReviewHasNext
                             }
                             onClick={() => openAdjacentBillAllocation(1)}
                             type="button"
@@ -9074,11 +8894,12 @@ export function BankStatementsPage() {
                         <Button
                           autoFocus={Boolean(billAllocationReviewDraft && !billAllocationReviewDraft.requiresUserReview)}
                           className="h-8 rounded-md bg-[#263b47] px-3 text-[10px] font-bold text-white shadow-none transition hover:bg-[#172a35]"
-                          disabled={!billAllocationReviewDraft || billAllocationReviewDraft.requiresUserReview}
-                          onClick={() => completePostingReview(billAllocationReviewTransaction.id)}
+                          disabled={!billAllocationReviewDraft || billAllocationReviewDraft.requiresUserReview ||
+                            Math.abs(billAllocationReviewDraft.unallocatedAmount) >= 0.01}
+                          onClick={completeBillAllocationReview}
                           type="button"
                         >
-                          {(filteredTransactionIndexById.get(billAllocationReviewTransaction.id) ?? -1) < filteredTransactions.length - 1
+                          {billAllocationReviewHasNext
                             ? "Done & next"
                             : "Done"}
                         </Button>
@@ -9248,11 +9069,11 @@ export function BankStatementsPage() {
                     variant="outline"
                   >
                     {matchingBills ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                    Check Tally ({validTransactions.length})
+                    {matchingBills ? "Checking Tally" : tallyCheckAttempted ? "Recheck Tally" : "Check Tally"}
                   </Button>
                   {transactionsNeedingTallyWork.length > 0 ? (
                     <div className="flex flex-1 items-center sm:flex-none">
-                      <select
+                      {hasMixedStatementDirections ? <select
                         aria-label="Choose Tally posting scope"
                         className="h-8 max-w-[150px] rounded-l-lg border border-r-0 border-[#ddd3c5] bg-white px-2 text-[10px] font-bold text-[#5a5046] outline-none"
                         disabled={
@@ -9264,19 +9085,19 @@ export function BankStatementsPage() {
                         onChange={(event) => setTallyPostingScope(event.target.value as TallyPostingScope)}
                         value={tallyPostingScope}
                       >
-                        <option value="all">All ({readyPostingTransactions.length})</option>
+                        <option value="all">All ready entries ({readyPostingTransactions.length})</option>
                         <option disabled={newReceiptCount === 0} value="receipts">Receipts only ({newReceiptCount})</option>
                         <option disabled={missingOutgoingCount === 0} value="payments">Payments only ({missingOutgoingCount})</option>
-                      </select>
+                      </select> : null}
                       <Button
-                        className="h-8 flex-1 rounded-l-none rounded-r-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a] sm:flex-none"
+                        className={`h-8 flex-1 ${hasMixedStatementDirections ? "rounded-l-none rounded-r-lg" : "rounded-lg"} bg-[#2d2d2d] px-3 text-[10px] font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a] sm:flex-none`}
                         title={selectedPostingTransactions.length === 0
                           ? "No ready entries in this scope. Check Tally matches and resolve held rows."
                           : `Post ${selectedPostingTransactions.length} ready entries only; held rows will stay for review.`}
                         onClick={() => {
-                          const mode = tallyPostingScope === "receipts"
+                          const mode = effectivePostingScope === "receipts"
                             ? "post_receipts"
-                            : tallyPostingScope === "payments"
+                            : effectivePostingScope === "payments"
                               ? "post_payments"
                               : "post_all";
                           void sendToTally(

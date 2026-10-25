@@ -59,5 +59,5 @@ test("the verified company preloads and retains the full connector catalogue", (
   assert.match(page, /nonEmptyLedgerCataloguesRef/);
   assert.match(page, /The connector returned an empty ledger catalogue/);
   assert.match(page, /Loading all ledgers from the connector/);
-  assert.match(page, /bankLedgerVerified \? "Matched" : bankLedgerManuallyConfirmed \? "Selected" : "Chosen"/);
+  assert.match(page, /bankLedgerVerified \? "Account matched" : bankLedgerManuallyConfirmed \? "Selected" : "Chosen"/);
 });
