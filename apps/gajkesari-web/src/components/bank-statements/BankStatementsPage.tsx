@@ -39,6 +39,7 @@ import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, stat
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
+import { validateAllocationBatch, type BillSourceState } from "@/lib/bank-statement-allocation-validation";
 import { resolveBankBillReference } from "@gajkesari/shared/lib/bank-bill-reference";
 import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
@@ -627,6 +628,7 @@ type BillAllocationDraft = {
   allocations: BillAllocationLine[];
   candidateBills: OpenBillReference[];
   existingAdvances: ExistingAdvanceReference[];
+  sourceBillState?: BillSourceState;
   requiresUserReview: boolean;
   isEligibleForPosting: boolean;
 };
@@ -2296,7 +2298,7 @@ function getBillAllocationSubtext(
   if (draft.status === "needs_review" || draft.status === "cannot_match_yet") {
     return `${formatCurrencyAmount(Math.max(0, draft.unallocatedAmount))} unallocated`;
   }
-  if (draft.status === "stale_data") return "Tally bill data changed";
+  if (draft.status === "stale_data") return "Review bill allocation before posting";
   if (draft.status === "post_failed") return "Open and retry posting";
   return "";
 }
@@ -2627,52 +2629,6 @@ function buildAdvanceReference(transaction: ReviewTransaction) {
 
 function isAllocationTotalValid(receiptAmount: number, totalAllocatedAmount: number) {
   return Math.abs(receiptAmount - totalAllocatedAmount) < 0.005;
-}
-
-function billStateSignature(
-  openBills: OpenBillReference[],
-  existingAdvances: ExistingAdvanceReference[]
-) {
-  const bills = openBills
-    .map((bill) => `${normalizeReferenceToken(bill.referenceName)}:${Number(bill.pendingAmount ?? 0).toFixed(2)}`)
-    .sort();
-  const advances = existingAdvances
-    .map((advance) => `${normalizeReferenceToken(advance.referenceName)}:${Number(advance.pendingAdvanceAmount ?? 0).toFixed(2)}`)
-    .sort();
-  return `${bills.join("|")}::${advances.join("|")}`;
-}
-
-function validateAllocationAgainstFreshBillState(
-  draft: BillAllocationDraft,
-  openBills: OpenBillReference[],
-  existingAdvances: ExistingAdvanceReference[]
-) {
-  const freshBillsByReference = new Map(
-    openBills.map((bill) => [normalizeReferenceToken(bill.referenceName), bill])
-  );
-  for (const allocation of draft.allocations) {
-    if (allocation.referenceType !== "Agst Ref") continue;
-    const freshBill = freshBillsByReference.get(normalizeReferenceToken(allocation.referenceName));
-    if (!freshBill) {
-      return `Bill ${allocation.referenceName} is no longer open in Tally.`;
-    }
-    if (Number(freshBill.pendingAmount ?? 0) + 0.005 < allocation.allocatedAmount) {
-      return `Bill ${allocation.referenceName} now has only ${formatCurrencyAmount(Number(freshBill.pendingAmount ?? 0))} pending.`;
-    }
-  }
-
-  const previousSignature = billStateSignature(draft.candidateBills, draft.existingAdvances);
-  const freshSignature = billStateSignature(openBills, existingAdvances);
-  if (draft.caseType !== "manual_review" && previousSignature !== freshSignature) {
-    return "Open bills or advances changed in Tally after the statement was checked.";
-  }
-  if (
-    draft.caseType === "manual_review" &&
-    billStateSignature([], draft.existingAdvances) !== billStateSignature([], existingAdvances)
-  ) {
-    return "Existing advances changed in Tally after the manual allocation was reviewed.";
-  }
-  return null;
 }
 
 function getAllocationCaseLabel(allocations: BillAllocationLine[], newAdvanceAmount: number, manual = false) {
@@ -6477,7 +6433,15 @@ export function BankStatementsPage() {
                 isEligibleForPosting: true,
               }
             : allocateBillsForTransaction(transaction, availableBills, data.existingAdvances);
-          nextDrafts[transaction.id] = draft;
+          nextDrafts[transaction.id] = {
+            ...draft,
+            // Preserve the unreserved Tally snapshot independently of the
+            // remaining bills used to plan this particular statement row.
+            sourceBillState: {
+              openBills: data.openBills.map(bill => ({ ...bill })),
+              existingAdvances: data.existingAdvances.map(advance => ({ ...advance })),
+            },
+          };
           workingBillsByLedger.set(ledgerKey, applyFifoAllocationsToBills(availableBills, draft.allocations));
         }
       }
@@ -6626,22 +6590,15 @@ export function BankStatementsPage() {
           .sort()
           .at(-1);
         const freshBillData = await fetchOpenBillsForLedgers(connection, ledgerNames, asOfDate);
-        const staleAllocations = billEligibleTransactions.flatMap((transaction) => {
-          const draft = billAllocationsByTransactionId[transaction.id];
-          const fresh = freshBillData.get(transaction.selectedLedgerName);
-          if (!draft || draft.status !== "ready_to_post") {
-            return [{ transaction, reason: "Bill allocation is no longer ready to post." }];
-          }
-          if (!fresh) {
-            return [{ transaction, reason: "Could not refresh the selected party ledger's open bills." }];
-          }
-          const reason = validateAllocationAgainstFreshBillState(
-            draft,
-            fresh.openBills,
-            fresh.existingAdvances
-          );
-          return reason ? [{ transaction, reason }] : [];
-        });
+        const billEligibleById = new Map(billEligibleTransactions.map(transaction => [transaction.id, transaction]));
+        const staleAllocations = validateAllocationBatch(
+          billEligibleTransactions.map(transaction => ({
+            transactionId: transaction.id,
+            ledgerName: transaction.selectedLedgerName,
+            draft: billAllocationsByTransactionId[transaction.id],
+          })),
+          freshBillData
+        ).map(({ transactionId, reason }) => ({ transaction: billEligibleById.get(transactionId)!, reason }));
         if (staleAllocations.length > 0) {
           setBillAllocationsByTransactionId((current) => {
             const next = { ...current };
@@ -6651,7 +6608,7 @@ export function BankStatementsPage() {
               next[transaction.id] = {
                 ...draft,
                 status: "stale_data",
-                caseLabel: "Tally Data Changed",
+                caseLabel: "Bill allocation needs review",
                 reason,
                 requiresUserReview: true,
                 isEligibleForPosting: false,
@@ -6659,24 +6616,19 @@ export function BankStatementsPage() {
             }
             return next;
           });
-          setOutgoingVerificationsByTransactionId({});
-          setTallyPresenceByTransactionId({});
           setTallyBalanceProof(null);
-          setTallyCheckAttempted(false);
           setBanner({
             tone: "error",
-            text: `Tally bill data changed for ${staleAllocations.length} row(s). Check Tally matches again before posting.`,
+            text: `${staleAllocations.length} ${staleAllocations.length === 1 ? "entry needs" : "entries need"} bill allocation review. Nothing was posted. Recheck Tally to update the allocations.`,
           });
           showToast("error", staleAllocations[0].reason);
           return;
         }
       } catch (error) {
-        setTallyCheckAttempted(false);
+        console.error("Live bill allocation check failed", error);
         setBanner({
           tone: "error",
-          text: error instanceof Error
-            ? `Could not revalidate live Tally bills: ${error.message}`
-            : "Could not revalidate live Tally bills. Check Tally matches again.",
+          text: "We could not check the latest bill balances. Nothing was posted. Keep Tally and the connector open, then try again.",
         });
         return;
       }
