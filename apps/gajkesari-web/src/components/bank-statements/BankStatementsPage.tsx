@@ -2303,6 +2303,31 @@ function getBillAllocationSubtext(
   return "";
 }
 
+function getReadyPostingSubtext(
+  transaction: ReviewTransaction,
+  ledgerMasters: TallyMaster[],
+  draft?: BillAllocationDraft | null
+) {
+  const entry = isOutgoingPaymentRow(transaction) ? "New payment" : "New receipt";
+  if (draft?.status === "ready_to_post") {
+    const bills = draft.allocations.filter((line) => line.referenceType === "Agst Ref");
+    const billAmount = bills.reduce((sum, line) => sum + line.allocatedAmount, 0);
+    if (bills.length === 0) {
+      return `Will post as an advance · ${formatCurrencyAmount(draft.newAdvanceAmount || draft.receiptAmount)}`;
+    }
+    const party = getPartyBillMatchContext(transaction, ledgerMasters).partyKind;
+    const billName = `${party ? `${party} ` : ""}bill${bills.length === 1 ? "" : "s"}`;
+    const fullSettlement = bills.every((line) => Math.abs(Number(line.pendingAmountAfterAllocation ?? NaN)) < 0.005);
+    const settlement = `Will ${fullSettlement ? "fully" : "partly"} settle ${bills.length} ${billName} · ${formatCurrencyAmount(billAmount)}`;
+    return draft.newAdvanceAmount > 0
+      ? `${settlement}; ${formatCurrencyAmount(draft.newAdvanceAmount)} as an advance`
+      : settlement;
+  }
+  return isSuspenseLedgerName(transaction.selectedLedgerName)
+    ? `${entry} · Will post to Suspense`
+    : entry;
+}
+
 function getBillAllocationClass(draft?: BillAllocationDraft | null) {
   if (!draft || draft.status === "not_applicable") return "border-[#e5ddd0] bg-white text-slate-500";
   if (draft.status === "ready_to_post") return "border-emerald-250 bg-emerald-50 text-emerald-800";
@@ -8189,7 +8214,7 @@ export function BankStatementsPage() {
                                         ? "Multiple entries in Tally"
                                         : tallyPresence.alreadyInTally === true || !postedThisSession
                                           ? "Already entered in Tally"
-                                          : "Posted successfully"}
+                                          : "Posted to Tally"}
                                     </span>
                                     <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={tallyPresence.reason}>
                                       {tallyPresence.duplicateInTally
@@ -8207,6 +8232,24 @@ export function BankStatementsPage() {
                                     <span className="self-start rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[9px] font-bold text-amber-800">{tallyPresence.label || "Needs checking in Tally"}</span>
                                     <span className="text-[9px] text-slate-500">{tallyPresence.reason || "Check again before sending"}</span>
                                     <span className="text-[9px] font-semibold text-amber-800 underline">View details</span>
+                                  </button>
+                                ) : readyPostingIds.has(transaction.id) && tallyCheckAttempted ? (
+                                  <button
+                                    className="flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
+                                    onClick={() => {
+                                      if (statementReviewDrawerLocked) return;
+                                      setReviewActionStage("posting");
+                                      openPostingReviewAction(transaction);
+                                    }}
+                                    title="Ready to post · view posting details"
+                                    type="button"
+                                  >
+                                    <span className="inline-flex min-h-5 max-w-full self-start items-center whitespace-nowrap rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide text-emerald-800">
+                                      Ready to post
+                                    </span>
+                                    <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500">
+                                      {getReadyPostingSubtext(transaction, ledgerMasters, billAllocation)}
+                                    </span>
                                   </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
                                   <button
