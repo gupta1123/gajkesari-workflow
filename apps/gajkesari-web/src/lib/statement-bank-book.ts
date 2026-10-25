@@ -40,10 +40,40 @@ export function summarizeSavedPostings(rows: SavedPostingRow[]) {
     result: row.postingStatus === "verified" ? { ...row.postingResult, verificationStatus: "verified" } : row.postingResult })));
 }
 
-export function summarizeStatementPostings(rows: StatementRow[], saved: SavedPostingRow[]) {
+type StatementPresence = {
+  status?: string;
+  voucherNumber?: string | null;
+  duplicateInTally?: boolean;
+  checkFailed?: boolean;
+  reviewKind?: string;
+};
+
+export function resolveStatementPostings(
+  rows: Array<StatementRow & { id?: string }>,
+  saved: SavedPostingRow[],
+  presence: Record<string, StatementPresence> = {}
+): SavedPostingRow[] {
   const byKey = new Map(saved.map(row => [statementRowKey(row), row]));
-  return summarizeSavedPostings(rows.map((row, index) => byKey.get(statementRowKey(row)) ??
-    { ...row, id: `unsubmitted-${index}`, postingStatus: "pending" }));
+  return rows.map((row, index) => {
+    // A live match must never erase an unresolved or failed posting attempt.
+    const posting = byKey.get(statementRowKey(row));
+    if (posting) return posting;
+    const check = row.id ? presence[row.id] : undefined;
+    const existing = check?.status === "found" && !check.duplicateInTally && !check.checkFailed && !check.reviewKind;
+    return {
+      ...row,
+      id: row.id || `unsubmitted-${index}`,
+      postingStatus: existing ? "verified" : "pending",
+      voucherNumber: existing ? check.voucherNumber : null,
+      postingResult: existing ? { alreadyInTally: true, created: 0 } : null,
+    };
+  });
+}
+
+export function summarizeStatementPostings(
+  rows: Array<StatementRow & { id?: string }>, saved: SavedPostingRow[], presence: Record<string, StatementPresence> = {}
+) {
+  return summarizeSavedPostings(resolveStatementPostings(rows, saved, presence));
 }
 
 // Results known before this upload's Post action are existing entries, even

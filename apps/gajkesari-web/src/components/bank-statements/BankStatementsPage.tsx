@@ -35,7 +35,7 @@ import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { bankPostingOutcome, bankPostingMessage, bankPostingTitle, summarizeBankPostings } from "@gajkesari/shared/lib/bank-posting-outcome";
 import { isBankChargeDescription, resolveBankChargeLedger, bankChargeNeedsReview } from "@gajkesari/shared/lib/bank-charge-ledger";
 import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, statementBalances, statementRowKey, summarizeSavedPostings,
-  heldPostingReason, statementCheckMessage, statementBalanceMessage, postingFooterSegments, summarizeStatementPostings, mergeCompletedPostingEvidence, markPreviouslyConfirmedPostings } from "@/lib/statement-bank-book";
+  heldPostingReason, statementCheckMessage, statementBalanceMessage, postingFooterSegments, summarizeStatementPostings, resolveStatementPostings, mergeCompletedPostingEvidence, markPreviouslyConfirmedPostings } from "@/lib/statement-bank-book";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
@@ -3995,7 +3995,7 @@ export function BankStatementsPage() {
       ? 0
       : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
   const tallyPostingInProgress = Boolean(pendingPostingJob || (tallyPostingStatus && !tallyPostingStatus.finished));
-  const bankBookTransactions = buildStatementBankBook(validTransactions, persistedPostedTransactions);
+  const bankBookTransactions = buildStatementBankBook(validTransactions, resolveStatementPostings(validTransactions, persistedPostedTransactions, tallyPresenceByTransactionId));
   const hasPostedEntries = persistedPostedTransactions.some(row =>
     ["confirmed", "needs_check"].includes(savedPostingOutcome(row).status)
   ) || validTransactions.some(row => postedTransactionIds.has(row.id) && tallyPresenceByTransactionId[row.id]?.status === "found");
@@ -4003,7 +4003,7 @@ export function BankStatementsPage() {
   const needsPostingCheck = persistedPostedTransactions.filter(row => savedPostingOutcome(row).status === "needs_check");
   const postingSummary = tallyPostingInProgress && tallyPostingStatus
     ? summarizeBankPostings(tallyPostingStatus.commands.filter(command => (command.commandType || command.command_type) === "post_bank_voucher"))
-    : summarizeStatementPostings(validTransactions, persistedPostedTransactions);
+    : summarizeStatementPostings(validTransactions, persistedPostedTransactions, tallyPresenceByTransactionId);
   const tallyCheckMessage = tallyPostingInProgress ? "Processing entries in Tally"
     : statementCheckMessage(validTransactions.map(row => tallyPresenceByTransactionId[row.id] || {}));
   const showPostingResultFooter = !tallyPostingInProgress && Boolean(statementDoneSummary || tallyPostingStatus?.finished);
@@ -4045,11 +4045,10 @@ export function BankStatementsPage() {
     setTallyPresenceByTransactionId(current => ({ ...current, ...presence }));
     setPostedTransactionIds(new Set(Object.entries(presence).filter(([, value]) => value.status === "found" && value.alreadyInTally !== true).map(([id]) => id)));
     if (Object.keys(presence).length) setTallyCheckAttempted(true);
-    const summary = summarizeSavedPostings(saved);
+    const summary = summarizeStatementPostings(rows, saved, tallyPresenceByTransactionId);
     setStatementDoneSummary(null);
-    const unmatchedRows = rows.filter(row => !saved.some(posting => statementRowKey(posting) === statementRowKey(row))).length;
-    if (summary.pending > 0 || unmatchedRows > 0) {
-      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary)}${unmatchedRows ? ` ${unmatchedRows} statement entries have no saved posting result; check Tally before posting.` : ""}` });
+    if (summary.pending > 0) {
+      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary)} ${summary.pending} statement entries have no confirmed result; check Tally before posting.` });
       return;
     }
     if (summary.confirmed || summary.needsCheck || summary.failed) {
@@ -6373,8 +6372,13 @@ export function BankStatementsPage() {
     try {
       setMatchingBills(true);
       setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
-      const billEligibleTransactionIds = pendingBillEligibleTransactions.map((transaction) => transaction.id);
-      const asOfDate = pendingBillEligibleTransactions
+      // A voucher found on the previous check may have been deleted or changed.
+      // Let the fresh check decide which bill-wise rows need allocation.
+      const billEligibleRows = validTransactions.filter((transaction) =>
+        isBillMatchEligibleTransaction(transaction, ledgerMasters)
+      );
+      const billEligibleTransactionIds = billEligibleRows.map((transaction) => transaction.id);
+      const asOfDate = billEligibleRows
         .map(getEffectiveTransactionDate)
         .filter(Boolean)
         .sort()
@@ -6390,7 +6394,7 @@ export function BankStatementsPage() {
         billEligibleTransactionIds,
         asOfDate,
       });
-      const receiptTransactionsToMatch = pendingBillEligibleTransactions.filter(
+      const receiptTransactionsToMatch = billEligibleRows.filter(
         (transaction) => presenceDrafts[transaction.id]?.status === "missing"
       );
       const nextDrafts: Record<string, BillAllocationDraft> = {};
@@ -6471,9 +6475,7 @@ export function BankStatementsPage() {
         }
       }
 
-      if (receiptTransactionsToMatch.length > 0) {
-        setBillAllocationsByTransactionId(nextDrafts);
-      }
+      setBillAllocationsByTransactionId(nextDrafts);
       lastLiveTallyCheckAtRef.current = Date.now();
       const foundCount = Object.values(presenceDrafts).filter((draft) => draft.status === "found").length;
       const ambiguousCount = Object.values(presenceDrafts).filter((draft) => draft.status === "ambiguous").length;
@@ -6722,7 +6724,7 @@ export function BankStatementsPage() {
       if (queueRows.length === 0) {
         const refreshedImport = await loadImportPreviewMetadata(confirmPayload.import.id);
         const savedResults = markPreviouslyConfirmedPostings(refreshedImport.postedTransactions ?? [], preview.postedTransactions ?? []);
-        const summary = summarizeStatementPostings(validTransactions, savedResults);
+        const summary = summarizeStatementPostings(validTransactions, savedResults, tallyPresenceByTransactionId);
         if (summary.confirmed || summary.needsCheck) {
           setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
           setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
@@ -6893,7 +6895,7 @@ export function BankStatementsPage() {
             setTallyPresenceByTransactionId(drafts);
             setTallyBalanceProof(balanceProof);
             setTallyCheckAttempted(true);
-            const statementSummary = summarizeStatementPostings(validTransactions, savedResults);
+            const statementSummary = summarizeStatementPostings(validTransactions, savedResults, drafts);
             const checksOnly = finalStatus.voucherTotal === 0;
             setStatementDoneSummary({
               tone: statementSummary.failed ? "error" : statementSummary.needsCheck || statementSummary.pending ? "info" : "success",
