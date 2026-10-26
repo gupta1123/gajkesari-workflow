@@ -4583,7 +4583,12 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
   };
 }
 
-const VOUCHER_CACHE_FULL_REFRESH_MS = 7 * 24 * 60 * 60 * 1_000;
+// The click path reads only the statement window (plus a small buffer), in
+// bounded chunks. A whole-financial-year snapshot made the first click the
+// slowest and let one Tally stall fail it, so it is no longer attempted here.
+const VOUCHER_WINDOW_BUFFER_DAYS = 7;
+const VOUCHER_CHUNK_DAYS = 31;
+const REFERENCE_LOOKUP_BUDGET_MS = 10_000;
 const CACHED_VOUCHER_FETCH_FIELDS =
   "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount";
 
@@ -4591,9 +4596,26 @@ function isCompleteVoucherEnvelope(xml) {
   return /<\/ENVELOPE\s*>/i.test(xml) && /<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(xml);
 }
 
+function shiftIsoDate(iso, days) {
+  const date = new Date(`${iso}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function splitDateRange(dateFrom, dateTo, maxDays) {
+  const ranges = [];
+  let start = dateFrom;
+  while (start <= dateTo) {
+    const end = shiftIsoDate(start, maxDays - 1);
+    ranges.push({ dateFrom: start, dateTo: end < dateTo ? end : dateTo });
+    start = shiftIsoDate(start, maxDays);
+  }
+  return ranges;
+}
+
 async function refreshCachedBankVouchers(
   tallyUrl,
-  { companyName, dateFrom, dateTo, bankLedgerName, transactions },
+  { companyName, dateFrom: requestedFrom, dateTo: requestedTo, bankLedgerName, transactions },
   dependencies = {}
 ) {
   const startedAt = Date.now();
@@ -4602,7 +4624,7 @@ async function refreshCachedBankVouchers(
     baseDir: dependencies.localMatchingBaseDir,
   };
   const db = loadOperationalCache(options);
-  const fy = financialYearRange(dateFrom);
+  const fy = financialYearRange(requestedFrom);
   const { key, partition } = ensureVoucherPartition(db, {
     companyGuid: dependencies.companyGuid || null,
     companyName,
@@ -4610,41 +4632,63 @@ async function refreshCachedBankVouchers(
     bankLedgerName,
     financialYear: fy.key,
   });
-  const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
-  const strongReferences = (transactions || []).map(bankTransactionReferences)
-    .map(({ bankReference }) => bankReference).filter(isStrongBankReference);
-  const needsCrossDateRead = strongReferences.some(
-    (reference) => !/^\d+$/.test(normalizeExactReference(reference))
-  );
-  // Recheck must observe references whose voucher date/amount changed since
-  // the last snapshot, including vouchers moved outside the statement period.
-  // A scoped refresh cannot prove that a cached cross-date UTR is current or
-  // absent. Refresh this bank's financial year whenever that identity is used.
-  const fullRefresh = needsCrossDateRead || !partition.lastFullRefreshAt ||
-    Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
-  const mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
+  const dateFrom = shiftIsoDate(normalizeDateForCompare(requestedFrom), -VOUCHER_WINDOW_BUFFER_DAYS);
+  const dateTo = shiftIsoDate(normalizeDateForCompare(requestedTo), VOUCHER_WINDOW_BUFFER_DAYS);
+  const mode = "scoped_snapshot";
   partition.status = "refreshing";
   saveOperationalCache(db, options);
 
   const exportStartedAt = Date.now();
-  try {
-    const xml = await (dependencies.exportCollection || exportTallyCollection)(tallyUrl, {
-      collectionName: fullRefresh
-        ? "Gajkesari Cached Bank Vouchers"
-        : "Gajkesari Statement Bank Vouchers",
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+  const exportRange = async (range) => {
+    const read = () => exportCollection(tallyUrl, {
+      collectionName: "Gajkesari Statement Bank Vouchers",
       tallyType: "Vouchers : Ledger",
       childOf: tallyFormulaString(bankLedgerName),
       fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
       companyName,
-      dateFrom: fullRefresh ? fy.dateFrom : dateFrom,
-      dateTo: fullRefresh ? fy.dateTo : dateTo,
+      dateFrom: range.dateFrom,
+      dateTo: range.dateTo,
       timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
       maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
     });
-    if (!isCompleteVoucherEnvelope(xml)) {
-      throw new Error("Tally did not return a complete voucher collection for the local index.");
+    try {
+      return await read();
+    } catch (error) {
+      // One retry for a transient stall; any other failure surfaces as-is.
+      if (!/timed out after/i.test(error instanceof Error ? error.message : "")) throw error;
+      return read();
     }
-    const changedVouchers = parseVoucherCollection(xml);
+  };
+  // A busy ledger can exceed the response cap for a whole chunk; halve the
+  // range until it fits (down to a single day) instead of failing the match.
+  const readParsedRange = async (range) => {
+    try {
+      const xml = await exportRange(range);
+      if (!isCompleteVoucherEnvelope(xml)) {
+        throw new Error("Tally did not return a complete voucher collection for the local index.");
+      }
+      return parseVoucherCollection(xml);
+    } catch (error) {
+      if (!/exceeded the safe response size/i.test(error instanceof Error ? error.message : "") || range.dateFrom >= range.dateTo) throw error;
+      const days = Math.round((Date.parse(`${range.dateTo}T00:00:00Z`) - Date.parse(`${range.dateFrom}T00:00:00Z`)) / 86_400_000) + 1;
+      const firstHalf = Math.ceil(days / 2);
+      const middle = shiftIsoDate(range.dateFrom, firstHalf - 1);
+      return [
+        ...(await readParsedRange({ dateFrom: range.dateFrom, dateTo: middle })),
+        ...(await readParsedRange({ dateFrom: shiftIsoDate(middle, 1), dateTo: range.dateTo })),
+      ];
+    }
+  };
+  try {
+    const changedVouchers = [];
+    const chunkTimings = [];
+    for (const range of splitDateRange(dateFrom, dateTo, VOUCHER_CHUNK_DAYS)) {
+      const chunkStartedAt = Date.now();
+      const parsed = await readParsedRange(range);
+      changedVouchers.push(...parsed);
+      chunkTimings.push({ ...range, ms: Date.now() - chunkStartedAt, vouchers: parsed.length });
+    }
     const update = upsertVoucherPartition(partition, changedVouchers, {
       mode, bankLedgerName, dateFrom, dateTo,
     });
@@ -4652,18 +4696,72 @@ async function refreshCachedBankVouchers(
     saveOperationalCache(db, options);
     dependencies.operationalContext = { db, key, partition, options };
 
-    const vouchers = activeVouchers(partition).filter((voucher) => {
+    const strongReferences = (transactions || []).map(bankTransactionReferences)
+      .map(({ bankReference }) => bankReference).filter(isStrongBankReference)
+      .filter((reference) => !/^\d+$/.test(normalizeExactReference(reference)));
+    const inWindow = (voucher) => {
       const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
-      return (date >= dateFrom && date <= dateTo) ||
-        strongReferences.some((reference) => !/^\d+$/.test(normalizeExactReference(reference)) &&
-          voucherHasExactReference(voucher, reference));
+      return date >= dateFrom && date <= dateTo;
+    };
+    const vouchers = activeVouchers(partition).filter((voucher) => inWindow(voucher) ||
+      strongReferences.some((reference) => voucherHasExactReference(voucher, reference)));
+
+    // Best effort: rows with a UTR that is not in the window may be dated
+    // elsewhere in the year. Look them up by amount within a short budget; on
+    // failure the rows are simply reported as checked within the window only.
+    const unresolved = (transactions || []).filter((row) => {
+      const { bankReference } = bankTransactionReferences(row);
+      return isStrongBankReference(bankReference) && !/^\d+$/.test(normalizeExactReference(bankReference)) &&
+        !vouchers.some((voucher) => voucherHasExactReference(voucher, bankReference));
     });
+    let referenceLookup = unresolved.length === 0 ? "not_needed" : "skipped";
+    let referenceLookupMs = 0;
+    let referenceLookupError = null;
+    const financialYear = financialYearBounds(requestedFrom);
+    if (unresolved.length > 0 && financialYear) {
+      const lookupStartedAt = Date.now();
+      try {
+        const entryFilterName = "GajkesariBankIdentityAmount";
+        const filterName = "GajkesariBankReferenceIdentity";
+        const amountFormula = Array.from(new Set(unresolved.map((row) => Number(row.amount))))
+          .map((amount) => `($Amount = ${amount} OR $Amount = ${-amount})`).join(" OR ");
+        const xml = await exportCollection(tallyUrl, {
+          collectionName: "Gajkesari Bank Reference Identity",
+          tallyType: "Vouchers : Ledger",
+          childOf: tallyFormulaString(bankLedgerName),
+          fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
+          companyName,
+          dateFrom: financialYear.dateFrom,
+          dateTo: financialYear.dateTo,
+          formulae: [
+            { name: entryFilterName, formula: `($$IsEqual:$LedgerName:${tallyFormulaString(bankLedgerName)}) AND (${amountFormula})` },
+            { name: filterName, formula: `$$FilterCount:AllLedgerEntries:${entryFilterName} > 0` },
+          ],
+          filterNames: [filterName],
+          timeoutMs: REFERENCE_LOOKUP_BUDGET_MS,
+          maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+        });
+        if (!isCompleteVoucherEnvelope(xml)) throw new Error("incomplete reference lookup response");
+        const idOf = (voucher) => voucher.guid || `${voucher.masterId}|${voucher.voucherNumber}`;
+        const seen = new Set(vouchers.map(idOf));
+        for (const voucher of parseVoucherCollection(xml)) {
+          if (/^yes$/i.test(String(voucher.isCancelled || "")) || seen.has(idOf(voucher))) continue;
+          seen.add(idOf(voucher));
+          vouchers.push(voucher);
+        }
+        referenceLookup = "completed";
+      } catch (error) {
+        referenceLookupError = error instanceof Error ? error.message : String(error);
+      }
+      referenceLookupMs = Date.now() - lookupStartedAt;
+    }
     return {
       vouchers,
       diagnostics: {
         source: "connector_voucher_index",
         refreshMode: mode,
-        crossDateReferenceRead: needsCrossDateRead,
+        window: { dateFrom, dateTo, bufferDays: VOUCHER_WINDOW_BUFFER_DAYS },
+        chunks: chunkTimings,
         exportMs: Date.now() - exportStartedAt,
         totalMs: Date.now() - startedAt,
         changedVoucherCount: changedVouchers.length,
@@ -4671,6 +4769,9 @@ async function refreshCachedBankVouchers(
         cachedVoucherCount: partition.voucherCount || 0,
         counts: update.counts,
         financialYear: fy.key,
+        referenceLookup,
+        referenceLookupMs,
+        referenceLookupError,
       },
     };
   } catch (error) {
@@ -4724,9 +4825,13 @@ async function fetchBankReconciliationVouchers(
   const financialYear = financialYearBounds(dateFrom);
   if (crossDateTransactions.length > 0 && financialYear) {
     const crossDateStartedAt = Date.now();
-    // A voucher can have both its date and amount edited. Read this bank's
-    // financial year without an amount filter, then compare exact references
-    // locally, including references in bank allocations and narration.
+    const filterName = "GajkesariBankReferenceIdentity";
+    // Filter by bank entry amount, not Reference. The UTR can be in bank
+    // allocations or narration, and is compared exactly after export.
+    const entryFilterName = "GajkesariBankIdentityAmount";
+    const amountFormula = Array.from(new Set(crossDateTransactions.map((row) => Number(row.amount))))
+      .map((amount) => `($Amount = ${amount} OR $Amount = ${-amount})`)
+      .join(" OR ");
     const crossDateXml = await exportCollection(tallyUrl, {
       collectionName: "Gajkesari Bank Reference Identity",
       tallyType: "Vouchers : Ledger",
@@ -4736,6 +4841,11 @@ async function fetchBankReconciliationVouchers(
       companyName,
       dateFrom: financialYear.dateFrom,
       dateTo: financialYear.dateTo,
+      formulae: [
+        { name: entryFilterName, formula: `($$IsEqual:$LedgerName:${tallyFormulaString(bankLedgerName)}) AND (${amountFormula})` },
+        { name: filterName, formula: `$$FilterCount:AllLedgerEntries:${entryFilterName} > 0` },
+      ],
+      filterNames: [filterName],
       timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
       maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
     });
@@ -4743,9 +4853,7 @@ async function fetchBankReconciliationVouchers(
       throw new Error("Tally did not return a complete financial-year duplicate lookup.");
     }
     crossDateVouchers = parseVoucherCollection(crossDateXml).filter(
-      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || "")) &&
-        crossDateTransactions.some(transaction =>
-          voucherHasExactReference(voucher, bankTransactionReferences(transaction).bankReference))
+      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
     );
     crossDateExportMs = Date.now() - crossDateStartedAt;
   }
@@ -4773,7 +4881,7 @@ async function fetchBankReconciliationVouchers(
       detailBatchCount: 0,
       primaryIncludesBankReferences: true,
       queryMode: crossDateTransactions.length > 0
-        ? "bank_ledger_plus_financial_year_reference"
+        ? "bank_ledger_plus_financial_year_amount"
         : "bank_ledger_child_of",
     },
   };

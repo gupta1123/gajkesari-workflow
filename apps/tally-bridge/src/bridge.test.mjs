@@ -92,29 +92,145 @@ test("stored '?' ledger name resolves by GUID to the exact live Unicode name", (
   assert.equal(resolved.counterpartyLedgerName, UNICODE_LEDGER_NAMES[0]);
 });
 
-test("operational voucher provider bootstraps once then requests a statement-scoped bank snapshot", async (t) => {
+const VOUCHER_XML = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
+
+test("operational voucher provider reads only the statement window plus a buffer, never the full year", async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-provider-"));
   t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   const calls = [];
-  const fullXml = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
   const request = {
     companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
-    transactions: [{ referenceNumber: "UTR-1" }],
+    transactions: [{ referenceNumber: "UTR-1", amount: 100 }],
   };
   const dependencies = {
     localMatchingBaseDir: baseDir,
     companyGuid: "company-guid",
-    exportCollection: async (_url, options) => { calls.push(options); return fullXml; },
+    exportCollection: async (_url, options) => { calls.push(options); return VOUCHER_XML; },
   };
   const first = await refreshCachedBankVouchers("http://tally", request, dependencies);
-  assert.equal(first.diagnostics.refreshMode, "full_snapshot");
+  assert.equal(first.diagnostics.refreshMode, "scoped_snapshot");
   assert.equal(first.vouchers.length, 1);
-  const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
-  assert.equal(second.diagnostics.refreshMode, "scoped_snapshot");
-  assert.equal(calls[1].tallyType, "Vouchers : Ledger");
-  assert.equal(calls[1].dateFrom, request.dateFrom);
-  assert.equal(calls[1].dateTo, request.dateTo);
-  assert.equal(calls[1].formulae, undefined);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].collectionName, "Gajkesari Statement Bank Vouchers");
+  assert.equal(calls[0].dateFrom, "2026-07-25");
+  assert.equal(calls[0].dateTo, "2026-08-08");
+  assert.equal(first.diagnostics.referenceLookup, "not_needed");
+});
+
+test("operational voucher provider splits long statements into bounded monthly reads", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-chunks-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const result = await refreshCachedBankVouchers("http://tally", {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-04-01", dateTo: "2026-06-30", transactions: [],
+  }, {
+    localMatchingBaseDir: baseDir,
+    companyGuid: "company-guid",
+    exportCollection: async (_url, options) => { calls.push(options); return VOUCHER_XML; },
+  });
+  assert.ok(calls.length >= 3);
+  for (const call of calls) {
+    const days = (Date.parse(call.dateTo) - Date.parse(call.dateFrom)) / 86_400_000 + 1;
+    assert.ok(days <= 31);
+  }
+  assert.equal(result.diagnostics.chunks.length, calls.length);
+});
+
+test("operational voucher provider retries a stalled window read once and then fails fast", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-timeout-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  let attempts = 0;
+  const request = { companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [] };
+  const ok = await refreshCachedBankVouchers("http://tally", request, {
+    localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+    exportCollection: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("Gajkesari Statement Bank Vouchers timed out after 20 seconds.");
+      return VOUCHER_XML;
+    },
+  });
+  assert.equal(attempts, 2);
+  assert.equal(ok.vouchers.length, 1);
+  await assert.rejects(
+    refreshCachedBankVouchers("http://tally", request, {
+      localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+      exportCollection: async () => { throw new Error("Gajkesari Statement Bank Vouchers timed out after 20 seconds."); },
+    }),
+    /timed out/
+  );
+});
+
+test("an oversized voucher read is halved until it fits instead of failing", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-size-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const result = await refreshCachedBankVouchers("http://tally", {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [],
+  }, {
+    localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+    exportCollection: async (_url, options) => {
+      calls.push(options);
+      const days = (Date.parse(options.dateTo) - Date.parse(options.dateFrom)) / 86_400_000 + 1;
+      if (days > 4) throw new Error("Gajkesari Statement Bank Vouchers exceeded the safe response size. Narrow the statement period or review this ledger separately.");
+      return VOUCHER_XML;
+    },
+  });
+  assert.ok(calls.length > 1);
+  assert.ok(result.vouchers.length >= 1);
+});
+
+test("an oversized single-day read stays blocked without committing a partial cache", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-one-day-size-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  await assert.rejects(refreshCachedBankVouchers("http://tally", {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [],
+  }, {
+    localMatchingBaseDir: baseDir,
+    exportCollection: async (_url, options) => {
+      calls.push(options);
+      throw new Error("Gajkesari Statement Bank Vouchers exceeded the safe response size.");
+    },
+  }), /safe response size/);
+  assert.equal(calls.at(-1).dateFrom, calls.at(-1).dateTo);
+  assert.ok(calls.length <= 5);
+  const partition = Object.values(JSON.parse(fs.readFileSync(path.join(baseDir, 'operational-cache.json'), 'utf8')).partitions)[0];
+  assert.equal(partition.status, 'error');
+  assert.equal(partition.lastRefreshAt, null);
+  assert.deepEqual(partition.vouchers, {});
+});
+
+test("a UTR missing from the window is looked up best-effort and never fails the check", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-utr-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const request = {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
+    transactions: [{ referenceNumber: "UTRABC123456", amount: 555 }],
+  };
+  const result = await refreshCachedBankVouchers("http://tally", request, {
+    localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+    exportCollection: async (_url, options) => {
+      if (options.collectionName === "Gajkesari Bank Reference Identity") throw new Error("Gajkesari Bank Reference Identity timed out after 10 seconds.");
+      return VOUCHER_XML;
+    },
+  });
+  assert.equal(result.diagnostics.referenceLookup, "skipped");
+  assert.match(result.diagnostics.referenceLookupError, /timed out/);
+});
+
+test("operational voucher provider does not mask non-timeout export errors", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "gajkesari-voucher-error-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  await assert.rejects(
+    refreshCachedBankVouchers("http://tally", {
+      companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [],
+    }, {
+      localMatchingBaseDir: baseDir,
+      companyGuid: "company-guid",
+      exportCollection: async () => { throw new Error("Tally is not reachable"); },
+    }),
+    /not reachable/
+  );
 });
 
 test("Tally response decoding preserves Unicode ledger punctuation", () => {
@@ -985,7 +1101,7 @@ test("an incomplete or unavailable duplicate read never becomes missing", async 
   }
 });
 
-test("statement reconciliation reads manual entries and finds financial-year references independently of amount", async () => {
+test("statement reconciliation reads manual entries and an amount-filtered financial year", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -1023,11 +1139,12 @@ test("statement reconciliation reads manual entries and finds financial-year ref
   assert.equal(calls[1].dateTo, "2027-03-31");
   assert.equal(calls[1].tallyType, "Vouchers : Ledger");
   assert.equal(calls[1].childOf, '\"ICICI Current Account\"');
-  assert.equal(calls[1].formulae, undefined);
-  assert.equal(calls[1].filterNames, undefined);
+  assert.equal(calls[1].formulae.length, 2);
+  assert.match(calls[1].formulae[0].formula, /\$Amount = 1250/);
+  assert.deepEqual(calls[1].filterNames, ['GajkesariBankReferenceIdentity']);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
-  assert.equal(outcome.result.queryDiagnostics.queryMode, "bank_ledger_plus_financial_year_reference");
+  assert.equal(outcome.result.queryDiagnostics.queryMode, "bank_ledger_plus_financial_year_amount");
 });
 
 test("statement reconciliation reads bank allocations from the primary export", async () => {
@@ -1604,41 +1721,42 @@ function movedPaymentExport(content, calls = []) {
     assert.equal(options.dateTo, '2027-03-31');
     assert.equal(options.tallyType, 'Vouchers : Ledger');
     assert.equal(options.childOf, '"ICICI Bank - 8822014500"');
-    assert.equal(options.formulae, undefined, 'An amount filter would hide this same-UTR voucher');
-    return content;
+    assert.equal(options.formulae.length, 2);
+    const allowed = [...options.formulae[0].formula.matchAll(/\$Amount = (-?[\d.]+)/g)].map(match => Math.abs(Number(match[1])));
+    if (!content.includes('</ENVELOPE>')) return content;
+    // Model Tally's amount filter rather than returning excluded fixtures.
+    const blocks = [...content.matchAll(/<VOUCHER\b[^>]*>[\s\S]*?<\/VOUCHER>/gi)].map(match => match[0]);
+    return '<ENVELOPE><COLLECTION>' + blocks.filter(block => allowed.some(amount => block.includes('<AMOUNT>'+amount+'</AMOUNT>') || block.includes('<AMOUNT>-'+amount+'</AMOUNT>'))).join('') + '</COLLECTION></ENVELOPE>';
   };
 }
 
-test('date-and-amount edits are found in the actual wider-date export before deciding presence', async () => {
+test('Polaad-style wider-date lookup excludes a voucher whose amount also changed', async () => {
   const calls=[];
   const check=await verifyBankTransactionInTally({}, row, {
     exportCollection:movedPaymentExport(xml(voucher({date:'20261024'})), calls),
   });
   assert.equal(calls.length,2);
-  assert.equal(check.result.verificationStatus,'ambiguous');
-  assert.equal(check.result.matches[0].voucherNumber,'5310');
-  assert.equal(check.result.matches[0].date,'2026-10-24');
-  assert.equal(check.result.matches[0].amount,2383.5);
-  assert.deepEqual(check.result.referenceConflicts,['amount']);
+  assert.equal(check.result.verificationStatus,'missing');
+  assert.deepEqual(check.result.matches,[]);
 });
 
-test('wider-date lookup retains changed amounts when the UTR is in bank details or narration', async () => {
-  const original=xml(voucher({date:'20261024'}));
+test('wider-date lookup finds same-amount vouchers with a UTR in bank details or narration', async () => {
+  const original=xml(voucher({date:'20261024',amount:2382.5}));
   for(const content of [
     original.replace('<REFERENCE>'+reference+'</REFERENCE>', '<REFERENCE></REFERENCE><NARRATION>UTR: '+reference+'</NARRATION>'),
-    original.replace('<REFERENCE>'+reference+'</REFERENCE>', '<REFERENCE></REFERENCE>').replace('<AMOUNT>2383.5</AMOUNT>', '<AMOUNT>2383.5</AMOUNT><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>'+reference+'</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST>'),
+    original.replace('<REFERENCE>'+reference+'</REFERENCE>', '<REFERENCE></REFERENCE>').replace('<AMOUNT>2382.5</AMOUNT>', '<AMOUNT>2382.5</AMOUNT><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>'+reference+'</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST>'),
   ]) {
     const check=await verifyBankTransactionInTally({},row,{exportCollection:movedPaymentExport(content)});
-    assert.equal(check.result.verificationStatus,'ambiguous');
-    assert.equal(check.result.matches[0].amount,2383.5);
+    assert.equal(check.result.verificationStatus,'found');
+    assert.equal(check.result.matches[0].amount,2382.5);
   }
 });
 
 test('wider-date conflicts do not turn unrelated references into duplicate warnings', async () => {
   const check=await reconcileBankTransactionsInTally({}, {bankLedgerName:bank,includeBalanceProof:false,
     transactions:[row,{...row,transactionId:'new-payment',referenceNumber:'UTIBN26300999999',bankReferenceNumber:'UTIBN26300999999'}]},
-    {exportCollection:movedPaymentExport(xml(voucher({date:'20261024'})))});
-  assert.deepEqual(check.result.transactions.map(r=>r.verificationStatus),['ambiguous','missing']);
+    {exportCollection:movedPaymentExport(xml(voucher({date:'20261024',amount:2382.5})))});
+  assert.deepEqual(check.result.transactions.map(r=>r.verificationStatus),['found','missing']);
   assert.equal(check.result.balanceProof.tallyMovement,0);
 });
 
@@ -1646,18 +1764,18 @@ test('an incomplete wider-date read fails instead of authorising another payment
   await assert.rejects(verifyBankTransactionInTally({},row,{exportCollection:movedPaymentExport('<ENVELOPE><COLLECTION>')}), /complete financial-year/);
 });
 
-test('final posting preflight stops a changed date and amount without building an import', async () => {
+test('final posting preflight skips an existing same-amount cross-date voucher without import', async () => {
   let imports=0;
   const blocked=()=>{imports++;throw Error('must not import')};
   const execute=new Function('resolveBankVoucherLedgerPayloads','validateBankVoucherBillAllocationsLive',
     'verifyBankTransactionInTally','buildBankVoucherXml','invokeTallyXml',`return (${postBankVoucher.toString()});`)(
     async(_,rows)=>rows,async(_,rows)=>rows,
-    (config,payload)=>verifyBankTransactionInTally(config,payload,{exportCollection:movedPaymentExport(xml(voucher({date:'20261024'})))}),
+    (config,payload)=>verifyBankTransactionInTally(config,payload,{exportCollection:movedPaymentExport(xml(voucher({date:'20261024',amount:2382.5})))}),
     blocked,blocked);
   const result=await execute('http://unused',row,'Solution Nyx');
-  assert.equal(result.outcome.success,false);
-  assert.equal(result.outcome.result.possibleDuplicateInTally,true);
-  assert.equal(result.outcome.result.duplicateCheck.matches[0].voucherNumber,'5310');
+  assert.equal(result.outcome.success,true);
+  assert.equal(result.outcome.result.alreadyInTally,true);
+  assert.equal(result.outcome.result.created,0);
   assert.equal(result.xml,null);assert.equal(imports,0);
 });
 
@@ -1670,7 +1788,7 @@ test('the live match operation rechecks a moved and edited UTR even with a warm 
       calls.push(options);
       if(options.tallyType!=='Vouchers : Ledger')return '<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>';
       if(!edited)return xml(voucher({amount:2382.5}));
-      return options.dateFrom==='2026-04-01' ? xml(voucher({date:'20261024'})) : '<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>';
+      return xml(voucher({date:'20261024'}));
     }};
   const request={companyName:'Solution Nyx',bankLedgerName:bank,includeBalanceProof:false,
     billEligibleTransactionIds:[row.transactionId],transactions:[row]};
@@ -1680,8 +1798,8 @@ test('the live match operation rechecks a moved and edited UTR even with a warm 
   assert.equal(result.transactions[0].matches[0].date,'2026-10-24');
   assert.equal(result.transactions[0].matches[0].amount,2383.5);
   assert.deepEqual(result.billLedgerNames,[],'A conflicting payment must not open bill allocation');
-  assert.equal(calls.length,2);assert.equal(calls[1].dateFrom,'2026-04-01');
-  assert.equal(calls[1].dateTo,'2027-03-31');assert.equal(calls[1].formulae,undefined);
+  assert.equal(calls.length,2);assert.equal(calls[1].dateFrom,'2026-10-18');
+  assert.equal(calls[1].dateTo,'2026-11-01');assert.equal(calls[1].formulae,undefined);
 });
 
 test('live matching removes a deleted out-of-period UTR instead of trusting the warm cache', async (t) => {
@@ -1701,7 +1819,7 @@ test('live matching refuses an incomplete fresh UTR read despite a previously co
   t.after(()=>fs.rmSync(baseDir,{recursive:true,force:true}));
   let incomplete=false;
   const dependencies={localMatchingBaseDir:baseDir,voucherProvider:refreshCachedBankVouchers,
-    exportCollection:async(_url,options)=>incomplete && options.dateFrom==='2026-04-01'
+    exportCollection:async(_url,options)=>incomplete && options.collectionName==='Gajkesari Statement Bank Vouchers'
       ? '<ENVELOPE><COLLECTION>' : xml(voucher({amount:2382.5}))};
   const request={bankLedgerName:bank,includeBalanceProof:false,transactions:[row]};
   await matchBankStatementInTally({},request,dependencies);incomplete=true;
