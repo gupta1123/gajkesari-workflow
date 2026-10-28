@@ -229,3 +229,11 @@
 .fu .trow.ledger:hover{background:transparent}
 .fu .struck{text-decoration:line-through;color:#8a7f72}
 .fu .tick small{font-weight:400}
+
+/* Customers checklist */
+.fu .trow{grid-template-columns:22px 18px minmax(0,1fr) auto}
+.fu .trow input[type=checkbox]{width:16px;height:16px;margin:0}
+.fu .trow.ledger{grid-template-columns:22px minmax(0,1fr)}
+.fu .tpath{display:block;font-size:11px;font-weight:400;color:#6a5f53}
+.fu .addgroup{display:flex;align-items:center;gap:10px;margin:10px 6px 4px;font-size:12px;color:#51483f}
+.fu .addgroup select{max-width:360px}
