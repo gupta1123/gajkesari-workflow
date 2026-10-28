@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { loadLiveCashDiscountDashboard } from "@/lib/cash-discount-live-dashboard";
 
 type CompanyOption = {
   id: string;
@@ -145,6 +146,10 @@ type DashboardPayload = {
   rules?: CashDiscountRule[];
   notes?: string[];
 };
+
+// Live mode reads the paired connector directly (customer scope, no cached scan)
+// instead of the queued-command snapshot. Off unless the build turns it on.
+const CASH_DISCOUNT_LIVE = process.env.NEXT_PUBLIC_CASH_DISCOUNT_LIVE === "true";
 
 type ActiveView = "needsAction" | "done" | "rules";
 
@@ -423,9 +428,17 @@ export function CollectionsDashboardPage() {
   }, [selectedCompanyId]);
 
   const loadDashboard = useCallback(
-    async (connectionId = selectedConnectionId, companyName = selectedCompany?.companyName ?? "") => {
+    async (
+      connectionId = selectedConnectionId,
+      companyName = selectedCompany?.companyName ?? "",
+      financialYear: string | null = selectedCompany?.financialYear ?? null
+    ) => {
       if (!connectionId) {
         setDashboard(null);
+        return;
+      }
+      if (CASH_DISCOUNT_LIVE && companyName) {
+        setDashboard(await loadLiveCashDiscountDashboard<DashboardPayload>({ connectionId, companyName, financialYear }));
         return;
       }
       const params = new URLSearchParams({ connectionId });
@@ -435,7 +448,7 @@ export function CollectionsDashboardPage() {
       if (!response.ok) throw new Error(payload.error || `Request failed with status ${response.status}`);
       setDashboard(payload);
     },
-    [selectedCompany?.companyName, selectedConnectionId]
+    [selectedCompany?.companyName, selectedCompany?.financialYear, selectedConnectionId]
   );
 
   const loadDebtorLedgers = useCallback(async (connectionId: string) => {
@@ -565,10 +578,10 @@ export function CollectionsDashboardPage() {
         // Set this before the asynchronous Tally scan so the selection effect
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
-        if (connectionId && options?.refreshTally !== false) {
+        if (!CASH_DISCOUNT_LIVE && connectionId && options?.refreshTally !== false) {
           await refreshTallyOpenBills(connectionId, company?.companyName);
         }
-        await loadDashboard(connectionId, company?.companyName);
+        await loadDashboard(connectionId, company?.companyName, company?.financialYear ?? null);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
