@@ -249,3 +249,13 @@
 .fu .tname{font-size:14px;font-weight:600}
 .fu .trow.ledger .tname,.fu .trow.ledger{font-weight:400}
 .fu .tlist.root{max-height:none;overflow:visible}
+
+/* Customers tree, pass 4: whole tree, blue when counted, grey when it only holds a counted group */
+.fu .trow input[type=checkbox]{accent-color:#2563eb}
+.fu .trow.in{background:#eaf1ff}
+.fu .trow.in .tname{color:#1d4ed8}
+.fu .trow.holds{background:#efede9}
+.fu .trow.holds .tname{color:#51483f}
+.fu .trow.ledger{background:transparent}
+.fu .treetools{display:flex;gap:14px;margin:2px 6px 6px;font-size:12px}
+.fu .tlist.root{max-height:560px;overflow-y:auto;overscroll-behavior:contain}
