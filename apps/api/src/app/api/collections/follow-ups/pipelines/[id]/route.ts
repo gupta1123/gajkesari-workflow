@@ -2,8 +2,8 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { followupsEnabledFor } from "@/lib/followups/access";
 import { readReminderBills } from "@/lib/followups/live-read";
-import { reminderPreview, submitReminder, WhatsappRejectedError } from "@/lib/followups/messages";
-import { advanceReminder, verificationOutcome, VERIFICATION_TTL_MS, type OpenBill, type ReminderStage } from "@/lib/followups/pipeline";
+import { reminderPreview, submitReminder, templateForRow, WhatsappRejectedError, type SummaryInvoice } from "@/lib/followups/messages";
+import { advanceReminder, customerOutcome, verificationOutcome, VERIFICATION_TTL_MS, type OpenBill, type ReminderStage } from "@/lib/followups/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { browserDatasetIds, resolveTallyTarget } from "@/lib/tally/browser-scope";
 
@@ -15,6 +15,7 @@ type Pipeline = {
   id: string; owner_user_id: string; company_dataset_id: string; company_name: string; financial_year: string;
   customer: string; invoice: string; invoice_date: string | null; recipient: string; outstanding: number | null;
   stages: ReminderStage[]; stage_index: number; stage_sent: number; status: string; revision: number;
+  kind: "invoice" | "customer"; invoices: SummaryInvoice[] | null;
 };
 
 const OPERATOR_STATUS: Record<string, { from: string[]; to: string }> = {
@@ -80,12 +81,19 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       row.customer
     );
     const byLedger = (read.byLedger ?? {}) as Record<string, { openBills?: OpenBill[] }>;
-    const outcome = verificationOutcome(byLedger[row.customer]?.openBills ?? [], row.invoice, row.invoice_date);
+    const openBills = byLedger[row.customer]?.openBills ?? [];
+    // A customer reminder re-reads every invoice it lists; paid ones drop out.
+    const outcome = row.kind === "customer"
+      ? customerOutcome(openBills, row.invoices ?? [])
+      : { ...verificationOutcome(openBills, row.invoice, row.invoice_date), invoices: null as SummaryInvoice[] | null };
     const now = Date.now();
 
     const { error: verifyError } = await db.from("invoice_followup_pipelines").update({
       status: outcome.status,
       outstanding: outcome.outstanding,
+      ...(row.kind === "customer" && outcome.invoices?.length
+        ? { invoices: outcome.invoices, invoice: `${outcome.invoices.length} invoice${outcome.invoices.length === 1 ? "" : "s"}` }
+        : {}),
       note: outcome.note,
       installation_id: target.installationId,
       session_generation: target.sessionGeneration,
@@ -101,8 +109,15 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
 
     const stage = row.stages[row.stage_index];
-    const message = { customer: row.customer, company_name: row.company_name, invoice: row.invoice, invoice_date: row.invoice_date, outstanding: outcome.outstanding };
-    reminderPreview(stage.template, message); // fails early if the template is no longer configured
+    const only = row.kind === "customer" && outcome.invoices?.length === 1 ? outcome.invoices[0] : null;
+    const message = {
+      customer: row.customer, company_name: row.company_name,
+      invoice: only?.invoice ?? row.invoice, invoice_date: only?.invoice_date ?? row.invoice_date,
+      outstanding: outcome.outstanding,
+      invoices: row.kind === "customer" ? outcome.invoices : null,
+    };
+    const templateKey = templateForRow(message, stage.template);
+    reminderPreview(templateKey, message); // fails early if the template is no longer configured
 
     const { data: claim, error: claimError } = await db.rpc("followup_claim_send", {
       p_id: id, p_revision: row.revision + 1, p_owner: user.id,
@@ -118,7 +133,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     let provider = "";
     let failure = "";
     try {
-      provider = await submitReminder(stage.template, message, row.recipient);
+      provider = await submitReminder(templateKey, message, row.recipient);
     } catch (sendError) {
       status = sendError instanceof WhatsappRejectedError ? "rejected" : "uncertain";
       failure = sendError instanceof Error ? sendError.message : "Reminder could not be sent.";

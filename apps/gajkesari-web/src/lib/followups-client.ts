@@ -28,6 +28,8 @@ export type FollowupPipeline = {
   verified_at: string | null;
   note: string | null;
   revision: number;
+  kind?: "invoice" | "customer";
+  invoices?: Array<{ invoice: string; invoice_date: string | null; outstanding: number }> | null;
 };
 
 export type FollowupAttempt = {
@@ -62,6 +64,8 @@ export async function createPipelines(input: {
   companyName: string;
   financialYear: string;
   plan: { name: string; stages: ReminderStage[] };
+  /** "customer" sends one message per customer that lists all their invoices. */
+  mode?: "invoice" | "customer";
   invoices: Array<{ customer: string; invoice: string; invoiceDate: string; recipient: string; narration?: string }>;
 }) {
   return readJson<{ created: string[]; skipped: Array<{ invoice: string; reason: string }> }>(

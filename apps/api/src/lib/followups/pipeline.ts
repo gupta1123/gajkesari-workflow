@@ -117,3 +117,43 @@ export function verificationOutcome(bills: OpenBill[], invoice: string, invoiceD
         : null,
   };
 }
+
+export type TrackedInvoice = { invoice: string; invoice_date: string | null; outstanding: number };
+
+export type CustomerOutcome = {
+  status: "active" | "settled" | "review";
+  outstanding: number | null;
+  invoices: TrackedInvoice[];
+  note: string | null;
+};
+
+/**
+ * What a live Tally read says about a customer's tracked invoices. Paid ones
+ * drop out of the message; the rest carry their fresh balances. A missing bill
+ * is never read as paid (see verificationOutcome), so it parks the reminder
+ * only when nothing else is left to send.
+ */
+export function customerOutcome(bills: OpenBill[], tracked: TrackedInvoice[]): CustomerOutcome {
+  const open: TrackedInvoice[] = [];
+  let paid = 0;
+  let unclear = 0;
+  for (const item of tracked) {
+    const result = verificationOutcome(bills, item.invoice, item.invoice_date);
+    if (result.status === "active" && result.outstanding) open.push({ ...item, outstanding: result.outstanding });
+    else if (result.status === "settled") paid += 1;
+    else unclear += 1;
+  }
+  if (!open.length) {
+    return unclear
+      ? { status: "review", outstanding: null, invoices: [], note: "Some invoices were not found as open in Tally. Check whether they were settled or changed." }
+      : { status: "settled", outstanding: null, invoices: [], note: "All invoices are settled. No further reminders will be sent." };
+  }
+  const total = Math.round(open.reduce((sum, item) => sum + item.outstanding, 0) * 100) / 100;
+  const dropped = paid + unclear;
+  return {
+    status: "active",
+    outstanding: total,
+    invoices: open,
+    note: dropped ? `${dropped} invoice${dropped === 1 ? "" : "s"} left out: paid or no longer open in Tally.` : null,
+  };
+}

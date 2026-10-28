@@ -1,7 +1,7 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { followupsEnabledFor } from "@/lib/followups/access";
-import { firstDueAt, validateReminderPlan, verificationOutcome, VERIFICATION_TTL_MS, type OpenBill } from "@/lib/followups/pipeline";
+import { customerOutcome, firstDueAt, validateReminderPlan, verificationOutcome, VERIFICATION_TTL_MS, type OpenBill } from "@/lib/followups/pipeline";
 import { classifyPaymentNarration, collectionPaymentRequirement } from "@/lib/followups/payment-terms";
 import { readReminderBills } from "@/lib/followups/live-read";
 import { reminderMessages } from "@/lib/followups/messages";
@@ -117,6 +117,66 @@ export async function POST(request: Request) {
     const created: string[] = [];
     const skipped: Array<{ invoice: string; reason: string }> = [];
     const now = Date.now();
+
+    if (body.mode === "customer") {
+      // One reminder per customer, listing every selected invoice of theirs.
+      const byCustomer = new Map<string, InvoiceInput[]>();
+      for (const input of invoices) {
+        const name = String(input.customer ?? "").trim();
+        if (name) byCustomer.set(name, [...(byCustomer.get(name) ?? []), input]);
+      }
+      for (const [customer, group] of byCustomer) {
+        const phone = tenDigitPhone(group.find((i) => tenDigitPhone(i.recipient))?.recipient);
+        if (!phone) { skipped.push({ invoice: customer, reason: "Enter a valid 10-digit WhatsApp number." }); continue; }
+        const tracked = group
+          .filter((i) => String(i.invoice ?? "").trim())
+          .map((i) => ({
+            invoice: String(i.invoice).trim(),
+            invoice_date: /^d{4}-d{2}-d{2}$/.test(String(i.invoiceDate ?? "")) ? String(i.invoiceDate) : null,
+            outstanding: 0,
+          }));
+        const outcome = customerOutcome(byLedger[customer]?.openBills ?? [], tracked);
+        if (outcome.status !== "active" || !outcome.outstanding) {
+          skipped.push({ invoice: customer, reason: outcome.note ?? "Nothing outstanding in Tally." });
+          continue;
+        }
+        // An invoice that already has its own running reminder is not repeated here.
+        const { data: running } = await db.from("invoice_followup_pipelines").select("invoice")
+          .eq("owner_user_id", user.id).eq("company_dataset_id", target.companyDatasetId).eq("kind", "invoice")
+          .in("invoice", outcome.invoices.map((i) => i.invoice)).not("status", "in", "(settled,finished,stopped)");
+        const taken = new Set((running ?? []).map((r: { invoice: string }) => r.invoice));
+        const listed = outcome.invoices.filter((i) => !taken.has(i.invoice));
+        if (!listed.length) { skipped.push({ invoice: customer, reason: "Every invoice already has its own reminder." }); continue; }
+        const total = Math.round(listed.reduce((sum, i) => sum + i.outstanding, 0) * 100) / 100;
+        const { data, error } = await db.from("invoice_followup_pipelines").insert({
+          owner_user_id: user.id,
+          company_dataset_id: target.companyDatasetId,
+          installation_id: target.installationId,
+          session_generation: target.sessionGeneration,
+          company_guid: target.companyGuid,
+          company_name: companyName,
+          financial_year: financialYear,
+          kind: "customer",
+          invoice_key: `customer|${customer.toLowerCase()}`,
+          customer,
+          invoice: `${listed.length} invoice${listed.length === 1 ? "" : "s"}`,
+          invoices: listed,
+          recipient: `91${phone}`,
+          plan_name: plan.name, stages: plan.stages,
+          outstanding: total,
+          next_due_at: firstDueAt(plan.stages, now),
+          verified_at: new Date(now).toISOString(),
+          verification_expires_at: new Date(now + VERIFICATION_TTL_MS).toISOString(),
+          note: outcome.note,
+        }).select("id").single();
+        if (error) {
+          skipped.push({ invoice: customer, reason: error.code === "23505" ? "Reminders are already running for this customer." : "Could not save this reminder." });
+          continue;
+        }
+        created.push(String(data.id));
+      }
+      return jsonWithCors(request, { created, skipped });
+    }
 
     for (const input of invoices) {
       const customer = String(input.customer ?? "").trim();

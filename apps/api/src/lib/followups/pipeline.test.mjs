@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  advanceReminder, firstDueAt, validateReminderPlan, verificationOutcome,
+  advanceReminder, customerOutcome, firstDueAt, validateReminderPlan, verificationOutcome,
 } from "./pipeline.ts";
 
 const stage = (over = {}) => ({ name: "Gentle", template: "payment_reminder", delay: 1, every: 2, unit: "days", limit: 2, ...over });
@@ -59,4 +59,27 @@ test("duplicate matching bills need review and a corrupt amount throws", () => {
   assert.equal(verificationOutcome([bill, bill], "INV-4", "2026-01-01").status, "review");
   assert.throws(() => verificationOutcome([{ ...bill, pendingAmount: -5 }], "INV-4", "2026-01-01"));
   assert.throws(() => verificationOutcome([{ ...bill, pendingAmount: Number.NaN }], "INV-4", "2026-01-01"));
+});
+
+test("a customer reminder lists only the invoices still open, with fresh balances", () => {
+  const bills = [
+    { referenceName: "A1", invoiceDate: "2026-08-01", pendingAmount: 400, originalAmount: 1000 },
+    { referenceName: "A2", invoiceDate: "2026-08-05", pendingAmount: 0, originalAmount: 500 },
+  ];
+  const tracked = [
+    { invoice: "A1", invoice_date: "2026-08-01", outstanding: 1000 },
+    { invoice: "A2", invoice_date: "2026-08-05", outstanding: 500 },
+    { invoice: "A3", invoice_date: "2026-08-09", outstanding: 700 },
+  ];
+  const result = customerOutcome(bills, tracked);
+  assert.equal(result.status, "active");
+  assert.equal(result.outstanding, 400);
+  assert.deepEqual(result.invoices.map((i) => i.invoice), ["A1"]);
+  assert.match(result.note, /2 invoices left out/);
+});
+
+test("a customer reminder settles when every invoice is paid and parks when they cannot be found", () => {
+  const paid = [{ referenceName: "A1", invoiceDate: "2026-08-01", pendingAmount: 0 }];
+  assert.equal(customerOutcome(paid, [{ invoice: "A1", invoice_date: "2026-08-01", outstanding: 10 }]).status, "settled");
+  assert.equal(customerOutcome([], [{ invoice: "A1", invoice_date: "2026-08-01", outstanding: 10 }]).status, "review");
 });

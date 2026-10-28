@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
 import { loadLiveCashDiscountDashboard, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
@@ -88,13 +88,35 @@ function ageCell(row: DueInvoice) {
   return <span>{row.ageLabel || "Due today"}</span>;
 }
 
-function messageText(template: string | undefined, row: { customer: string; invoice: string; invoice_date: string | null; outstanding: number | null }, company: string) {
+type ListedInvoice = { invoice: string; invoice_date: string | null; outstanding: number };
+
+// Same one-line list the server sends: oldest five, then "and N more".
+function invoiceListLine(invoices: ListedInvoice[]) {
+  const sorted = [...invoices].sort((a, b) => String(a.invoice_date ?? "9999").localeCompare(String(b.invoice_date ?? "9999")));
+  const parts = sorted.slice(0, 5).map((item) => {
+    const date = item.invoice_date ? new Date(`${item.invoice_date}T00:00:00`).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "";
+    return `${item.invoice} ₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(item.outstanding)}${date ? ` (${date})` : ""}`;
+  });
+  const rest = sorted.length - parts.length;
+  return `${parts.join("; ")}${rest > 0 ? `; and ${rest} more` : ""}`;
+}
+
+const SUMMARY_KEY = "payment_reminder_summary";
+// Two or more invoices go out as the summary message; one uses the stage's own message.
+const templateKeyFor = (row: { invoices?: ListedInvoice[] | null }, stageTemplate: string | undefined) =>
+  row.invoices && row.invoices.length > 1 ? SUMMARY_KEY : stageTemplate;
+
+function messageText(template: string | undefined, row: { customer: string; invoice: string; invoice_date: string | null; outstanding: number | null; invoices?: ListedInvoice[] | null }, company: string) {
   const values: Record<string, string> = {
     customer: row.customer, company, invoice: row.invoice, invoice_date: fmtDate(row.invoice_date),
     outstanding: new Intl.NumberFormat("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(row.outstanding ?? 0),
+    invoice_count: String(row.invoices?.length ?? 1),
+    invoice_list: row.invoices?.length ? invoiceListLine(row.invoices) : row.invoice,
   };
-  return (template ?? "").replace(/\{\{(customer|company|invoice|invoice_date|outstanding)\}\}/g, (_, key: string) => values[key]);
+  return (template ?? "").replace(/\{\{(customer|company|invoice|invoice_date|outstanding|invoice_count|invoice_list)\}\}/g, (_, key: string) => values[key]);
 }
+
+type CustomerGroup = { name: string; phone: string; invoices: DueInvoice[]; total: number; maxAge: number; oldest: string };
 
 function WhatsappBubble({ name, phone, text }: { name: string; phone: string; text: string }) {
   const initials = name.split(" ").map((word) => word[0]).join("").slice(0, 2).toUpperCase();
@@ -134,7 +156,9 @@ export function FollowUpPipelines() {
   const [menuId, setMenuId] = useState("");
 
   // Start-reminders card (replaces the list, like the demo).
-  const [enrolling, setEnrolling] = useState<{ ids: string[]; once: boolean } | null>(null);
+  const [enrolling, setEnrolling] = useState<{ ids: string[]; once: boolean; customers?: boolean } | null>(null);
+  const [view, setView] = useState<"invoice" | "customer">("customer");
+  const [opened, setOpened] = useState<Set<string>>(new Set());
   const [phones, setPhones] = useState<Record<string, string>>({});
   const [template, setTemplate] = useState("");
   const [savedPlans, setSavedPlans] = useState<Array<{ id: string; name: string; stages: ReminderStage[] }>>([]);
@@ -206,7 +230,13 @@ export function FollowUpPipelines() {
   useEffect(() => { void scan(); }, [scan]);
 
   const pipelineFor = useCallback(
-    (row: DueInvoice) => rows.find((p) => p.invoice === row.linkedInvoiceNumber && p.customer === row.partyLedgerName && isOpen(p)),
+    (row: DueInvoice) => rows.find((p) => p.customer === row.partyLedgerName && isOpen(p) && (
+      p.kind === "customer" ? p.invoices?.some((i) => i.invoice === row.linkedInvoiceNumber) : p.invoice === row.linkedInvoiceNumber
+    )),
+    [rows]
+  );
+  const customerPipeline = useCallback(
+    (name: string) => rows.find((p) => p.kind === "customer" && p.customer === name && isOpen(p)),
     [rows]
   );
 
@@ -220,16 +250,41 @@ export function FollowUpPipelines() {
     return sorted;
   }, [due, kind, sort]);
 
+  // Invoices with unclear payment terms stay out of customer messages; they need a person's eye first.
+  const groups = useMemo(() => {
+    const byName = new Map<string, CustomerGroup>();
+    for (const row of visibleDues) {
+      if (!row.linkedInvoiceNumber || kindOf(row) === "unclear") continue;
+      const group = byName.get(row.partyLedgerName) ?? { name: row.partyLedgerName, phone: "", invoices: [], total: 0, maxAge: -1, oldest: "9999" };
+      group.invoices.push(row);
+      group.total += row.outstandingAmount;
+      group.maxAge = Math.max(group.maxAge, row.ageDays ?? -1);
+      group.oldest = [group.oldest, row.linkedInvoiceDate ?? "9999"].sort()[0];
+      group.phone ||= tenDigits(row.partyPhone);
+      byName.set(row.partyLedgerName, group);
+    }
+    const list = [...byName.values()];
+    if (sort === "highest") list.sort((a, b) => b.total - a.total);
+    else if (sort === "oldest") list.sort((a, b) => a.oldest.localeCompare(b.oldest));
+    else if (sort === "customer") list.sort((a, b) => a.name.localeCompare(b.name));
+    else list.sort((a, b) => b.maxAge - a.maxAge);
+    return list;
+  }, [visibleDues, sort]);
+  const byCustomer = tab === "dues" && view === "customer";
+
   const dueReminders = useMemo(() => rows.filter(isDue), [rows]);
-  const tabRows: Array<DueInvoice | FollowupPipeline> =
-    tab === "dues" ? visibleDues : tab === "due" ? dueReminders : tab === "pipelines" ? rows : [];
+  const tabRows: Array<DueInvoice | FollowupPipeline | CustomerGroup> =
+    tab === "dues" ? (byCustomer ? groups : visibleDues) : tab === "due" ? dueReminders : tab === "pipelines" ? rows : [];
   const total = tab === "history" ? attempts.length : tabRows.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(page, pageCount);
   const slice = <T,>(list: T[]) => list.slice((safePage - 1) * pageSize, safePage * pageSize);
-  const pageDues = tab === "dues" ? slice(visibleDues) : [];
+  const pageDues = tab === "dues" && !byCustomer ? slice(visibleDues) : [];
+  const pageGroups = byCustomer ? slice(groups) : [];
   const pagePipes = tab === "due" ? slice(dueReminders) : tab === "pipelines" ? slice(rows) : [];
-  const pageIds = tab === "dues" ? pageDues.filter((row) => row.linkedInvoiceNumber).map((row) => row.id) : pagePipes.map((row) => row.id);
+  const pageIds = byCustomer
+    ? pageGroups.map((group) => `c:${group.name}`)
+    : tab === "dues" ? pageDues.filter((row) => row.linkedInvoiceNumber).map((row) => row.id) : pagePipes.map((row) => row.id);
 
   const kpis = useMemo(() => {
     const confirmed = due.filter((row) => kindOf(row) !== "unclear");
@@ -270,14 +325,27 @@ export function FollowUpPipelines() {
     setEnrollError("");
   };
 
+  // One message per customer: ids are customer names, phones are keyed by name.
+  const openEnrollCustomers = (names: string[], once: boolean) => {
+    const chosen = groups.filter((group) => names.includes(group.name) && !customerPipeline(group.name));
+    if (!chosen.length) return say("warn", "Those customers already have a reminder running.");
+    setPhones(Object.fromEntries(chosen.map((group) => [group.name, group.phone])));
+    setTemplate((current) => current || messages[0]?.key || "");
+    setEnrolling({ ids: chosen.map((group) => group.name), once, customers: true });
+    setEnrollError("");
+  };
+
   const chosenPlan = savedPlans.find((plan) => plan.id === planId);
 
   const submitEnroll = async () => {
     if (!company || !enrolling) return;
-    const chosen = due.filter((row) => enrolling.ids.includes(row.id));
+    const chosen = enrolling.customers
+      ? groups.filter((group) => enrolling.ids.includes(group.name)).flatMap((group) => group.invoices.map((row) => ({ ...row, partyPhone: phones[group.name] ?? "" })))
+      : due.filter((row) => enrolling.ids.includes(row.id));
     if (!template) return setEnrollError("No WhatsApp reminder message is configured yet. Ask your administrator to register an approved template.");
-    const missing = chosen.filter((row) => !/^[6-9]\d{9}$/.test(phones[row.id] ?? ""));
-    if (missing.length) return setEnrollError(`Enter a valid 10-digit mobile number for ${missing.map((row) => row.partyLedgerName).slice(0, 3).join(", ")}${missing.length > 3 ? "…" : ""}.`);
+    const phoneOf = (row: DueInvoice) => (enrolling.customers ? phones[row.partyLedgerName] : phones[row.id]) ?? "";
+    const missing = [...new Set(chosen.filter((row) => !/^[6-9]\d{9}$/.test(phoneOf(row))).map((row) => row.partyLedgerName))];
+    if (missing.length) return setEnrollError(`Enter a valid 10-digit mobile number for ${missing.slice(0, 3).join(", ")}${missing.length > 3 ? "…" : ""}.`);
     setEnrollBusy(true);
     setEnrollError("");
     try {
@@ -285,6 +353,7 @@ export function FollowUpPipelines() {
         connectionId: company.connectionId,
         companyName: company.companyName,
         financialYear: company.financialYear,
+        mode: enrolling.customers ? "customer" : "invoice",
         plan: {
           name: enrolling.once ? "Send once" : chosenPlan?.name ?? "Standard",
           stages: enrolling.once
@@ -297,7 +366,7 @@ export function FollowUpPipelines() {
           customer: row.partyLedgerName,
           invoice: row.linkedInvoiceNumber ?? "",
           invoiceDate: row.linkedInvoiceDate ?? "",
-          recipient: phones[row.id],
+          recipient: phoneOf(row),
           narration: row.narration ?? "",
         })),
       });
@@ -398,15 +467,24 @@ export function FollowUpPipelines() {
   const startable = selDues.filter((row) => !pipelineFor(row));
   const noPhone = startable.filter((row) => !tenDigits(row.partyPhone)).length;
   const tallyOk = !scanError;
-  const messageFor = (key: string) => messages.find((m) => m.key === key)?.text;
+  const messageFor = (key: string | undefined) => messages.find((m) => m.key === key)?.text;
   const detail = rows.find((row) => row.id === detailId);
   const focusRow = review ? rows.find((row) => row.id === review.focus) : undefined;
-  const enrollRows = enrolling ? due.filter((row) => enrolling.ids.includes(row.id)) : [];
+  const enrollRows = enrolling && !enrolling.customers ? due.filter((row) => enrolling.ids.includes(row.id)) : [];
+  const enrollGroups = enrolling?.customers ? groups.filter((group) => enrolling.ids.includes(group.name)) : [];
+  const selGroups = groups.filter((group) => selected.has(`c:${group.name}`));
+  const startableGroups = selGroups.filter((group) => !customerPipeline(group.name));
 
   const bulkBar = selectedCount > 0 && !enrolling && (
     <div className="bulkbar">
       <span className="bb-count">{selectedCount} selected</span><span className="bb-sep" />
-      {tab === "dues" ? (
+      {byCustomer ? (
+        <>
+          <button className="bb pri" disabled={!startableGroups.length} onClick={() => openEnrollCustomers(startableGroups.map((group) => group.name), false)}>Start reminders<small>{startableGroups.length}</small></button>
+          <button className="bb" disabled={!startableGroups.length} onClick={() => openEnrollCustomers(startableGroups.map((group) => group.name), true)}>Send once<small>{startableGroups.length}</small></button>
+          {startableGroups.some((group) => !group.phone) && <button className="bb warn" onClick={() => openEnrollCustomers(startableGroups.map((group) => group.name), false)}>⚠ {startableGroups.filter((group) => !group.phone).length} no contact</button>}
+        </>
+      ) : tab === "dues" ? (
         <>
           <button className="bb pri" disabled={!startable.length} onClick={() => openEnroll(startable.map((row) => row.id), false)}>Start reminders<small>{startable.length}</small></button>
           <button className="bb" disabled={!startable.length} onClick={() => openEnroll(startable.map((row) => row.id), true)}>Send once<small>{startable.length}</small></button>
@@ -486,6 +564,10 @@ export function FollowUpPipelines() {
               <button className="btn" onClick={() => setEnrolling(null)}>← Back to unpaid invoices</button>
             ) : tab === "dues" ? (
               <>
+                <select aria-label="Group invoices" value={view} onChange={(e) => { setView(e.target.value as "invoice" | "customer"); setSelected(new Set()); setPage(1); }}>
+                  <option value="customer">By customer</option>
+                  <option value="invoice">By invoice</option>
+                </select>
                 <select aria-label="Payment type" value={kind} onChange={(e) => { setKind(e.target.value as Kind); setPage(1); }}>
                   <option value="all">All payment types</option>
                   {(Object.keys(KIND_LABEL) as Array<keyof typeof KIND_LABEL>).map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
@@ -505,11 +587,33 @@ export function FollowUpPipelines() {
         {enrolling ? (
           <div className="enroll">
             <div className="eh">
-              <small>{enrolling.once ? "Send once" : "Invoice reminders"}</small>
+              <small>{enrolling.once ? "Send once" : enrolling.customers ? "Customer reminders" : "Invoice reminders"}</small>
+              {enrolling.customers ? (
+                <>
+                  <h3>{enrollGroups.length === 1 ? enrollGroups[0].name : `${enrollGroups.length} customers`}</h3>
+                  <p>{enrollGroups.reduce((sum, group) => sum + group.invoices.length, 0)} invoices · Outstanding {money(enrollGroups.reduce((sum, group) => sum + group.total, 0))}</p>
+                </>
+              ) : (
+                <>
               <h3>{enrollRows.length === 1 ? enrollRows[0].partyLedgerName : `${enrollRows.length} invoices`}</h3>
               <p>{enrollRows.length === 1 ? `${enrollRows[0].linkedInvoiceNumber} · ${fmtDate(enrollRows[0].linkedInvoiceDate)} · Outstanding ${money(enrollRows[0].outstandingAmount)}` : `Outstanding ${money(enrollRows.reduce((sum, row) => sum + row.outstandingAmount, 0))}`}</p>
+                </>
+              )}
             </div>
             <div className="eb">
+              {enrollGroups.map((group) => (
+                <label className="f" key={group.name}>
+                  <span>{enrollGroups.length > 1 ? `${group.name} · ${group.invoices.length} invoice${group.invoices.length === 1 ? "" : "s"}` : "Customer’s WhatsApp number"}{group.phone ? " (on file)" : ""}</span>
+                  <input type="tel" inputMode="numeric" maxLength={10} placeholder="10-digit mobile number" value={phones[group.name] ?? ""}
+                    onChange={(e) => setPhones((current) => ({ ...current, [group.name]: e.target.value.replace(/D/g, "").slice(-10) }))} />
+                </label>
+              ))}
+              {enrollGroups[0] && (() => {
+                const first = enrollGroups[0];
+                const listed = first.invoices.map((row) => ({ invoice: row.linkedInvoiceNumber ?? "", invoice_date: row.linkedInvoiceDate, outstanding: row.outstandingAmount }));
+                const text = messageText(listed.length > 1 ? messageFor(SUMMARY_KEY) : messageFor(template), { customer: first.name, invoice: listed[0]?.invoice ?? "", invoice_date: listed[0]?.invoice_date ?? null, outstanding: first.total, invoices: listed }, company?.companyName ?? "");
+                return text ? <WhatsappBubble name={first.name} phone={phones[first.name] ?? ""} text={text} /> : null;
+              })()}
               {enrollRows.map((row) => (
                 <label className="f" key={row.id}>
                   <span>{enrollRows.length > 1 ? `${row.partyLedgerName} · ${row.linkedInvoiceNumber}` : "Customer’s WhatsApp number"}{tenDigits(row.partyPhone) ? " (on file)" : ""}</span>
@@ -517,13 +621,13 @@ export function FollowUpPipelines() {
                     onChange={(e) => setPhones((current) => ({ ...current, [row.id]: e.target.value.replace(/\D/g, "").slice(-10) }))} />
                 </label>
               ))}
-              <label className="f">
+              {!enrolling.customers && <label className="f">
                 <span>WhatsApp message</span>
                 <select value={template} onChange={(e) => setTemplate(e.target.value)}>
                   {messages.length === 0 && <option value="">No WhatsApp reminder message is configured yet</option>}
                   {messages.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
                 </select>
-              </label>
+              </label>}
               {!enrolling.once && savedPlans.length > 0 && (
                 <label className="f">
                   <span>Reminder plan</span>
@@ -556,13 +660,56 @@ export function FollowUpPipelines() {
         ) : (
           <>
             <p className="footnote">
-              {tab === "dues" && "Open invoices read from Tally. Select invoices to start reminders in bulk."}
+              {tab === "dues" && (byCustomer ? "One message per customer lists all their unpaid invoices. Invoices with unclear payment terms are left out." : "Open invoices read from Tally. Select invoices to start reminders in bulk.")}
               {tab === "due" && "Reminders that are due now. Tally is checked before each one is sent."}
               {tab === "pipelines" && "Every reminder journey, running or finished."}
               {tab === "history" && "Every WhatsApp reminder, newest first."}
             </p>
             <div className="flat">
-              {scanning && tab === "dues" && !due.length ? <div className="skel" /> : tab === "dues" ? (
+              {scanning && tab === "dues" && !due.length ? <div className="skel" /> : byCustomer ? (
+                <table className="grid">
+                  <thead><tr>
+                    <th style={{ width: 36 }}><input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} /></th>
+                    <th>Customer</th><th style={{ width: 110 }}>Invoices</th><th className="r" style={{ width: 150 }}>Outstanding</th>
+                    <th style={{ width: "18%" }}>Oldest overdue</th><th style={{ width: 170 }}>Reminders</th>
+                  </tr></thead>
+                  <tbody>
+                    {pageGroups.map((group) => {
+                      const pipe = customerPipeline(group.name);
+                      const open = opened.has(group.name);
+                      return (
+                        <Fragment key={group.name}>
+                          <tr>
+                            <td><input type="checkbox" aria-label={`Select ${group.name}`} checked={selected.has(`c:${group.name}`)} onChange={(e) => toggle(`c:${group.name}`, e.target.checked)} /></td>
+                            <td>
+                              <button className="lnk" style={{ textDecoration: "none", textAlign: "left" }} aria-expanded={open}
+                                onClick={() => setOpened((current) => { const next = new Set(current); if (open) next.delete(group.name); else next.add(group.name); return next; })}>
+                                <span className="cname">{group.name}</span>
+                              </button>
+                              {!group.phone && <span className="csub">No contact on file</span>}
+                            </td>
+                            <td>{group.invoices.length}</td>
+                            <td className="r num">{money(group.total)}</td>
+                            <td>{group.maxAge > 0 ? <span className={group.maxAge > 30 ? "age-bad" : "age-warn"}>{group.maxAge} days</span> : <span>Due today</span>}</td>
+                            <td>{pipe
+                              ? <span className="pill pill-stone">{STATUS_LABEL[pipe.status]}</span>
+                              : <button className="btn" onClick={() => openEnrollCustomers([group.name], false)}>Remind customer</button>}</td>
+                          </tr>
+                          {open && group.invoices.map((row) => (
+                            <tr key={row.id} className="sub">
+                              <td />
+                              <td colSpan={2}>{row.linkedInvoiceNumber}<span className="csub">{fmtDate(row.linkedInvoiceDate)}</span></td>
+                              <td className="r num">{money(row.outstandingAmount)}</td>
+                              <td colSpan={2}>{ageCell(row)}</td>
+                            </tr>
+                          ))}
+                        </Fragment>
+                      );
+                    })}
+                    {!pageGroups.length && <tr><td colSpan={6} className="empty">{scanError ? "Tally could not be read." : "No customers have unpaid invoices that need a follow-up."}</td></tr>}
+                  </tbody>
+                </table>
+              ) : tab === "dues" ? (
                 <table className="grid">
                   <thead><tr>
                     <th style={{ width: 36 }}><input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} /></th>
@@ -697,7 +844,7 @@ export function FollowUpPipelines() {
                           return { ...current, off };
                         })} />
                         <button style={{ all: "unset", cursor: "pointer", flex: 1, minWidth: 0 }} onClick={() => setReview({ ...review, focus: id })}>
-                          <b style={{ display: "block" }}>{row.customer}</b><span className="muted">{row.invoice} · {money(row.outstanding)}</span>
+                          <b style={{ display: "block" }}>{row.customer}</b><span className="muted">{row.kind === "customer" ? row.invoice : row.invoice} · {money(row.outstanding)}</span>
                         </button>
                       </div>
                     );
@@ -705,7 +852,7 @@ export function FollowUpPipelines() {
                 </div>
               )}
               <p style={{ fontSize: 12, color: "#756b60", margin: "0 0 12px" }}>To {maskPhone(focusRow.recipient)}. This is exactly what the customer will receive.</p>
-              <WhatsappBubble name={focusRow.customer} phone={focusRow.recipient} text={messageText(messageFor(focusRow.stages[focusRow.stage_index]?.template), focusRow, focusRow.company_name) || "No message template is configured."} />
+              <WhatsappBubble name={focusRow.customer} phone={focusRow.recipient} text={messageText(messageFor(templateKeyFor(focusRow, focusRow.stages[focusRow.stage_index]?.template)), focusRow, focusRow.company_name) || "No message template is configured."} />
             </div>
             <div className="panel-f">
               <button className="btn" disabled={sending} onClick={() => setReview(null)}>Cancel</button>
@@ -729,7 +876,9 @@ export function FollowUpPipelines() {
               <dl className="facts">
                 <div><dt>Status</dt><dd>{STATUS_LABEL[detail.status]}</dd></div>
                 <div><dt>Outstanding</dt><dd>{money(detail.outstanding)}</dd></div>
-                <div><dt>Invoice date</dt><dd>{fmtDate(detail.invoice_date)}</dd></div>
+                {detail.kind === "customer"
+                  ? <div><dt>Invoices</dt><dd>{(detail.invoices ?? []).map((i) => `${i.invoice} ${money(i.outstanding)}`).join(", ")}</dd></div>
+                  : <div><dt>Invoice date</dt><dd>{fmtDate(detail.invoice_date)}</dd></div>}
                 <div><dt>WhatsApp</dt><dd>{maskPhone(detail.recipient)}</dd></div>
                 <div><dt>Stage</dt><dd>{detail.stages[detail.stage_index]?.name ?? "—"} · {detail.stage_sent} of {detail.stages[detail.stage_index]?.limit ?? 1} sent</dd></div>
                 <div><dt>Next reminder</dt><dd>{detail.next_due_at ? fmtDateTime(detail.next_due_at) : "None"}</dd></div>
