@@ -26,6 +26,15 @@ export function financialYearStart(financialYear: string | null | undefined) {
 type LiveLedger = ScopeMaster & { gstin?: string | null };
 type LedgerBucket = { complete?: boolean; openBills?: unknown[]; settledBills?: unknown[] };
 
+// Says how much of the scan came from the connector's local copy of Tally's vouchers.
+function describeCache(cache: { mode?: string; vouchersRead?: number; cachedVouchers?: number } | undefined, customerCount: number) {
+  const base = `Read ${customerCount} customers in one pass.`;
+  if (cache?.mode === "unchanged") return `${base} Nothing changed in Tally since the last scan, so saved vouchers were reused.`;
+  if (cache?.mode === "delta") return `${base} Only ${cache.vouchersRead ?? 0} changed voucher(s) were read; the rest came from the saved copy.`;
+  if (cache?.mode === "rebuilt") return `${base} First scan: all vouchers were read and saved, so later scans will be much faster.`;
+  return base;
+}
+
 // Tally serves one request at a time; a batch that queued behind the previous
 // export is safe to repeat after a short pause.
 async function withBusyRetry<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
@@ -106,13 +115,14 @@ async function runLiveCashDiscountDashboard<T>(params: {
   try {
     onScanInfo?.({ mode: "fast", label: "Fast scan", detail: `Reading all ${customers.length} customers in one pass.` });
     onProgress?.("Fast scan: reading the whole company from Tally...");
-    const read = await withBusyRetry(signal, () => runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
+    const read = await withBusyRetry(signal, () => runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket>; queryDiagnostics?: { evidenceCache?: { mode?: string; vouchersRead?: number; cachedVouchers?: number } } }>({
       connectionId, companyName, financialYear, signal, onProgress,
       operation: "fetch_customer_open_bills",
       payload: { companyName, financialYear, queryStrategy: "company_scan", ledgerNames: [], scopeLedgerNames: customers.map((customer) => customer.name) },
     }));
     Object.assign(byLedger, read.byLedger ?? {});
     scanned = true;
+    onScanInfo?.({ mode: "fast", label: "Fast scan", detail: describeCache(read.queryDiagnostics?.evidenceCache, customers.length) });
   } catch (error) {
     if (!(error instanceof Error) || !/requires ledgerName/i.test(error.message)) throw error;
   }
