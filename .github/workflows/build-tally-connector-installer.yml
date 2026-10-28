@@ -9,10 +9,15 @@ on:
       - "apps/tally-bridge/**"
       - "installer/tally-bridge/**"
       - "scripts/build-tally-connector-installer.mjs"
+      - "scripts/prepare-connector-release.mjs"
       - ".github/workflows/build-tally-connector-installer.yml"
 
 permissions:
   contents: write
+
+concurrency:
+  group: connector-release
+  cancel-in-progress: false
 
 jobs:
   build-windows-installer:
@@ -50,29 +55,38 @@ jobs:
       - name: Validate installer identity
         run: npm run installer:tally-bridge:validate
 
+      - name: Test updater and duplicate protections
+        run: node --test installer/tally-bridge/electron-app/updates.test.mjs installer/tally-bridge/electron-app/update-helper.test.mjs apps/tally-bridge/src/bridge.test.mjs
+
       - name: Build Gajkesari installer
         run: npm run installer:tally-bridge
 
-      - name: Record installer checksum
-        shell: pwsh
-        run: Get-FileHash installer\tally-bridge\output\GajkesariTallyConnectorSetup.exe -Algorithm SHA256
+      - name: Prepare versioned installer and update manifest
+        run: node scripts/prepare-connector-release.mjs
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7.0.1
         with:
           name: GajkesariTallyConnectorSetup
-          path: installer/tally-bridge/output/GajkesariTallyConnectorSetup.exe
+          path: installer/tally-bridge/release/*
           if-no-files-found: error
 
+      # Releases feed the in-app updater, so they are published only on an
+      # explicit manual run, never as a side effect of pushing to main.
       - name: Publish permanent GitHub release
+        if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "gajkesari-tally-connector-v0.1.32"
-          $installer = "installer\tally-bridge\output\GajkesariTallyConnectorSetup.exe"
+          $manifest = Get-Content installer/tally-bridge/release/connector-update.json -Raw | ConvertFrom-Json
+          $tag = "gajkesari-tally-connector-v$($manifest.version)"
+          $installer = "installer/tally-bridge/release/GajkesariTallyConnectorSetup-$($manifest.version).exe"
           gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target $env:GITHUB_SHA --title "Gajkesari Tally Connector v0.1.32" --notes "Windows installer for the Gajkesari Tally Connector. Registers the gajkesari-tally protocol, installs separately under C:\Gajkesari\tally-bridge, and supports durable connector session control."
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists. Published updates are immutable; increment the connector version."
           }
-          gh release upload $tag $installer --clobber
+          gh release create $tag $installer installer/tally-bridge/release/connector-update.json --draft --target $env:GITHUB_SHA --title "Gajkesari Tally Connector $($manifest.version)" --notes "Windows connector with in-app updates. Download the installer for first-time setup; subsequent releases can be installed from Connector updates."
+          if ($LASTEXITCODE -ne 0) { throw "Release upload failed. The update has not been published." }
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish the completed update release." }

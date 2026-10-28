@@ -2,6 +2,9 @@ import { app, BrowserWindow, dialog, net, ipcMain, safeStorage } from "electron"
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { createConnectorUpdater } from "./updates.mjs";
+import { createElectronConnectorUpdater } from "./electron-updates.mjs";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
 import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, upsertGroups, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
 import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable, closeZvecCollections } from "./src/local-matching/vector.mjs";
@@ -24,6 +27,7 @@ app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CONNECTOR_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version;
 const brandLogoPath = path.join(__dirname, "assets", "gajkesari-logo.png");
 const brandLogoDataUrl = `data:image/png;base64,${fs.readFileSync(brandLogoPath).toString("base64")}`;
 const installDir = path.resolve(__dirname, "..", "..");
@@ -34,6 +38,102 @@ const ELECTRON_NETWORK_RETRY_MS = 5 * 60 * 1000;
 let preferNodeFetchUntil = 0;
 let directEmbeddingConfig = null;
 let localSyncInFlight = null;
+let updater = null;
+let updateInstalling = false;
+let vectorising = false;
+let updateAcknowledgement = null;
+
+function sendUpdateState(state) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("updates:state", state);
+}
+
+async function installConnectorUpdate(update) {
+  const directory = path.join(app.getPath("userData"), "updates");
+  if (process.platform !== "win32" || path.resolve(installDir).toLowerCase() !== "c:\\gajkesari\\tally-bridge" ||
+      path.basename(process.execPath) !== "Gajkesari Tally Connector.exe") {
+    updateInstalling = false;
+    throw new Error("Install this connector normally before using automatic updates.");
+  }
+  const helper = path.join(directory, "update-helper.ps1");
+  const jobPath = path.join(directory, "update-job.json");
+  const job = { ...update, parentPid: process.pid, installDir,
+    backup: path.join(directory, `backup-${Date.now()}`), receipt: path.join(directory, "update-result.json"),
+    ack: path.join(directory, "update-ack.json"), ready: path.join(directory, "helper-ready") };
+  fs.copyFileSync(path.join(__dirname, "update-helper.ps1"), helper);
+  for (const target of [job.receipt, job.ack, job.ready]) fs.rmSync(target, {force:true});
+  fs.writeFileSync(jobPath, JSON.stringify(job), {mode:0o600});
+  let spawnError;
+  const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper, "-JobPath", jobPath],
+    {detached:true,windowsHide:true,stdio:"ignore"});
+  child.once("error", error => { spawnError = error; });
+  child.unref();
+  const until = Date.now() + 10000;
+  while (!fs.existsSync(job.ready)) {
+    if (spawnError || Date.now() > until || fs.existsSync(job.receipt)) {
+      updateInstalling = false;
+      if (runner?.stopped) void startRunner().catch(error => appendLog(errPath, error.message));
+      throw spawnError || new Error("The background updater could not start. Please try again.");
+    }
+    await new Promise(resolve => setTimeout(resolve,100));
+  }
+  await closeZvecCollections();
+  app.quit();
+}
+
+async function startConnectorUpdater() {
+  const directory = path.join(app.getPath("userData"), "updates");
+  const metadata = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+  if (metadata.connectorUpdater === "electron-updater") {
+    const {default: electronUpdater} = await import("electron-updater");
+    const writeUpdateLog = (...values) => appendLog(path.join(app.getPath("userData"), "connector-update.log"), values.map(String).join(" "));
+    updater = createElectronConnectorUpdater({
+      engine: electronUpdater.autoUpdater, version: CONNECTOR_VERSION, directory, onState: sendUpdateState,
+      logger: {info: writeUpdateLog, warn: writeUpdateLog, error: writeUpdateLog, debug: writeUpdateLog},
+      prepareForInstall: async () => {
+        if (localSyncInFlight || vectorising || updateInstalling) return false;
+        if (runner && !runner.stopped && !runner.prepareForUpdate()) return false;
+        updateInstalling = true;
+        return true;
+      },
+      beforeQuit: () => closeZvecCollections(),
+      resumeAfterFailure: () => {
+        updateInstalling = false;
+        if (runner?.stopped) void startRunner().catch(error => appendLog(errPath, error.message));
+      },
+    });
+    ipcMain.handle("updates:state", () => updater.getState());
+    ipcMain.handle("updates:check", () => updater.check());
+    ipcMain.handle("updates:download", () => updater.download());
+    ipcMain.handle("updates:install", () => updater.apply());
+    setTimeout(() => { if (!['installed', 'error'].includes(updater.getState().phase)) void updater.check(); }, 15000).unref();
+    setInterval(() => { if (!['downloading', 'ready', 'waiting', 'restarting'].includes(updater.getState().phase)) void updater.check(); }, 4 * 60 * 60 * 1000).unref();
+    return;
+  }
+  updater = createConnectorUpdater({version:CONNECTOR_VERSION,directory,fetch:(url,options)=>net.fetch(url,options),onState:sendUpdateState,
+    prepareForInstall:async()=>{
+      if (localSyncInFlight || vectorising || updateInstalling) return false;
+      if (runner && !runner.stopped && !runner.prepareForUpdate()) return false;
+      updateInstalling = true;
+      return true;
+    },install:async update=>{
+      try { await installConnectorUpdate(update); }
+      catch(error){updateInstalling=false;if(runner?.stopped)void startRunner().catch(e=>appendLog(errPath,e.message));throw error;}
+    }});
+  try {
+    const result = JSON.parse(fs.readFileSync(path.join(directory,"update-result.json"),"utf8").replace(/^\uFEFF/,""));
+    updater.restoreResult(result);
+    if (result.status === "installed" && result.version === CONNECTOR_VERSION) {
+      updateAcknowledgement = path.join(directory,"update-ack.json");
+    }
+  } catch {}
+  ipcMain.handle("updates:state",()=>updater.getState());
+  ipcMain.handle("updates:check",()=>updater.check());
+  ipcMain.handle("updates:download",()=>updater.download());
+  ipcMain.handle("updates:install",()=>updater.apply());
+  // Never apply automatically: the user chooses when to restart.
+  setTimeout(()=>{if (!['installed','error'].includes(updater.getState().phase))void updater.check();},15000).unref();
+  setInterval(()=>{if (!['downloading','verifying','ready','waiting','restarting'].includes(updater.getState().phase))void updater.check();},4*60*60*1000).unref();
+}
 
 function directEmbeddingConfigPath() {
   return path.join(app.getPath("userData"), "direct-embedding.json");
@@ -343,6 +443,7 @@ async function handleLocalSync({ forceFull = false } = {}) {
 }
 
 function scheduleLocalSync(options = {}) {
+  if (updateInstalling) return Promise.reject(new Error("The connector is restarting for an update."));
   if (localSyncInFlight) return localSyncInFlight;
   const startedAt = Date.now();
   const execute = () => handleLocalSync(options);
@@ -536,6 +637,7 @@ async function renderTallyPrintToPdf({ html, fileName }) {
 }
 
 async function startRunner() {
+  if (updateInstalling) return;
   if (runner && !runner.stopped) runner.stop("restarting");
 
   runner = createBridgeRunner({
@@ -838,12 +940,15 @@ function createWindow() {
           <div class="updateHero">
             <div class="updateTile" aria-hidden="true">✓</div>
             <div>
-              <p class="updateVersion">Current version 0.1.73</p>
-              <h2 id="updateTitle">You're up to date</h2>
-              <p id="updateCopy">Last checked a few minutes ago.</p>
+              <p class="updateVersion">Current version ${CONNECTOR_VERSION}</p>
+              <h2 id="updateTitle">Connector updates</h2>
+              <p id="updateCopy">Check for the latest improvements.</p>
             </div>
           </div>
           <button id="checkUpdatesBtn" class="updateAction">Check for updates</button>
+          <p id="updateLastUpdated" class="meta" hidden></p>
+          <progress id="updateProgress" max="100" value="0" hidden style="width:100%;margin-top:12px;accent-color:#b87529" aria-label="Update download progress"></progress>
+          <p id="updateNotice" class="meta" role="status" aria-live="polite"></p>
         </div>
         </div>
 
@@ -937,17 +1042,42 @@ function createWindow() {
           });
           homeLedgerCard.addEventListener('click', showLedgerMatching);
           homeVectorCard.addEventListener('click', showLedgerMatching);
-          checkUpdatesBtn.addEventListener('click', () => {
+          let updateState = {phase:'idle'};
+          function renderUpdate(state){
+            updateState = state;
+            const phase = state.phase;
+            document.getElementById('updateTitle').textContent = ({available:'Update available',current:"You're up to date",installed:'Updated successfully',error:'Update needs attention',ready:'Ready to update',waiting:'Finish Tally work first',restarting:'Restarting connector',checking:'Checking for updates',downloading:'Downloading update',verifying:'Verifying update'})[phase] || 'Connector updates';
+            document.getElementById('updateCopy').textContent = state.message || '';
+            document.querySelector('.updateVersion').textContent = 'Current version '+state.currentVersion;
+            const lastUpdated = document.getElementById('updateLastUpdated');
+            lastUpdated.hidden = !state.lastUpdatedAt;
+            lastUpdated.textContent = state.lastUpdatedAt ? 'Last updated: '+fmtTime(state.lastUpdatedAt) : '';
+            const busy = ['checking','downloading','verifying','restarting'].includes(phase);
+            checkUpdatesBtn.disabled = busy;
+            checkUpdatesBtn.textContent = busy ? (phase === 'downloading' ? 'Downloading… '+(state.progress || 0)+'%' : 'Please wait…')
+              : phase === 'available' ? 'Update now' : ['ready','waiting'].includes(phase) ? 'Restart and update' : 'Check for updates';
+            const progress = document.getElementById('updateProgress');
+            progress.hidden = !['downloading','verifying','ready','waiting','restarting'].includes(phase);
+            progress.value = state.progress || 0;
+            document.getElementById('updateNotice').textContent = ['ready','waiting','restarting'].includes(phase) ? 'Your connection and saved settings will be kept. Only the connector restarts.' : '';
+            menuUpdates.textContent = ['available','ready','waiting'].includes(phase) ? 'Connector updates · New update' : 'Connector updates';
+            menuBtn.title = ['available','ready','waiting'].includes(phase) ? 'A connector update is available' : 'More';
+            let badge = document.getElementById('homeUpdateNotice');
+            if(!badge){badge=document.createElement('button');badge.id='homeUpdateNotice';badge.className='updateAction';badge.addEventListener('click',showUpdates);document.getElementById('menuUpdates').closest('.moreWrap').parentElement.insertAdjacentElement('afterend',badge);}
+            badge.hidden = !['available','ready','waiting'].includes(phase);
+            badge.textContent = 'Connector update available · View update';
+          }
+          ipcRenderer.on('updates:state',(_event,state)=>renderUpdate(state));
+          ipcRenderer.invoke('updates:state').then(renderUpdate).catch(()=>{});
+          checkUpdatesBtn.addEventListener('click', async () => {
             checkUpdatesBtn.disabled = true;
-            checkUpdatesBtn.textContent = 'Checking…';
-            document.getElementById('updateTitle').textContent = 'Checking for updates';
-            document.getElementById('updateCopy').textContent = 'This takes only a moment.';
-            setTimeout(() => {
-              document.getElementById('updateTitle').textContent = "You're up to date";
-              document.getElementById('updateCopy').textContent = 'Checked just now.';
-              checkUpdatesBtn.textContent = 'Check again';
-              checkUpdatesBtn.disabled = false;
-            }, 900);
+            try {
+              if(updateState.phase === 'available'){
+                renderUpdate(await ipcRenderer.invoke('updates:download'));
+                if(updateState.phase === 'ready')renderUpdate(await ipcRenderer.invoke('updates:install'));
+              }else if(['ready','waiting'].includes(updateState.phase))renderUpdate(await ipcRenderer.invoke('updates:install'));
+              else renderUpdate(await ipcRenderer.invoke('updates:check'));
+            }catch{renderUpdate({...updateState,phase:'error',message:'Could not update. Please try again.'});}
           });
           ipcRenderer.on('navigate:updates', showUpdates);
 
@@ -1103,7 +1233,10 @@ function createWindow() {
   `)}`;
 
   mainWindow.once("ready-to-show", showWindow);
-  mainWindow.webContents.on("did-finish-load", () => sendStatus(lastStatus));
+  mainWindow.webContents.on("did-finish-load", () => {
+    sendStatus(lastStatus);
+    if(updateAcknowledgement){fs.writeFileSync(updateAcknowledgement,JSON.stringify({version:CONNECTOR_VERSION}));updateAcknowledgement=null;}
+  });
   mainWindow.webContents.on("did-fail-load", (_event, code, description) => {
     appendLog(errPath, `Connector status page failed to load (${code}: ${description}).`);
   });
@@ -1150,8 +1283,9 @@ if (!gotLock) {
     if (mainWindow) handleProtocolUrl(url);
     else pendingProtocolUrl = url;
   });
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     installSystemNetworkFetch();
+    await startConnectorUpdater();
     ipcMain.on("window:minimize", () => mainWindow?.minimize());
     ipcMain.on("window:toggle-maximize", () => {
       if (!mainWindow) return;
@@ -1164,7 +1298,11 @@ if (!gotLock) {
       ipcMain.handle("connection:recheck", async () => handleConnectionRecheck());
       ipcMain.handle("local-matching:getStatus", async () => getLocalMatchingStatus());
       ipcMain.handle("local-matching:sync", async (_event, payload) => scheduleLocalSync({ forceFull: payload?.forceFull === true }));
-      ipcMain.handle("local-matching:vectorise", async () => handleLocalVectorise());
+      ipcMain.handle("local-matching:vectorise", async () => {
+        if (updateInstalling) throw new Error("The connector is restarting for an update.");
+        vectorising = true;
+        try { return await handleLocalVectorise(); } finally { vectorising = false; }
+      });
       ipcMain.handle("local-matching:suggest", async (_event, payload) => {
         const topK = payload?.topK || payload?.top_k || 10;
         return await suggestLedgers({
