@@ -23,6 +23,21 @@ export function financialYearStart(financialYear: string | null | undefined) {
 type LiveLedger = ScopeMaster & { gstin?: string | null };
 type LedgerBucket = { complete?: boolean; openBills?: unknown[]; settledBills?: unknown[] };
 
+// Tally serves one request at a time; a batch that queued behind the previous
+// export is safe to repeat after a short pause.
+async function withBusyRetry<T>(signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      const busy = error instanceof Error && /tally is busy/i.test(error.message);
+      if (!busy || attempt >= 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      signal?.throwIfAborted();
+    }
+  }
+}
+
 async function readError(response: Response) {
   const payload = (await response.json().catch(() => ({}))) as { error?: string };
   return payload.error || `Request failed with status ${response.status}`;
@@ -69,11 +84,11 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
   for (const [index, ledgerNames] of batches.entries()) {
     signal?.throwIfAborted();
     onProgress?.(`Reading open bills ${index * LEDGERS_PER_READ + ledgerNames.length} of ${customers.length} customers...`);
-    const read = await runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
+    const read = await withBusyRetry(signal, () => runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
       connectionId, companyName, financialYear, signal, onProgress,
       operation: "fetch_customer_open_bills",
       payload: { companyName, financialYear, ledgerNames, ...(dateFrom ? { dateFrom } : {}) },
-    });
+    }));
     Object.assign(byLedger, read.byLedger ?? {});
   }
 
