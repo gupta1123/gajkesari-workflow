@@ -4467,6 +4467,97 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   };
 }
 
+// Whole-company read for Cash Discount. Tally charges one scan per export no
+// matter how many customers it covers, so three exports replace hundreds of
+// per-customer batches. The existing open-bill logic then builds the result.
+const COMPANY_SCAN_EVIDENCE_FIELDS =
+  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
+
+function dateRangeChunks(fromIso, toIso, months = 2) {
+  const chunks = [];
+  const end = new Date(`${toIso}T00:00:00Z`);
+  let start = new Date(`${fromIso}T00:00:00Z`);
+  while (start <= end) {
+    const next = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + months, 1));
+    const stop = new Date(Math.min(next.getTime() - 86_400_000, end.getTime()));
+    chunks.push({ dateFrom: start.toISOString().slice(0, 10), dateTo: stop.toISOString().slice(0, 10) });
+    start = next;
+  }
+  return chunks;
+}
+
+async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependencies = {}) {
+  const startedAt = Date.now();
+  const scopeNames = uniquePayloadLedgerNames({ ledgerNames: commandPayload.scopeLedgerNames });
+  if (scopeNames.length === 0) throw new Error("Company scan requires scopeLedgerNames.");
+  const scopeByKey = new Map(scopeNames.map((name) => [normalizeLooseName(name), name]));
+  const companyName = commandPayload.companyName || null;
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || new Date().toISOString().slice(0, 10);
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+
+  dependencies.onProgress?.("Reading every open bill in Tally...");
+  const billXml = await exportCollection(tallyUrl, {
+    collectionName: "Gajkesari Company Open Bills", tallyType: "Bill",
+    fetchFields: "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+    companyName, dateTo: asOfDate, timeoutMs: 120_000,
+  });
+  dependencies.signal?.throwIfAborted();
+  const billsReadAt = Date.now();
+  const scopedBills = extractBlocks(billXml, "BILL").filter((block) => scopeByKey.has(normalizeLooseName(billLedgerName(block))));
+  // Receipts and narrations are needed from the oldest in-scope open bill on.
+  const evidenceFrom = earliestBillDate(scopedBills);
+
+  const keptVouchers = [];
+  let voucherChunks = 0;
+  if (evidenceFrom) {
+    const chunks = dateRangeChunks(evidenceFrom, asOfDate);
+    for (const [index, range] of chunks.entries()) {
+      dependencies.signal?.throwIfAborted();
+      dependencies.onProgress?.(`Reading invoices and receipts ${index + 1} of ${chunks.length}...`);
+      const xml = await exportCollection(tallyUrl, {
+        collectionName: `Gajkesari Company Evidence ${index + 1}`, tallyType: "Voucher",
+        fetchFields: COMPANY_SCAN_EVIDENCE_FIELDS,
+        companyName, dateFrom: range.dateFrom, dateTo: range.dateTo, timeoutMs: 120_000,
+      });
+      voucherChunks += 1;
+      // Keep only invoice/receipt vouchers for in-scope customers so memory stays small.
+      for (const voucher of extractBlocks(xml, "VOUCHER")) {
+        if (!isPartyInvoiceVoucher(voucher) && !isPartySettlementVoucher(voucher)) continue;
+        const touchesScope = [
+          getTagText(voucher, "PARTYLEDGERNAME"),
+          ...extractBlocks(voucher, "ALLLEDGERENTRIES.LIST").map((entry) => getTagText(entry, "LEDGERNAME")),
+        ].some((name) => name && scopeByKey.has(normalizeLooseName(name)));
+        if (!touchesScope) continue;
+        keptVouchers.push(voucher);
+      }
+    }
+  }
+  const evidenceReadAt = Date.now();
+
+  const outcome = await fetchCustomerOpenBillsFromTally(
+    config,
+    { ...commandPayload, ledgerNames: scopeNames, queryStrategy: undefined, scopeLedgerNames: undefined, dateFrom: undefined },
+    {
+      ...dependencies,
+      billExport: { xml: billXml, batchCount: 1, queryMode: "company_scan" },
+      voucherExport: { xml: keptVouchers.join(String.fromCharCode(10)), batchCount: voucherChunks, queryMode: "company_scan" },
+    }
+  );
+  outcome.result.queryDiagnostics = {
+    ...outcome.result.queryDiagnostics,
+    scanMode: "company_scan",
+    scopeLedgerCount: scopeNames.length,
+    scopedOpenBillObjects: scopedBills.length,
+    evidenceFrom,
+    evidenceVoucherCount: keptVouchers.length,
+    billsReadMs: billsReadAt - startedAt,
+    evidenceReadMs: evidenceReadAt - billsReadAt,
+    scanTotalMs: Date.now() - startedAt,
+  };
+  return outcome;
+}
+
 async function matchBankStatementInTally(config, commandPayload = {}, dependencies = {}) {
   const startedAt = Date.now();
   const verificationOutcome = await reconcileBankTransactionsInTally(
@@ -6451,7 +6542,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "fetch_customer_open_bills") {
-          const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {}, { signal: controller.signal, onProgress });
+          const outcome = message.payload?.queryStrategy === "company_scan"
+            ? await fetchCompanyOpenBillsScan(config, message.payload, { signal: controller.signal, onProgress })
+            : await fetchCustomerOpenBillsFromTally(config, message.payload || {}, { signal: controller.signal, onProgress });
           await assertCompany();
           return outcome.result || outcome;
         }
@@ -7494,6 +7587,7 @@ export {
   fetchBankLedgersFromTally,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
+  fetchCompanyOpenBillsScan,
   matchBankStatementInTally,
   normalizeTallyUrl,
   openBillBlockRequiresVoucherFallback,
