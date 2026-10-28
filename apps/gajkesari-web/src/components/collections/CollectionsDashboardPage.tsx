@@ -298,15 +298,15 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-      <div className="flex flex-col gap-3 border-b border-[#e5ddd0] px-5 py-4.5 sm:flex-row sm:items-center sm:justify-between bg-[#fcfbfa]/80 rounded-t-2xl">
+    <section>
+      <div className="flex flex-col gap-2 pb-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h3 className="text-sm font-semibold text-[#1a1a1a]">{title}</h3>
           {description ? <p className="mt-0.5 text-[11px] font-semibold text-slate-400">{description}</p> : null}
         </div>
         {action}
       </div>
-      <div className="p-5">{children}</div>
+      <div>{children}</div>
     </section>
   );
 }
@@ -327,7 +327,7 @@ function WorkflowButton({
   return (
     <button
       aria-pressed={active}
-      className={`min-h-28 rounded-2xl border p-5 text-left transition-all duration-300 ${
+      className={`rounded-xl border px-4 py-3 text-left transition-colors ${
         active
           ? "border-[#2d2d2d] bg-white text-[#1a1a1a] ring-1 ring-[#2d2d2d]"
           : "border-[#e5ddd0] bg-white text-[#1a1a1a] hover:border-[#cbd5e1] hover:bg-[#faf8f4] shadow-[0_2px_8px_rgba(0,0,0,0.02)]"
@@ -338,8 +338,8 @@ function WorkflowButton({
       <span className={`text-[11px] font-semibold text-slate-500`}>
         {label}
       </span>
-      <span className="mt-3 block text-3xl font-semibold tracking-tight leading-none">{count}</span>
-      <span className={`mt-2.5 block text-xs font-semibold leading-relaxed text-slate-500`}>{detail}</span>
+      <span className="mt-1 block text-2xl font-semibold tracking-tight leading-none">{count}</span>
+      <span className="mt-1.5 block text-[11px] font-medium text-slate-500">{detail}</span>
     </button>
   );
 }
@@ -997,22 +997,14 @@ export function CollectionsDashboardPage() {
   }
 
   return (
-    <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto px-6 pb-8 pt-5 text-[#1a1a1a] animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <div className="mb-8 border-b border-[#e5ddd0] pb-6 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-6">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-[#1a1a1a] flex items-center gap-2">
-            Cash Discounts
-          </h1>
-          <p className="text-xs font-semibold text-slate-500 mt-1">
-            Review, track, and post debit notes for missed cash discounts.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-3 xl:justify-end">
-          <label className="w-full sm:w-[280px]">
+    <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto px-6 pb-8 pt-4 text-[#1a1a1a] animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-3 border-b border-[#e5ddd0] pb-3">
+        <h1 className="text-xl font-semibold tracking-tight text-[#1a1a1a]">Cash Discounts</h1>
+        <div className="flex flex-wrap items-center gap-2">
+          <label>
             <span className="sr-only">Company</span>
             <select
-              className="h-10 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+              className="h-9 w-[240px] rounded-lg border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none focus:border-[#2d2d2d]"
               onChange={(event) => {
                 const company = companies.find((item) => item.id === event.target.value) ?? null;
                 setSelectedCompanyId(event.target.value);
@@ -1028,41 +1020,31 @@ export function CollectionsDashboardPage() {
               ))}
             </select>
           </label>
-
-          <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs text-slate-500 shadow-sm">
-            <span
-              className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[10px] font-bold ${
-                companyReady
-                  ? "border-emerald-250 bg-emerald-50 text-emerald-800"
-                  : "border-amber-250 bg-amber-50 text-amber-800"
-              }`}
-            >
-              {companyReady ? <CheckCircle2 className="h-3.5 w-3.5" /> : <TriangleAlert className="h-3.5 w-3.5" />}
-              {checkingLiveTallyCompany ? "Checking Tally" : companyReady ? "Tally company verified" : "Switch company in Tally"}
-            </span>
-            <span className="hidden h-4 w-px bg-[#e5ddd0] sm:block" />
-            <span className="whitespace-nowrap font-semibold">
-              Gajkesari: {selectedCompany?.companyName || "Not selected"} · Tally: {checkingLiveTallyCompany ? "Checking…" : activeTallyCompanyName || "Not detected"}
-            </span>
-          </div>
-
+          <span
+            className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium ${
+              companyReady ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-amber-200 bg-amber-50 text-amber-800"
+            }`}
+            title={`Gajkesari: ${selectedCompany?.companyName || "Not selected"}. Tally: ${checkingLiveTallyCompany ? "Checking" : activeTallyCompanyName || "Not detected"}`}
+          >
+            {companyReady ? <CheckCircle2 className="h-3.5 w-3.5" /> : <TriangleAlert className="h-3.5 w-3.5" />}
+            {checkingLiveTallyCompany ? "Checking Tally" : companyReady ? "Tally connected" : "Switch company in Tally"}
+          </span>
           <button
-            className="inline-flex h-10 w-fit items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+            className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#2f2924] hover:bg-[#faf8f4]"
             onClick={() => void refreshAll()}
             type="button"
           >
-            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
             Refresh
           </button>
         </div>
       </div>
 
       {CASH_DISCOUNT_LIVE && (scanInfo || scanProgress) ? (
-        <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-[#e5ddd0] bg-white px-4 py-3 text-xs font-medium text-slate-600">
-          {scanInfo ? <span className="rounded-full bg-[#f3eee8] px-2.5 py-0.5 font-semibold text-[#2f2924]">{scanInfo.label}</span> : null}
-          <span>{scanProgress ?? scanInfo?.detail}</span>
-        </div>
-      ) : null}
+        <p className="mb-3 mt-2 text-right text-[11px] text-slate-500">
+          {scanProgress ?? (scanInfo ? scanInfo.label + ": " + scanInfo.detail : "")}
+        </p>
+      ) : <div className="mb-3" />}
 
       {message ? (
         <div
@@ -1083,8 +1065,8 @@ export function CollectionsDashboardPage() {
         </div>
       ) : null}
 
-      <section className="mb-6">
-        <div className="grid gap-4 md:grid-cols-3">
+      <section className="mb-4">
+        <div className="grid gap-3 md:grid-cols-3">
           <WorkflowButton
             active={activeView === "needsAction"}
             count={pendingProposals.length}
@@ -1132,10 +1114,10 @@ export function CollectionsDashboardPage() {
               Nothing needs action right now.
             </EmptyState>
           ) : (
-            <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <div className="max-h-[calc(100vh-430px)] overflow-auto">
-                <table className="w-full min-w-[960px] border-collapse text-left">
-                  <thead className="sticky top-0 z-10">
+            <div>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[860px] border-collapse text-left">
+                  <thead>
                     <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-xs font-semibold text-slate-500">
                       <th className="w-10 px-4 py-3.5">
                         <input
@@ -1275,10 +1257,10 @@ export function CollectionsDashboardPage() {
           {createdProposals.length === 0 ? (
             <EmptyState>Nothing completed yet.</EmptyState>
           ) : (
-            <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <div className="max-h-[calc(100vh-430px)] overflow-auto">
-                <table className="w-full min-w-[960px] border-collapse text-left">
-                  <thead className="sticky top-0 z-10">
+            <div>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[860px] border-collapse text-left">
+                  <thead>
                     <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-xs font-semibold text-slate-500">
                       <th className="w-10 px-4 py-3.5">
                         <input
@@ -1443,7 +1425,7 @@ export function CollectionsDashboardPage() {
             </div>
             <div className="mt-5 max-h-[360px] overflow-auto rounded-2xl border border-[#e5ddd0]">
               <table className="w-full min-w-[620px] border-collapse text-left">
-                <thead className="sticky top-0 z-10">
+                <thead>
                   <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-xs font-semibold text-slate-500">
                     <th className="px-3 py-3">Customer</th>
                     <th className="w-44 px-3 py-3">Debit note</th>
