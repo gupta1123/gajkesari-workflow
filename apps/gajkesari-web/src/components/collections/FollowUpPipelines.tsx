@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
+import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
 import {
   createPipelines, findCandidates, getCustomerScope, listPipelines, runPipelineAction, saveCustomerScope,
   type FollowupCandidate, type FollowupPipeline, type PipelineAction, type ReminderMessage,
@@ -84,7 +85,8 @@ export function FollowUpPipelines() {
   useEffect(() => {
     (async () => {
       try {
-        const response = await apiFetch("/api/tally/companies", { cache: "no-store" });
+        const connectorId = await resolveTallyConnectionId();
+        const response = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectorId)}`, { cache: "no-store" });
         const payload = await response.json();
         if (response.ok) {
           setCompanies(payload.companies ?? []);

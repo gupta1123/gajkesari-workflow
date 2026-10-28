@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
 import { loadLiveCashDiscountDashboard } from "@/lib/cash-discount-live-dashboard";
 
 type CompanyOption = {
@@ -406,7 +407,9 @@ export function CollectionsDashboardPage() {
   );
 
   const loadCompanies = useCallback(async () => {
-    const response = await apiFetch("/api/tally/companies", { cache: "no-store" });
+    const connectorId = selectedConnectionId || (await resolveTallyConnectionId());
+    if (!connectorId) throw new Error("Connect a Tally connector first.");
+    const response = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectorId)}`, { cache: "no-store" });
     if (!response.ok) throw new Error(await readError(response));
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
     const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
@@ -425,7 +428,7 @@ export function CollectionsDashboardPage() {
       return nextCompanies.some((company) => company.connectionId === current) ? current : "";
     });
     return nextCompanies;
-  }, [selectedCompanyId]);
+  }, [selectedCompanyId, selectedConnectionId]);
 
   const loadDashboard = useCallback(
     async (
