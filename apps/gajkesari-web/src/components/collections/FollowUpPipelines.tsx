@@ -70,6 +70,9 @@ const fmtDate = (value: string | null | undefined) =>
   value ? new Date(`${value.slice(0, 10)}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—";
 const fmtDateTime = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "—";
+// Large balances read better as lakh or crore.
+const shortMoney = (value: number) =>
+  value >= 1e7 ? `₹${(value / 1e7).toFixed(2)} crore` : value >= 1e5 ? `₹${(value / 1e5).toFixed(2)} lakh` : money(value);
 const maskPhone = (value: string | null | undefined) => (value ? `+91 ${value.slice(-10, -5)} ${value.slice(-5)}` : "—");
 
 function tenDigits(value: string | null | undefined) {
@@ -567,7 +570,7 @@ export function FollowUpPipelines() {
         <header className="ph">
           <div className="ph-top">
             <div className="ph-title">
-              <h1>Payment Follow-ups</h1><span className="ph-dot">·</span><span className="ph-sub">Prioritize overdue payments</span>
+              <h1>Payment Follow-ups</h1>
             </div>
             <div className="ph-actions">
               {companies.length > 1 && (
@@ -596,7 +599,7 @@ export function FollowUpPipelines() {
 
         <div className="kpis">
           <div className="kpi"><div className="l">Overdue 1–30 days</div><div className="v">{kpis.early}</div><div className="n">Invoices</div></div>
-          <div className="kpi"><div className="l">Outstanding (excluding review)</div><div className="v">{money(kpis.amount)}</div><div className="n">Confirmed invoices</div></div>
+          <div className="kpi"><div className="l">Outstanding (excluding review)</div><div className="v" title={money(kpis.amount)}>{shortMoney(kpis.amount)}</div><div className="n">Confirmed invoices</div></div>
           <div className="kpi"><div className="l">Overdue 31+ days</div><div className="v">{kpis.late}</div><div className="n">Invoices</div></div>
           <div className="kpi"><div className="l">Needs review</div><div className="v">{kpis.unclear}</div><div className="n">{money(kpis.unclearAmount)} · unclear terms</div></div>
         </div>
@@ -730,12 +733,12 @@ export function FollowUpPipelines() {
                           <input type="checkbox" aria-label={`Select ${group.name}`} checked={selected.has(`c:${group.name}`)} onChange={(e) => toggle(`c:${group.name}`, e.target.checked)} />
                           <button className="cg-name" aria-expanded={open} aria-label={`${open ? "Hide" : "Show"} invoices of ${group.name}`}
                             onClick={() => setOpened((current) => { const next = new Set(current); if (open) next.delete(group.name); else next.add(group.name); return next; })}>
-                            <svg className="chev" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                            <svg className="chev" width="10" height="10" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
                             <span><b title={group.name}>{group.name}</b>{!group.phone && <small>No contact on file</small>}</span>
                           </button>
                           <span className="r num">{group.invoices.length}</span>
                           <span className="r num">{money(group.total)}</span>
-                          <span>{group.maxAge > 0 ? <span className={group.maxAge > 30 ? "age-bad" : "age-warn"}>{group.maxAge} days</span> : "Due today"}</span>
+                          <span>{group.maxAge > 0 ? <span className={group.maxAge > 30 ? "age-bad" : "age-warn"}>{group.maxAge} days</span> : "Due today"}{group.oldest !== "9999" && <small className="csub">oldest invoice {fmtDate(group.oldest)}</small>}</span>
                           <span>{pipe
                             ? <span className="pill pill-stone">{STATUS_LABEL[pipe.status]}</span>
                             : <button className="btn" onClick={() => openEnrollCustomers([group.name], false)}>Remind customer</button>}</span>

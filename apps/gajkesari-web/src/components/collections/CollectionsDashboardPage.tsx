@@ -301,7 +301,7 @@ function Section({
     <section className="rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
       <div className="flex flex-col gap-3 border-b border-[#e5ddd0] px-5 py-4.5 sm:flex-row sm:items-center sm:justify-between bg-[#fcfbfa]/80 rounded-t-2xl">
         <div>
-          <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#1a1a1a]">{title}</h3>
+          <h3 className="text-sm font-semibold text-[#1a1a1a]">{title}</h3>
           {description ? <p className="mt-0.5 text-[11px] font-semibold text-slate-400">{description}</p> : null}
         </div>
         {action}
@@ -329,17 +329,17 @@ function WorkflowButton({
       aria-pressed={active}
       className={`min-h-28 rounded-2xl border p-5 text-left transition-all duration-300 ${
         active
-          ? "border-[#2d2d2d] bg-[#2d2d2d] text-[#f7f7f5] shadow-lg shadow-black/10"
+          ? "border-[#2d2d2d] bg-white text-[#1a1a1a] ring-1 ring-[#2d2d2d]"
           : "border-[#e5ddd0] bg-white text-[#1a1a1a] hover:border-[#cbd5e1] hover:bg-[#faf8f4] shadow-[0_2px_8px_rgba(0,0,0,0.02)]"
       }`}
       onClick={onClick}
       type="button"
     >
-      <span className={`text-[10px] font-bold uppercase tracking-wider ${active ? "text-amber-300" : "text-slate-400"}`}>
+      <span className={`text-[11px] font-semibold text-slate-500`}>
         {label}
       </span>
-      <span className="mt-3 block text-3xl font-black tracking-tight leading-none">{count}</span>
-      <span className={`mt-2.5 block text-xs font-semibold leading-relaxed ${active ? "text-slate-300" : "text-slate-500"}`}>{detail}</span>
+      <span className="mt-3 block text-3xl font-semibold tracking-tight leading-none">{count}</span>
+      <span className={`mt-2.5 block text-xs font-semibold leading-relaxed text-slate-500`}>{detail}</span>
     </button>
   );
 }
@@ -1000,11 +1000,7 @@ export function CollectionsDashboardPage() {
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto px-6 pb-8 pt-5 text-[#1a1a1a] animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div className="mb-8 border-b border-[#e5ddd0] pb-6 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-6">
         <div>
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-            <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-            Collections Ledgers
-          </div>
-          <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
+          <h1 className="text-2xl font-semibold tracking-tight text-[#1a1a1a] flex items-center gap-2">
             Cash Discounts
           </h1>
           <p className="text-xs font-semibold text-slate-500 mt-1">
@@ -1062,8 +1058,8 @@ export function CollectionsDashboardPage() {
       </div>
 
       {CASH_DISCOUNT_LIVE && (scanInfo || scanProgress) ? (
-        <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-900">
-          {scanInfo ? <span className="rounded-full bg-amber-200 px-2.5 py-0.5 font-bold">{scanInfo.label}</span> : null}
+        <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-[#e5ddd0] bg-white px-4 py-3 text-xs font-medium text-slate-600">
+          {scanInfo ? <span className="rounded-full bg-[#f3eee8] px-2.5 py-0.5 font-semibold text-[#2f2924]">{scanInfo.label}</span> : null}
           <span>{scanProgress ?? scanInfo?.detail}</span>
         </div>
       ) : null}
@@ -1105,8 +1101,8 @@ export function CollectionsDashboardPage() {
           />
           <WorkflowButton
             active={activeView === "rules"}
-            count={rules.length}
-            detail={activeRule ? `${activeRule.discountValue}% within ${activeRule.eligibilityDays} days` : "No active rule"}
+            count={rules.length || "Built-in"}
+            detail={activeRule ? `${activeRule.discountValue}% within ${activeRule.eligibilityDays} days` : "RTGS advance 1.5%, same day 1%"}
             label={rules.length === 1 ? "Rule" : "Rules"}
             onClick={() => chooseView("rules")}
           />
@@ -1138,9 +1134,9 @@ export function CollectionsDashboardPage() {
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
               <div className="max-h-[calc(100vh-430px)] overflow-auto">
-                <table className="w-full min-w-[1120px] border-collapse text-left">
+                <table className="w-full min-w-[960px] border-collapse text-left">
                   <thead className="sticky top-0 z-10">
-                    <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-xs font-semibold text-slate-500">
                       <th className="w-10 px-4 py-3.5">
                         <input
                           aria-label="Select all debit notes to create"
@@ -1152,11 +1148,11 @@ export function CollectionsDashboardPage() {
                         />
                       </th>
                       <th className="px-4 py-3.5">Customer</th>
-                      <th className="w-56 px-4 py-3.5">Invoice</th>
-                      <th className="w-56 px-4 py-3.5">Why now</th>
-                      <th className="w-40 px-4 py-3.5 text-right">Debit note</th>
+                      <th className="w-48 px-4 py-3.5">Invoice</th>
+                      <th className="w-44 px-4 py-3.5">Why now</th>
+                      <th className="w-36 px-4 py-3.5 text-right">Debit note</th>
                       <th className="w-32 px-4 py-3.5">Status</th>
-                      <th className="w-48 px-4 py-3.5 text-right">Action</th>
+                      <th className="w-44 px-4 py-3.5 text-right">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
@@ -1200,7 +1196,7 @@ export function CollectionsDashboardPage() {
                               <span className="rounded-full bg-[#f7f4ee] px-2 py-0.5 text-slate-600">
                                 Invoice {formatMoney(proposal.originalInvoiceAmount)}
                               </span>
-                              {typeof proposal.pendingAmount === "number" ? (
+                              {typeof proposal.pendingAmount === "number" && Math.abs(proposal.pendingAmount - (proposal.originalInvoiceAmount ?? 0)) > 0.5 ? (
                                 <span className="rounded-full bg-[#fff7ed] px-2 py-0.5 text-amber-800">
                                   Pending {formatMoney(proposal.pendingAmount)}
                                 </span>
@@ -1222,17 +1218,17 @@ export function CollectionsDashboardPage() {
                           <td className="px-4 py-4 text-right">
                             <div className="tabular-nums text-sm font-semibold text-[#1a1a1a]">{formatMoney(displayAmount)}</div>
                             <div className="mt-1 text-[11px] font-medium text-slate-400">
-                              {proposal.cashDiscountRuleName || "Cash discount"}
+                              <span title={proposal.cashDiscountRuleName || "Cash discount"}>{(proposal.cashDiscountRuleName || "Cash discount").split(" — ")[0]}</span>
                             </div>
                           </td>
                           <td className="px-4 py-4">
-                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusClass(proposal.status)}`}>
+                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${statusClass(proposal.status)}`}>
                               {actionStatusLabel(proposal)}
                             </span>
                           </td>
                           <td className="px-4 py-4 text-right">
                             <button
-                              className="inline-flex min-h-8.5 min-w-[150px] items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[#2d2d2d] px-4 py-2 text-xs font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
+                              className="inline-flex min-h-8.5 min-w-[130px] items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[#2d2d2d] px-4 py-2 text-xs font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                               disabled={!createEnabled || approvingId === proposal.id}
                               onClick={() => {
                                 if (createEnabled) void approveProposal(proposal);
@@ -1281,9 +1277,9 @@ export function CollectionsDashboardPage() {
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
               <div className="max-h-[calc(100vh-430px)] overflow-auto">
-                <table className="w-full min-w-[1120px] border-collapse text-left">
+                <table className="w-full min-w-[960px] border-collapse text-left">
                   <thead className="sticky top-0 z-10">
-                    <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                    <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-xs font-semibold text-slate-500">
                       <th className="w-10 px-4 py-3.5">
                         <input
                           aria-label="Select all debit notes for WhatsApp"
@@ -1351,14 +1347,14 @@ export function CollectionsDashboardPage() {
                             {formatMoney(proposal.recoverableAmount)}
                           </td>
                           <td className="px-4 py-4">
-                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusClass(proposal.status)}`}>
+                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${statusClass(proposal.status)}`}>
                               Created in Tally
                             </span>
                           </td>
                           <td className="px-4 py-4 text-right">
                             <div className="flex items-center justify-end gap-2.5">
                               <span
-                                className={`hidden rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider lg:inline-flex ${messageStatusClass(proposal.communicationStatus)}`}
+                                className={`hidden rounded-full border px-2.5 py-0.5 text-[11px] font-semibold lg:inline-flex ${messageStatusClass(proposal.communicationStatus)}`}
                               >
                                 {proposal.communicationStatus === "sent" ? "Sent" : proposal.communicationStatus === "failed" ? "Failed" : "Not sent"}
                               </span>
@@ -1448,7 +1444,7 @@ export function CollectionsDashboardPage() {
             <div className="mt-5 max-h-[360px] overflow-auto rounded-2xl border border-[#e5ddd0]">
               <table className="w-full min-w-[620px] border-collapse text-left">
                 <thead className="sticky top-0 z-10">
-                  <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-xs font-semibold text-slate-500">
                     <th className="px-3 py-3">Customer</th>
                     <th className="w-44 px-3 py-3">Debit note</th>
                     <th className="w-28 px-3 py-3 text-right">Amount</th>
@@ -1477,7 +1473,7 @@ export function CollectionsDashboardPage() {
                         </td>
                         <td className="px-3 py-2.5">
                           {proposal.partyPhone ? (
-                            <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                            <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-800">
                               {proposal.partyPhone}
                             </span>
                           ) : (
