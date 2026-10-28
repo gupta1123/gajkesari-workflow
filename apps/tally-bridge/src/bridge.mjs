@@ -14,6 +14,10 @@ import { parseDocumentAndSuggestLedgers } from "./document-parsing/parse-and-sug
 import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs";
 import { warmZvecCollection } from "./local-matching/vector.mjs";
 import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
+import {
+  dropVouchersMissingFrom, emptyEvidenceCache, evidenceCachePath, loadEvidenceCache,
+  needsKeyReconcile, planEvidenceRefresh, saveEvidenceCache, storeVouchers,
+} from "./company-evidence-cache.mjs";
 import { applySeparatePaymentDecision } from "./local-matching/duplicate-resolution.mjs";
 import {
   activeVouchers,
@@ -4471,7 +4475,7 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
 // matter how many customers it covers, so three exports replace hundreds of
 // per-customer batches. The existing open-bill logic then builds the result.
 const COMPANY_SCAN_EVIDENCE_FIELDS =
-  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
+  "MasterID,AlterID,GUID,Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
 
 function dateRangeChunks(fromIso, toIso, months = 2) {
   const chunks = [];
@@ -4484,6 +4488,115 @@ function dateRangeChunks(fromIso, toIso, months = 2) {
     start = next;
   }
   return chunks;
+}
+
+// Tally's company-wide change counters (no TDL needed). AltVchID moves whenever
+// any voucher is created, edited or deleted.
+async function readTallyChangeCounters(tallyUrl, companyName, exportCollection) {
+  const xml = await exportCollection(tallyUrl, {
+    collectionName: "Gajkesari Change Counters", tallyType: "Company",
+    fetchFields: "Name,GUID,AltVchID,AltMstID", timeoutMs: 15_000,
+  });
+  const wanted = normalizeLooseName(companyName);
+  const block = extractBlocks(xml, "COMPANY").find((candidate) =>
+    normalizeLooseName(getAttribute(candidate, "NAME") || getTagText(candidate, "NAME")) === wanted);
+  if (!block) throw new Error(`Tally did not report change counters for ${companyName}.`);
+  return {
+    altVchId: Number(getTagText(block, "ALTVCHID") || 0),
+    altMstId: Number(getTagText(block, "ALTMSTID") || 0),
+    companyGuid: getTagText(block, "GUID") || null,
+  };
+}
+
+function evidenceVoucherKey(block) {
+  return getTagText(block, "MASTERID") || getTagText(block, "GUID") || null;
+}
+
+const evidenceCacheMemory = new Map();
+const evidenceCacheQueue = new Map();
+
+// Scans for one company run one after another so the cache is never updated twice at once.
+function refreshCompanyEvidence(args) {
+  const queueKey = normalizeLooseName(args.companyName);
+  const run = (evidenceCacheQueue.get(queueKey) || Promise.resolve()).catch(() => {}).then(() => refreshCompanyEvidenceNow(args));
+  evidenceCacheQueue.set(queueKey, run);
+  return run;
+}
+
+async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, asOfDate, exportCollection, dependencies }) {
+  const file = evidenceCachePath(dependencies.cacheDir || CONFIG_DIR, companyName);
+  const counters = await readTallyChangeCounters(tallyUrl, companyName, exportCollection);
+  let cache = evidenceCacheMemory.get(file) || loadEvidenceCache(file);
+  const plan = planEvidenceRefresh({ cache, counters, companyGuid: counters.companyGuid, neededFrom: evidenceFrom, asOfDate });
+  if (!plan.cache) cache = emptyEvidenceCache({ companyName, companyGuid: counters.companyGuid });
+  const previousFrom = cache.coveredFrom;
+  const previousAltVchId = cache.altVchId;
+  const stats = { mode: plan.mode, reason: plan.reason, readCalls: 0, vouchersRead: 0, reconciled: false, removed: 0 };
+
+  const collect = (xml) => {
+    const blocks = extractBlocks(xml, "VOUCHER");
+    const entries = [];
+    for (const block of blocks) {
+      if (!isPartyInvoiceVoucher(block) && !isPartySettlementVoucher(block)) continue;
+      const key = evidenceVoucherKey(block);
+      if (!key) continue;
+      entries.push({
+        key, alterId: Number(getTagText(block, "ALTERID") || 0),
+        date: normalizeDateForCompare(getTagText(block, "DATE")), xml: block.replace(/>\s+</g, "><"),
+      });
+    }
+    storeVouchers(cache, entries);
+    stats.vouchersRead += entries.length;
+    return blocks.length;
+  };
+  const read = async (label, options) => {
+    dependencies.signal?.throwIfAborted();
+    stats.readCalls += 1;
+    return exportCollection(tallyUrl, { companyName, tallyType: "Voucher", timeoutMs: 120_000, ...options, collectionName: `Gajkesari Evidence ${label}` });
+  };
+
+  let chunkNumber = 0;
+  for (const range of plan.ranges) {
+    const chunks = dateRangeChunks(range.from, range.to);
+    for (const [index, chunk] of chunks.entries()) {
+      dependencies.onProgress?.(`Reading invoices and receipts ${index + 1} of ${chunks.length}...`);
+      collect(await read(`Range ${chunkNumber += 1}`, { fetchFields: COMPANY_SCAN_EVIDENCE_FIELDS, dateFrom: chunk.dateFrom, dateTo: chunk.dateTo }));
+    }
+  }
+
+  const windowFrom = previousFrom && previousFrom < evidenceFrom ? previousFrom : evidenceFrom;
+  if (plan.deltaAfter !== null) {
+    dependencies.onProgress?.("Reading vouchers changed in Tally since the last scan...");
+    const changedCount = collect(await read("Changed", {
+      fetchFields: COMPANY_SCAN_EVIDENCE_FIELDS, dateFrom: windowFrom, dateTo: asOfDate,
+      formulae: [{ name: "GajkesariAfterAlterId", formula: `$AlterID > ${plan.deltaAfter}` }],
+      filterNames: ["GajkesariAfterAlterId"],
+    }));
+    if (needsKeyReconcile({ cache, counterMovedBy: counters.altVchId - previousAltVchId, deltaCount: changedCount })) {
+      dependencies.onProgress?.("Checking for vouchers deleted in Tally...");
+      const keysXml = await read("Keys", { fetchFields: "MasterID,AlterID,GUID", dateFrom: windowFrom, dateTo: asOfDate });
+      const present = new Set(extractBlocks(keysXml, "VOUCHER").map(evidenceVoucherKey).filter(Boolean));
+      stats.removed = dropVouchersMissingFrom(cache, present, { from: windowFrom, to: asOfDate });
+      stats.reconciled = true;
+      cache.lastReconciledAt = Date.now();
+    }
+  }
+
+  cache.companyGuid = counters.companyGuid || cache.companyGuid;
+  cache.altVchId = counters.altVchId;
+  cache.altMstId = counters.altMstId;
+  cache.coveredFrom = !cache.coveredFrom || windowFrom < cache.coveredFrom ? windowFrom : cache.coveredFrom;
+  cache.coveredTo = !cache.coveredTo || asOfDate > cache.coveredTo ? asOfDate : cache.coveredTo;
+  if (plan.mode === "rebuilt") cache.lastReconciledAt = Date.now();
+  evidenceCacheMemory.set(file, cache);
+  if (plan.mode !== "unchanged") {
+    try { saveEvidenceCache(file, cache); } catch (error) { stats.reason += ` (cache not saved: ${error.message})`; }
+  }
+
+  const vouchers = Object.values(cache.vouchers)
+    .filter((voucher) => !voucher.date || (voucher.date >= evidenceFrom && voucher.date <= asOfDate))
+    .map((voucher) => voucher.xml);
+  return { ...stats, altVchId: counters.altVchId, cachedVouchers: Object.keys(cache.vouchers).length, vouchers };
 }
 
 async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependencies = {}) {
@@ -4508,31 +4621,15 @@ async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependenci
   // Receipts and narrations are needed from the oldest in-scope open bill on.
   const evidenceFrom = earliestBillDate(scopedBills);
 
-  const keptVouchers = [];
-  let voucherChunks = 0;
-  if (evidenceFrom) {
-    const chunks = dateRangeChunks(evidenceFrom, asOfDate);
-    for (const [index, range] of chunks.entries()) {
-      dependencies.signal?.throwIfAborted();
-      dependencies.onProgress?.(`Reading invoices and receipts ${index + 1} of ${chunks.length}...`);
-      const xml = await exportCollection(tallyUrl, {
-        collectionName: `Gajkesari Company Evidence ${index + 1}`, tallyType: "Voucher",
-        fetchFields: COMPANY_SCAN_EVIDENCE_FIELDS,
-        companyName, dateFrom: range.dateFrom, dateTo: range.dateTo, timeoutMs: 120_000,
-      });
-      voucherChunks += 1;
-      // Keep only invoice/receipt vouchers for in-scope customers so memory stays small.
-      for (const voucher of extractBlocks(xml, "VOUCHER")) {
-        if (!isPartyInvoiceVoucher(voucher) && !isPartySettlementVoucher(voucher)) continue;
-        const touchesScope = [
-          getTagText(voucher, "PARTYLEDGERNAME"),
-          ...extractBlocks(voucher, "ALLLEDGERENTRIES.LIST").map((entry) => getTagText(entry, "LEDGERNAME")),
-        ].some((name) => name && scopeByKey.has(normalizeLooseName(name)));
-        if (!touchesScope) continue;
-        keptVouchers.push(voucher);
-      }
-    }
-  }
+  const evidence = evidenceFrom
+    ? await refreshCompanyEvidence({ tallyUrl, companyName, evidenceFrom, asOfDate, exportCollection, dependencies })
+    : { mode: "skipped", reason: "no open bills in scope", vouchers: [], readCalls: 0 };
+  // The cache holds every customer's vouchers; keep only those of in-scope customers.
+  const keptVouchers = evidence.vouchers.filter((voucher) => [
+    getTagText(voucher, "PARTYLEDGERNAME"),
+    ...extractBlocks(voucher, "ALLLEDGERENTRIES.LIST").map((entry) => getTagText(entry, "LEDGERNAME")),
+  ].some((name) => name && scopeByKey.has(normalizeLooseName(name))));
+  const voucherChunks = evidence.readCalls;
   const evidenceReadAt = Date.now();
 
   const outcome = await fetchCustomerOpenBillsFromTally(
@@ -4551,6 +4648,11 @@ async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependenci
     scopedOpenBillObjects: scopedBills.length,
     evidenceFrom,
     evidenceVoucherCount: keptVouchers.length,
+    evidenceCache: {
+      mode: evidence.mode, reason: evidence.reason, altVchId: evidence.altVchId ?? null,
+      cachedVouchers: evidence.cachedVouchers ?? 0, vouchersRead: evidence.vouchersRead ?? 0,
+      reconciled: Boolean(evidence.reconciled), removed: evidence.removed ?? 0,
+    },
     billsReadMs: billsReadAt - startedAt,
     evidenceReadMs: evidenceReadAt - billsReadAt,
     scanTotalMs: Date.now() - startedAt,
