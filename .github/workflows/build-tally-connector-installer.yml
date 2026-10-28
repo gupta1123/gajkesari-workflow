@@ -71,7 +71,10 @@ jobs:
           path: installer/tally-bridge/release/*
           if-no-files-found: error
 
+      # Releases feed the in-app updater, so they are published only on an
+      # explicit manual run, never as a side effect of pushing to main.
       - name: Publish permanent GitHub release
+        if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
