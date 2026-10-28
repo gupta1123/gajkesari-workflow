@@ -34,6 +34,13 @@ type Sort = "priority" | "most_overdue" | "highest" | "oldest" | "customer";
 type Kind = "all" | "regular" | "same_day" | "advance" | "unclear";
 
 const MAX_SELECTED = 50;
+
+// Same schedule as Kalika's standard payment reminders.
+const STANDARD_STAGES = [
+  { name: "First reminder", delay: 0, every: 1, unit: "days" as const, limit: 1 },
+  { name: "Regular follow-up", delay: 2, every: 2, unit: "days" as const, limit: 3 },
+  { name: "Final reminders", delay: 1, every: 1, unit: "days" as const, limit: 3 },
+];
 const LIVE = ["active", "paused", "review"];
 
 const STATUS_LABEL: Record<FollowupPipeline["status"], string> = {
@@ -130,9 +137,6 @@ export function FollowUpPipelines() {
   const [enrolling, setEnrolling] = useState<{ ids: string[]; once: boolean } | null>(null);
   const [phones, setPhones] = useState<Record<string, string>>({});
   const [template, setTemplate] = useState("");
-  const [firstDelay, setFirstDelay] = useState("0");
-  const [everyDays, setEveryDays] = useState("3");
-  const [limit, setLimit] = useState("3");
   const [enrollBusy, setEnrollBusy] = useState(false);
   const [enrollError, setEnrollError] = useState("");
 
@@ -277,7 +281,9 @@ export function FollowUpPipelines() {
         financialYear: company.financialYear,
         plan: {
           name: enrolling.once ? "Send once" : "Standard",
-          stages: [{ name: "Reminder", template, delay: enrolling.once ? 0 : Math.max(0, Number(firstDelay) || 0), every: Number(everyDays) || 3, unit: "days", limit: enrolling.once ? 1 : Math.max(1, Number(limit) || 3) }],
+          stages: enrolling.once
+            ? [{ name: "One-time message", template, delay: 0, every: 1, unit: "days", limit: 1 }]
+            : STANDARD_STAGES.map((stage) => ({ ...stage, template })),
         },
         invoices: chosen.map((row) => ({
           customer: row.partyLedgerName,
@@ -511,11 +517,11 @@ export function FollowUpPipelines() {
                 </select>
               </label>
               {!enrolling.once && (
-                <div className="seqrow" style={{ maxWidth: 384 }}>
-                  <label className="f"><span>First reminder after (days)</span><input type="number" min={0} value={firstDelay} onChange={(e) => setFirstDelay(e.target.value)} /></label>
-                  <label className="f"><span>Repeat every (days)</span><input type="number" min={1} value={everyDays} onChange={(e) => setEveryDays(e.target.value)} /></label>
-                  <label className="f"><span>Up to (messages)</span><input type="number" min={1} value={limit} onChange={(e) => setLimit(e.target.value)} /></label>
-                </div>
+                <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.7, color: "#51483f" }}>
+                  <li><b>First reminder</b> when you start, one message</li>
+                  <li><b>Regular follow-up</b> 2 days later, every 2 days, up to 3 messages</li>
+                  <li><b>Final reminders</b> 1 day later, every day, up to 3 messages</li>
+                </ol>
               )}
               {enrollError && <div className="alert err" style={{ margin: 0 }}>{enrollError}</div>}
             </div>

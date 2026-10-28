@@ -1,5 +1,5 @@
-// WhatsApp reminder templates. Nothing is built in: a Gajkesari deployment must
-// register its own MSG91-approved template(s) through FOLLOWUP_WHATSAPP_TEMPLATES_JSON,
+// WhatsApp reminder templates. payment_reminder_v2 is built in; more can be
+// registered through FOLLOWUP_WHATSAPP_TEMPLATES_JSON,
 // e.g. [{"key":"payment_reminder","name":"payment_reminder","language":"en",
 // "namespace":"<your namespace>","text":"Hello {{customer}}, ...",
 // "components":{"body_1":"customer","body_2":"outstanding","body_3":"invoice",
@@ -20,6 +20,18 @@ type MessageRow = { customer: string; company_name: string; invoice: string; inv
 const FIELDS = ["customer", "company", "invoice", "invoice_date", "outstanding"] as const;
 type Field = (typeof FIELDS)[number];
 
+// Approved MSG91 template on the account Gajkesari already sends debit notes
+// from (same namespace as Kalika's). Deployments can add or override templates
+// through FOLLOWUP_WHATSAPP_TEMPLATES_JSON.
+const BUILTIN_MESSAGES: Message[] = [{
+  key: "payment_reminder_v2",
+  name: "payment_reminder_v2",
+  language: "en",
+  namespace: "2bf6cec8_61b1_4925_8632_49e9ddebff44",
+  text: "Hello {{customer}},\n\nThis is a payment reminder for ₹{{outstanding}} pending against invoice {{invoice}} dated {{invoice_date}}.\n\nPlease arrange payment at your earliest convenience. If payment has already been made, please ignore this message.\n\nRegards,\n{{company}} Accounts Team",
+  components: { body_1: "customer", body_2: "outstanding", body_3: "invoice", body_4: "invoice_date", body_5: "company" },
+}];
+
 export function reminderMessages(): Message[] {
   let raw: unknown;
   try {
@@ -28,12 +40,15 @@ export function reminderMessages(): Message[] {
     throw new Error("Follow-up messages are not configured correctly.");
   }
   if (!Array.isArray(raw)) throw new Error("Follow-up messages are not configured correctly.");
-  return raw.filter(
+  const configured = raw.filter(
     (m: Message) =>
       m && typeof m.key === "string" && typeof m.name === "string" && typeof m.language === "string" &&
       typeof m.namespace === "string" && typeof m.text === "string" && m.components &&
       Object.values(m.components).every((x) => (FIELDS as readonly string[]).includes(x))
   );
+  const byKey = new Map(BUILTIN_MESSAGES.map((m) => [m.key, m]));
+  for (const message of configured) byKey.set(message.key, message);
+  return [...byKey.values()];
 }
 
 export function reminderMessageValues(row: MessageRow): Record<Field, string> {
