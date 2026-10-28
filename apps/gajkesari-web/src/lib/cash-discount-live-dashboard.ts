@@ -90,11 +90,11 @@ async function runLiveCashDiscountDashboard<T>(params: {
   const dateFrom = financialYearStart(financialYear);
 
   onProgress?.("Reading customers from Tally...");
-  const masters = await runCashDiscountLiveRequest<{ ledgers?: LiveLedger[]; groups?: ScopeMaster[] }>({
+  const masters = await withBusyRetry(signal, () => runCashDiscountLiveRequest<{ ledgers?: LiveLedger[]; groups?: ScopeMaster[] }>({
     connectionId, companyName, financialYear, signal, onProgress,
     operation: "ledger_masters",
     payload: { requestedMasterTypes: ["ledger", "group"] },
-  });
+  }));
   const customers = resolveScopedLedgers({ groups: masters.groups ?? [], ledgers: masters.ledgers ?? [] }, scope) as LiveLedger[];
   if (!customers.length) throw new Error("No customers match the Cash Discount customer scope. Review it in Settings.");
 

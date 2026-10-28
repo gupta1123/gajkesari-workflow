@@ -860,7 +860,7 @@ export function CollectionsDashboardPage() {
       try {
         // A company switch must read a new live snapshot. Loading the old saved
         // scan here can show bills belonging to the previously selected company.
-        await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
+        if (!CASH_DISCOUNT_LIVE) await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
         await loadDashboard(selectedConnectionId, company?.companyName);
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
@@ -958,7 +958,7 @@ export function CollectionsDashboardPage() {
         await createDebitNoteForProposal(proposal);
       }
       if (selectedConnectionId) {
-        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        if (!CASH_DISCOUNT_LIVE) await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
         await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
       } else {
         await loadDashboard();
