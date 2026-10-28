@@ -105,8 +105,6 @@ export function PaymentReminderSettings() {
 
   return (
     <div className="set-body">
-      <h2>Payment reminders</h2>
-      <p className="set-lead">A plan is the schedule a reminder follows. Every message waits for your review before it goes out. Nothing is sent automatically.</p>
 
       {notice && <div className={`alert ${notice.tone === "ok" ? "ok" : "err"}`}>{notice.text}</div>}
 
@@ -128,7 +126,6 @@ export function PaymentReminderSettings() {
 
       <section className="set-block">
         <h3>Message</h3>
-        <p className="why">Customers get this WhatsApp message at every stage. It was approved by WhatsApp, so its wording can’t be edited here.</p>
         {messages.length === 0 ? (
           <div className="alert warn" style={{ margin: 0 }}>No WhatsApp message is available yet. Ask your administrator to register one, then reload this page.</div>
         ) : (
@@ -148,7 +145,6 @@ export function PaymentReminderSettings() {
 
       <section className="set-block">
         <h3>Schedule</h3>
-        <p className="why">{draft.stages.length} stage{draft.stages.length === 1 ? "" : "s"}, {total(draft.stages)} message{total(draft.stages) === 1 ? "" : "s"} at most for each invoice. A stage ends when all its messages are sent or the invoice is paid.</p>
         <ol className="rail">
           {draft.stages.map((stage, index) => (
             <li key={index}>

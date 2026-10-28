@@ -264,3 +264,12 @@
 .fu .trow.own,.fu .trow.ledger{grid-template-columns:22px minmax(0,1fr)}
 .fu .tname.own{font-weight:400;color:#51483f}
 .fu .cnt{font-weight:400;font-size:12px;color:#6a5f53}
+
+/* Settings: tabs run across the top */
+.fu .set{display:block;margin-top:16px}
+.fu .set-nav{position:static;flex-direction:row;gap:4px;border-bottom:1px solid var(--fu-line);margin-bottom:20px;overflow-x:auto}
+.fu .set-nav button{border-left:0;border-radius:0;border-bottom:2px solid transparent;margin-bottom:-1px;padding:10px 14px;background:none}
+.fu .set-nav button:hover{background:none;color:#1a1a1a}
+.fu .set-nav button[aria-current=page]{background:none;border-bottom-color:#2563eb;color:#1a1a1a}
+.fu .set-body{max-width:none}
+.fu .set-block:first-of-type{margin-top:0;border-top:0;padding-top:0}

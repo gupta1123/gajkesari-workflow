@@ -308,8 +308,6 @@ function CustomerScope({ company }: { company: Company }) {
 
   return (
     <div className="set-body">
-      <h2>Customers</h2>
-      <p className="set-lead">Cash Discounts and Payment Follow-ups only read bills from ledgers counted as customers. Counting a group also counts every subgroup and ledger inside it.</p>
       {notice && <div className={`alert ${notice.tone}`}>{notice.text}</div>}
 
       <section className="set-block">
@@ -320,8 +318,6 @@ function CustomerScope({ company }: { company: Company }) {
       </section>
 
       <section className="set-block">
-        <h3>Groups and ledgers</h3>
-        <p className="why">Tick the groups that hold customers. A blue group counts everything inside it; untick a subgroup to leave it out. A grey group only contains a ticked one. The number in brackets is how many ledgers a group holds.</p>
         <div className="tree">
           <input type="search" aria-label="Search groups and ledgers" placeholder="Search a group or a customer" value={search} onChange={(e) => setSearch(e.target.value)} />
           {found && (found.groupHits.length > 0 || found.ledgerHits.length > 0) && (
@@ -352,7 +348,7 @@ function CustomerScope({ company }: { company: Company }) {
         <label className="tick">
           <input type="checkbox" checked={scope.mode === "automatic"}
             onChange={(e) => setScope({ ...scope, mode: e.target.checked ? "automatic" : saved.mode === "strict" ? "strict" : "custom", detectSalesLinkedExceptions: e.target.checked })} />
-          <span>Also add ledgers that Tally sales show are customers<small className="why" style={{ display: "block", margin: "2px 0 0" }}>These are found during a scan, so they are not in the count above.</small></span>
+          <span>Also add ledgers that Tally sales show are customers</span>
         </label>
       </section>
 
@@ -373,8 +369,6 @@ function CashDiscountRules() {
   ];
   return (
     <div className="set-body">
-      <h2>Cash discount rules</h2>
-      <p className="set-lead">These are fixed and follow Kalika’s logic. A debit note is created in Tally only when you press Create.</p>
       <section className="set-block">
         <table className="ratetable">
           <thead><tr><th>Payment type</th><th>Discount</th><th>When it applies</th></tr></thead>
@@ -382,7 +376,6 @@ function CashDiscountRules() {
         </table>
       </section>
       <section className="set-block">
-        <p className="why" style={{ margin: 0 }}>Regular credit invoices (30 days) get no discount. Once overdue they appear under Payment Follow-ups.</p>
       </section>
     </div>
   );
