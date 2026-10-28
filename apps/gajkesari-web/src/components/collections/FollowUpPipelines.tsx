@@ -226,9 +226,14 @@ export function FollowUpPipelines() {
     });
     (async () => {
       try {
-        const connectorId = await resolveTallyConnectionId();
-        const response = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectorId)}`, { cache: "no-store" });
-        const payload = await response.json();
+        // A remembered connector skips the lookup; if it no longer answers, look it up again.
+        const fetchCompanies = async (id: string) => {
+          const reply = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(id)}`, { cache: "no-store" });
+          return { response: reply, payload: await reply.json() };
+        };
+        const remembered = cached?.companies[0]?.connectionId;
+        let { response, payload } = remembered ? await fetchCompanies(remembered) : await fetchCompanies(await resolveTallyConnectionId());
+        if (remembered && (!response.ok || !(payload.companies ?? []).length)) ({ response, payload } = await fetchCompanies(await resolveTallyConnectionId()));
         if (response.ok) {
           const list: Company[] = payload.companies ?? [];
           const chosen: string = payload.selectedCompanyId || list[0]?.id || "";

@@ -2,6 +2,7 @@
 
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { InvoicePanel, type PanelDate } from "./InvoicePanel";
+import { readCompaniesCache, writeCompaniesCache } from "@/lib/company-cache";
 import {
   CheckCircle2,
   Loader2,
@@ -410,13 +411,24 @@ export function CollectionsDashboardPage() {
     [companies, selectedCompanyId, selectedConnectionId]
   );
 
-  const loadCompanies = useCallback(async () => {
+  const loadCompanies = useCallback(async (fromCache = false) => {
+    const cached = fromCache ? readCompaniesCache<CompanyOption>() : null;
+    if (cached) {
+      // Start from the last known company so the scan begins now; the fresh list replaces it when it arrives.
+      const known = uniqueCompanyOptions(cached.companies);
+      setCompanies(known);
+      setSelectedCompanyId(cached.selectedCompanyId);
+      setSelectedConnectionId(known.find((company) => company.id === cached.selectedCompanyId)?.connectionId ?? known[0]?.connectionId ?? "");
+      void loadCompanies(false).catch(() => undefined);
+      return known;
+    }
     const connectorId = selectedConnectionId || (await resolveTallyConnectionId());
     if (!connectorId) throw new Error("Connect a Tally connector first.");
     const response = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectorId)}`, { cache: "no-store" });
     if (!response.ok) throw new Error(await readError(response));
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
     const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
+    writeCompaniesCache(nextCompanies, payload.selectedCompanyId || nextCompanies[0]?.id || "");
     setCompanies(nextCompanies);
     setSelectedCompanyId((current) =>
       current && nextCompanies.some((company) => company.id === current)
@@ -576,12 +588,12 @@ export function CollectionsDashboardPage() {
   );
 
   const refreshAll = useCallback(
-    async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
+    async (options?: { quiet?: boolean; refreshTally?: boolean; fromCache?: boolean }) => {
       try {
         if (!options?.quiet) setLoading(true);
         setMessage(null);
         setDashboard(null);
-        const nextCompanies = await loadCompanies();
+        const nextCompanies = await loadCompanies(options?.fromCache);
         const company =
           nextCompanies.find((item) => item.id === selectedCompanyId) ??
           nextCompanies.find((item) => item.connectionId === selectedConnectionId) ??
@@ -590,14 +602,15 @@ export function CollectionsDashboardPage() {
         const connectionId = company?.connectionId || selectedConnectionId || "";
         if (company) setSelectedCompanyId(company.id);
         if (connectionId) setSelectedConnectionId(connectionId);
-        if (connectionId) await refreshLiveTallyCompany(connectionId);
+        const liveCheck = connectionId ? refreshLiveTallyCompany(connectionId) : Promise.resolve();
+        liveCheck.catch(() => undefined); // reported through Promise.all below
         // Set this before the asynchronous Tally scan so the selection effect
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
         if (!CASH_DISCOUNT_LIVE && connectionId && options?.refreshTally !== false) {
           await refreshTallyOpenBills(connectionId, company?.companyName);
         }
-        await loadDashboard(connectionId, company?.companyName, company?.financialYear ?? null);
+        await Promise.all([liveCheck, loadDashboard(connectionId, company?.companyName, company?.financialYear ?? null)]);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
@@ -838,7 +851,7 @@ export function CollectionsDashboardPage() {
   useEffect(() => {
     if (initialLoadStartedRef.current) return;
     initialLoadStartedRef.current = true;
-    void refreshAll();
+    void refreshAll({ fromCache: true });
   }, [refreshAll]);
 
   useEffect(() => {

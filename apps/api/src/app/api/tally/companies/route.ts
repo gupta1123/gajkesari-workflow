@@ -402,62 +402,42 @@ export async function GET(request: Request) {
 
     const connections = (data ?? []) as unknown as TallyConnectionRow[];
     const installationIds = connections.flatMap((connection) => connection.installation_ref ? [connection.installation_ref] : []);
-    const { data: datasets, error: datasetError } = installationIds.length ? await supabase.from("tally_company_datasets")
-      .select("id,installation_id,company_guid").eq("owner_user_id", user.id).in("installation_id", installationIds)
-      : { data: [], error: null };
+    const connectionIds = connections.map((connection) => connection.id);
+    const legacyConnectionIds = connections
+      .filter((connection) => !Array.isArray(connection.last_companies_snapshot) || connection.last_companies_snapshot.length === 0)
+      .map((connection) => connection.id);
+    // These three only depend on the connections, so they run together.
+    const [datasetResult, syncResult, eventResult] = await Promise.all([
+      installationIds.length
+        ? supabase.from("tally_company_datasets").select("id,installation_id,company_guid").eq("owner_user_id", user.id).in("installation_id", installationIds)
+        : Promise.resolve({ data: [], error: null }),
+      connectionIds.length
+        ? supabase.from("tally_master_sync_runs").select("connection_id, company_name, completed_at, totals")
+            .eq("owner_user_id", user.id).in("connection_id", connectionIds).order("created_at", { ascending: false }).limit(100)
+        : Promise.resolve({ data: [], error: null }),
+      legacyConnectionIds.length
+        ? supabase.from("tally_connection_events").select("connection_id, created_at, payload")
+            .eq("owner_user_id", user.id).in("connection_id", legacyConnectionIds).eq("event_type", "bridge_heartbeat")
+            .order("created_at", { ascending: false }).limit(200)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+    const { data: datasets, error: datasetError } = datasetResult;
     if (datasetError) throw datasetError;
     const datasetByGuid = new Map((datasets || []).map((dataset) => [`${dataset.installation_id}|${dataset.company_guid}`, dataset.id]));
-    const connectionIds = connections.map((connection) => connection.id);
     const latestSyncByConnection = new Map<string, LatestSyncRow>();
     const latestHeartbeatByConnection = new Map<string, HeartbeatEventRow>();
     const localTallyCompanies: LocalTallyCompany[] = [];
 
-    if (connectionIds.length > 0) {
-      const { data: syncRows, error: syncError } = await supabase
-        .from("tally_master_sync_runs")
-        .select("connection_id, company_name, completed_at, totals")
-        .eq("owner_user_id", user.id)
-        .in("connection_id", connectionIds)
-        .order("created_at", { ascending: false })
-        .limit(100);
-
-      if (syncError) throw syncError;
-
-      for (const row of (syncRows ?? []) as unknown as LatestSyncRow[]) {
-        const key = `${row.connection_id}|${row.company_name}`;
-        if (!latestSyncByConnection.has(key)) {
-          latestSyncByConnection.set(key, row);
-        }
-      }
-
-      // New heartbeats persist their compact company list on the connection.
-      // Only read historical events for connections created before that column
-      // existed, keeping the normal response off the high-volume event table.
-      const legacyConnectionIds = connections
-        .filter(
-          (connection) =>
-            !Array.isArray(connection.last_companies_snapshot) ||
-            connection.last_companies_snapshot.length === 0
-        )
-        .map((connection) => connection.id);
-      if (legacyConnectionIds.length > 0) {
-        const { data: eventRows, error: eventError } = await supabase
-          .from("tally_connection_events")
-          .select("connection_id, created_at, payload")
-          .eq("owner_user_id", user.id)
-          .in("connection_id", legacyConnectionIds)
-          .eq("event_type", "bridge_heartbeat")
-          .order("created_at", { ascending: false })
-          .limit(200);
-
-        if (eventError) throw eventError;
-
-        for (const row of (eventRows ?? []) as unknown as HeartbeatEventRow[]) {
-          if (!latestHeartbeatByConnection.has(row.connection_id)) {
-            latestHeartbeatByConnection.set(row.connection_id, row);
-          }
-        }
-      }
+    if (syncResult.error) throw syncResult.error;
+    for (const row of (syncResult.data ?? []) as unknown as LatestSyncRow[]) {
+      const key = `${row.connection_id}|${row.company_name}`;
+      if (!latestSyncByConnection.has(key)) latestSyncByConnection.set(key, row);
+    }
+    // New heartbeats keep their company list on the connection; only older
+    // connections need the event table.
+    if (eventResult.error) throw eventResult.error;
+    for (const row of (eventResult.data ?? []) as unknown as HeartbeatEventRow[]) {
+      if (!latestHeartbeatByConnection.has(row.connection_id)) latestHeartbeatByConnection.set(row.connection_id, row);
     }
 
     const companyEntries = connections.flatMap((connection) => {
