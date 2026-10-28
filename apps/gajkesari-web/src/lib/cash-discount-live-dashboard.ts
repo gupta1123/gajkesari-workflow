@@ -56,12 +56,27 @@ export async function loadCustomerScope(connectionId: string, companyName: strin
   return { ...DEFAULT_CUSTOMER_SCOPE, ...payload.settings };
 }
 
+// Tally answers one request at a time, so a second scan for the same company
+// (a refresh click racing the page load) would only queue behind the first and
+// fail with "Tally is busy". Callers share the scan that is already running.
+const scansInFlight = new Map<string, Promise<unknown>>();
+
+export function loadLiveCashDiscountDashboard<T>(params: Parameters<typeof runLiveCashDiscountDashboard>[0]): Promise<T> {
+  const key = `${params.connectionId}::${params.companyName}::${params.financialYear ?? ""}`;
+  const running = scansInFlight.get(key);
+  if (running) return running as Promise<T>;
+  const scan = runLiveCashDiscountDashboard<T>(params).finally(() => scansInFlight.delete(key));
+  scansInFlight.set(key, scan);
+  return scan;
+}
+
 /**
- * Reads the in-scope customers' open bills live from Tally (deployed connector
- * operations only), then has the API analyse the merged scan. Nothing partial
- * is ever analysed: a failed batch fails the whole refresh.
+ * Reads the in-scope customers' open bills live from Tally, then has the API
+ * analyse the result. A whole-company scan is tried first; connectors without it
+ * fall back to per-customer batches. Nothing partial is ever analysed: a failed
+ * read fails the whole refresh.
  */
-export async function loadLiveCashDiscountDashboard<T>(params: {
+async function runLiveCashDiscountDashboard<T>(params: {
   connectionId: string;
   companyName: string;
   financialYear?: string | null;
