@@ -42,8 +42,20 @@ export async function GET(request: Request) {
     const { data, error } = await query;
     if (error) throw error;
 
+    const pipelineIds = (data ?? []).map((row: { id: string }) => row.id);
+    const attempts = pipelineIds.length
+      ? (await createSupabaseAdminClient()
+          .from("invoice_followup_attempts")
+          .select("id,pipeline_id,status,recipient,outstanding,stage_index,error,created_at,finished_at")
+          .eq("owner_user_id", user.id)
+          .in("pipeline_id", pipelineIds)
+          .order("created_at", { ascending: false })
+          .limit(300)).data ?? []
+      : [];
+
     return jsonWithCors(request, {
       pipelines: data ?? [],
+      attempts,
       messages: reminderMessages().map(({ key, name, text }) => ({ key, name, text })),
     });
   } catch (error) {

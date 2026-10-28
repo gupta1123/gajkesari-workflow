@@ -30,6 +30,18 @@ export type FollowupPipeline = {
   revision: number;
 };
 
+export type FollowupAttempt = {
+  id: string;
+  pipeline_id: string;
+  status: "submitting" | "accepted" | "rejected" | "uncertain";
+  recipient: string;
+  outstanding: number;
+  stage_index: number;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+};
+
 export type ReminderMessage = { key: string; name: string; text: string };
 export type PipelineAction = "pause" | "resume" | "stop" | "check" | "send";
 
@@ -40,7 +52,7 @@ async function readJson<T>(response: Response): Promise<T> {
 }
 
 export async function listPipelines() {
-  return readJson<{ pipelines: FollowupPipeline[]; messages: ReminderMessage[] }>(
+  return readJson<{ pipelines: FollowupPipeline[]; attempts?: FollowupAttempt[]; messages: ReminderMessage[] }>(
     await apiFetch("/api/collections/follow-ups/pipelines", { cache: "no-store" })
   );
 }
