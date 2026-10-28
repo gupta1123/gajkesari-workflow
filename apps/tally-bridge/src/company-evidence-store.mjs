@@ -23,8 +23,19 @@ import {
 
 const require = createRequire(import.meta.url);
 
+// GAJKESARI_SQLITE_PATH points at a better-sqlite3 build for this runtime when the
+// package next to the bridge was built for a different one (a dev connector that
+// shares the repo's node_modules, for example). Each candidate must actually open.
 export function loadSqliteDriver() {
-  try { return require("better-sqlite3"); } catch { return null; }
+  for (const candidate of [process.env.GAJKESARI_SQLITE_PATH, "better-sqlite3"]) {
+    if (!candidate) continue;
+    try {
+      const Database = require(candidate);
+      new Database(":memory:").close();
+      return Database;
+    } catch { /* try the next one */ }
+  }
+  return null;
 }
 
 export function evidenceDbPath(dir, companyName) {
@@ -152,7 +163,12 @@ function openSqliteStore({ dir, companyName }, Database) {
       return db.prepare("select xml from vouchers where date = '' or date is null or (date >= ? and date <= ?)").all(from, to).map((row) => row.xml);
     },
     count() { return db.prepare("select count(*) as n from vouchers").get().n; },
-    commit() { if (meta) persistMeta(); },
+    commit() {
+      if (!meta) return;
+      persistMeta();
+      // Fold the write-ahead log back into the database so the file does not keep growing.
+      try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* a reader holds it; try next time */ }
+    },
     close() { try { db.close(); } catch { /* ignore */ } },
   };
 }
