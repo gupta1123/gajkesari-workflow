@@ -13,6 +13,13 @@ export const DEFAULT_CUSTOMER_SCOPE: CustomerScope = {
   excludedLedgerNames: [],
 };
 
+// "2026-27" -> "2026-04-01". Limiting the voucher history Tally scans keeps one
+// read inside Tally's own 60-second export limit on large companies.
+export function financialYearStart(financialYear: string | null | undefined) {
+  const match = /^(d{4})s*-s*d{2,4}$/.exec(String(financialYear ?? "").trim());
+  return match ? `${match[1]}-04-01` : null;
+}
+
 type LiveLedger = ScopeMaster & { gstin?: string | null };
 type LedgerBucket = { complete?: boolean; openBills?: unknown[]; settledBills?: unknown[] };
 
@@ -46,6 +53,7 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
   const { connectionId, companyName, signal, onProgress } = params;
   const financialYear = params.financialYear ?? null;
   const scope = await loadCustomerScope(connectionId, companyName);
+  const dateFrom = financialYearStart(financialYear);
 
   onProgress?.("Reading customers from Tally...");
   const masters = await runCashDiscountLiveRequest<{ ledgers?: LiveLedger[]; groups?: ScopeMaster[] }>({
@@ -64,7 +72,7 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
     const read = await runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
       connectionId, companyName, financialYear, signal, onProgress,
       operation: "fetch_customer_open_bills",
-      payload: { companyName, financialYear, ledgerNames },
+      payload: { companyName, financialYear, ledgerNames, ...(dateFrom ? { dateFrom } : {}) },
     });
     Object.assign(byLedger, read.byLedger ?? {});
   }
