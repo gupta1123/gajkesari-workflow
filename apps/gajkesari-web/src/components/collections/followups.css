@@ -237,3 +237,15 @@
 .fu .tpath{display:block;font-size:11px;font-weight:400;color:#6a5f53}
 .fu .addgroup{display:flex;align-items:center;gap:10px;margin:10px 6px 4px;font-size:12px;color:#51483f}
 .fu .addgroup select{max-width:360px}
+
+/* Customers tree, pass 3: state is the checkbox and the strikethrough, nothing else */
+.fu .trow{border-left:0;cursor:default;min-height:38px}
+.fu .trow.in,.fu .trow.out{border-left:0}
+.fu .trow.out .tname{text-decoration:line-through;color:#8a7f72}
+.fu .trow:not(.ledger){cursor:pointer}
+.fu .chev{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;font-size:14px}
+.fu .trow input[type=checkbox]{width:18px;height:18px}
+.fu .crumb{font-size:12px;color:#6a5f53;margin:8px 0 0}
+.fu .tname{font-size:14px;font-weight:600}
+.fu .trow.ledger .tname,.fu .trow.ledger{font-weight:400}
+.fu .tlist.root{max-height:none;overflow:visible}
