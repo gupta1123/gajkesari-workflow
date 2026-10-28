@@ -308,6 +308,7 @@ fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, 
 copyDir(path.join(electronAppSource, "assets"), path.join(appDir, "assets"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
 fs.copyFileSync(path.join(bridgeRoot, "src", "company-evidence-cache.mjs"), path.join(appDir, "src", "company-evidence-cache.mjs"));
+fs.copyFileSync(path.join(bridgeRoot, "src", "company-evidence-store.mjs"), path.join(appDir, "src", "company-evidence-store.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
 fs.copyFileSync(path.join(repoRoot, "packages/shared/src/lib/bank-bill-reference.mjs"), path.join(appDir, "src/local-matching/bill-reference.mjs"));
 fs.copyFileSync(path.join(repoRoot, "packages/shared/src/lib/bank-duplicate-resolution.mjs"), path.join(appDir, "src/local-matching/duplicate-resolution.mjs"));
@@ -330,6 +331,30 @@ copyDir(pdfjsPackageSource, path.join(appDir, "node_modules", "pdfjs-dist"));
 copyDir(napiCanvasSource, path.join(appDir, "node_modules", "@napi-rs", "canvas"));
 copyDir(napiCanvasWindowsSource, path.join(appDir, "node_modules", "@napi-rs", "canvas-win32-x64-msvc"));
 copyDir(anydocWindowsSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc"));
+// SQLite keeps the scan evidence. The repo copy is built for Node, so the staged copy gets
+// Electron's binary. Without it the connector falls back to the JSON cache.
+const sqliteSource = path.join(repoRoot, "node_modules", "better-sqlite3");
+if (fs.existsSync(path.join(sqliteSource, "package.json"))) {
+  for (const name of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
+    copyDir(path.join(repoRoot, "node_modules", name), path.join(appDir, "node_modules", name));
+  }
+  const stagedSqlite = path.join(appDir, "node_modules", "better-sqlite3");
+  fs.rmSync(path.join(stagedSqlite, "deps"), { recursive: true, force: true });
+  fs.rmSync(path.join(stagedSqlite, "src"), { recursive: true, force: true });
+  const electronVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "node_modules", "electron", "package.json"), "utf8")).version;
+  try {
+    execFileSync(process.execPath, [
+      path.join(repoRoot, "node_modules", "prebuild-install", "bin.js"),
+      "--runtime=electron", `--target=${electronVersion}`, "--arch=x64", "--platform=win32", "--force",
+    ], { cwd: stagedSqlite, stdio: "inherit" });
+    console.log(`SQLite evidence cache included (Electron ${electronVersion}).`);
+  } catch (error) {
+    fs.rmSync(stagedSqlite, { recursive: true, force: true });
+    console.warn(`Warning: SQLite could not be prepared for Electron (${error.message}); the connector will use the JSON evidence cache.`);
+  }
+} else {
+  console.warn("Warning: better-sqlite3 is not installed; the connector will use the JSON evidence cache.");
+}
 if (fs.existsSync(zvecPackageSource)) {
   copyDir(path.join(repoRoot, "node_modules", "@zvec"), path.join(appDir, "node_modules", "@zvec"));
   // Also copy @zvec's transitive bindings if present

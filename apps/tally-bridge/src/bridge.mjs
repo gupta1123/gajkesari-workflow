@@ -15,9 +15,9 @@ import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs
 import { warmZvecCollection } from "./local-matching/vector.mjs";
 import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
 import {
-  dropVouchersMissingFrom, emptyEvidenceCache, evidenceCachePath, loadEvidenceCache,
-  needsKeyReconcile, planEvidenceRefresh, saveEvidenceCache, storeVouchers,
+  needsKeyReconcile, planEvidenceRefresh,
 } from "./company-evidence-cache.mjs";
+import { getEvidenceStore } from "./company-evidence-store.mjs";
 import { applySeparatePaymentDecision } from "./local-matching/duplicate-resolution.mjs";
 import {
   activeVouchers,
@@ -4512,7 +4512,6 @@ function evidenceVoucherKey(block) {
   return getTagText(block, "MASTERID") || getTagText(block, "GUID") || null;
 }
 
-const evidenceCacheMemory = new Map();
 const evidenceCacheQueue = new Map();
 
 // Scans for one company run one after another so the cache is never updated twice at once.
@@ -4524,14 +4523,14 @@ function refreshCompanyEvidence(args) {
 }
 
 async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, asOfDate, exportCollection, dependencies }) {
-  const file = evidenceCachePath(dependencies.cacheDir || CONFIG_DIR, companyName);
+  const store = getEvidenceStore({ dir: dependencies.cacheDir || CONFIG_DIR, companyName });
   const counters = await readTallyChangeCounters(tallyUrl, companyName, exportCollection);
-  let cache = evidenceCacheMemory.get(file) || loadEvidenceCache(file);
+  let cache = store.meta;
   const plan = planEvidenceRefresh({ cache, counters, companyGuid: counters.companyGuid, neededFrom: evidenceFrom, asOfDate });
-  if (!plan.cache) cache = emptyEvidenceCache({ companyName, companyGuid: counters.companyGuid });
+  if (!plan.cache) cache = store.reset({ companyName, companyGuid: counters.companyGuid });
   const previousFrom = cache.coveredFrom;
   const previousAltVchId = cache.altVchId;
-  const stats = { mode: plan.mode, reason: plan.reason, readCalls: 0, vouchersRead: 0, reconciled: false, removed: 0 };
+  const stats = { mode: plan.mode, reason: plan.reason, backend: store.backend, readCalls: 0, vouchersRead: 0, reconciled: false, removed: 0 };
 
   const collect = (xml) => {
     const blocks = extractBlocks(xml, "VOUCHER");
@@ -4545,7 +4544,7 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
         date: normalizeDateForCompare(getTagText(block, "DATE")), xml: block.replace(/>\s+</g, "><"),
       });
     }
-    storeVouchers(cache, entries);
+    store.put(entries);
     stats.vouchersRead += entries.length;
     return blocks.length;
   };
@@ -4576,7 +4575,7 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
       dependencies.onProgress?.("Checking for vouchers deleted in Tally...");
       const keysXml = await read("Keys", { fetchFields: "MasterID,AlterID,GUID", dateFrom: windowFrom, dateTo: asOfDate });
       const present = new Set(extractBlocks(keysXml, "VOUCHER").map(evidenceVoucherKey).filter(Boolean));
-      stats.removed = dropVouchersMissingFrom(cache, present, { from: windowFrom, to: asOfDate });
+      stats.removed = store.dropMissing(present, { from: windowFrom, to: asOfDate });
       stats.reconciled = true;
       cache.lastReconciledAt = Date.now();
     }
@@ -4588,15 +4587,12 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
   cache.coveredFrom = !cache.coveredFrom || windowFrom < cache.coveredFrom ? windowFrom : cache.coveredFrom;
   cache.coveredTo = !cache.coveredTo || asOfDate > cache.coveredTo ? asOfDate : cache.coveredTo;
   if (plan.mode === "rebuilt") cache.lastReconciledAt = Date.now();
-  evidenceCacheMemory.set(file, cache);
   if (plan.mode !== "unchanged") {
-    try { saveEvidenceCache(file, cache); } catch (error) { stats.reason += ` (cache not saved: ${error.message})`; }
+    try { store.commit(); } catch (error) { stats.reason += ` (cache not saved: ${error.message})`; }
   }
 
-  const vouchers = Object.values(cache.vouchers)
-    .filter((voucher) => !voucher.date || (voucher.date >= evidenceFrom && voucher.date <= asOfDate))
-    .map((voucher) => voucher.xml);
-  return { ...stats, altVchId: counters.altVchId, cachedVouchers: Object.keys(cache.vouchers).length, vouchers };
+  const vouchers = store.window(evidenceFrom, asOfDate);
+  return { ...stats, altVchId: counters.altVchId, cachedVouchers: store.count(), vouchers };
 }
 
 async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependencies = {}) {
@@ -4649,7 +4645,7 @@ async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependenci
     evidenceFrom,
     evidenceVoucherCount: keptVouchers.length,
     evidenceCache: {
-      mode: evidence.mode, reason: evidence.reason, altVchId: evidence.altVchId ?? null,
+      mode: evidence.mode, reason: evidence.reason, backend: evidence.backend ?? null, altVchId: evidence.altVchId ?? null,
       cachedVouchers: evidence.cachedVouchers ?? 0, vouchersRead: evidence.vouchersRead ?? 0,
       reconciled: Boolean(evidence.reconciled), removed: evidence.removed ?? 0,
     },

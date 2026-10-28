@@ -25,5 +25,8 @@
   "devDependencies": {
     "@electron/rebuild": "^3.7.0",
     "electron": "^31.7.7"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "12.11.1"
   }
 }
