@@ -210,3 +210,22 @@
 .fu .preview li{grid-template-columns:minmax(0,1fr) minmax(0,.5fr)}
 .fu .rowtick{display:flex;align-items:center;gap:10px;min-width:0;cursor:pointer}
 .fu .rowtick span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Customers: one tree for groups, subgroups and ledgers */
+.fu .tree{border:1px solid var(--fu-line);border-radius:10px;background:#fff;padding:8px}
+.fu .tree input[type=search]{width:100%;height:34px;border-radius:8px;margin-bottom:6px}
+.fu .tlist{list-style:none;margin:0;padding:0}
+.fu .tlist.root{max-height:520px;overflow-y:auto;overscroll-behavior:contain}
+.fu .trow{display:grid;grid-template-columns:22px minmax(0,1fr) auto auto;gap:8px;align-items:center;min-height:36px;padding:3px 6px;border-radius:6px;font-size:13px;border-left:3px solid transparent}
+.fu .trow:hover{background:#f7f4ef}
+.fu .trow.in{border-left-color:#2f2924}
+.fu .trow.out{border-left-color:#c2564b}
+.fu .trow.out .tname{color:#8f2f27}
+.fu .chev{border:0;background:none;width:22px;height:22px;padding:0;font-size:12px;color:#6f655a;cursor:pointer}
+.fu .chev:disabled{cursor:default}
+.fu .tname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.fu .tmeta{font-size:11px;color:#6a5f53;white-space:nowrap}
+.fu .trow.ledger{grid-template-columns:22px minmax(0,1fr);min-height:30px;font-size:12px}
+.fu .trow.ledger:hover{background:transparent}
+.fu .struck{text-decoration:line-through;color:#8a7f72}
+.fu .tick small{font-weight:400}
