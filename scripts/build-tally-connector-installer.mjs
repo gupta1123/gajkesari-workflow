@@ -307,6 +307,7 @@ fs.writeFileSync(stagedWrapper, fs.readFileSync(stagedWrapper, "utf8")
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
 copyDir(path.join(electronAppSource, "assets"), path.join(appDir, "assets"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
+fs.copyFileSync(path.join(bridgeRoot, "src", "company-evidence-cache.mjs"), path.join(appDir, "src", "company-evidence-cache.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
 fs.copyFileSync(path.join(repoRoot, "packages/shared/src/lib/bank-bill-reference.mjs"), path.join(appDir, "src/local-matching/bill-reference.mjs"));
 fs.copyFileSync(path.join(repoRoot, "packages/shared/src/lib/bank-duplicate-resolution.mjs"), path.join(appDir, "src/local-matching/duplicate-resolution.mjs"));
