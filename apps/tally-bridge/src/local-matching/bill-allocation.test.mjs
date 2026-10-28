@@ -2,6 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { planChronologicalBillAllocations } from "./bill-allocation.mjs";
 
+test('short invoice references choose the named newer bill, while ambiguous references do not fall back to FIFO',()=>{
+  const run=(narration,extra=[])=>planChronologicalBillAllocations({
+    transactions:[{transactionId:'t',voucherDate:'2026-10-25',amount:48500,counterpartyLedgerName:'Party',narration}],
+    verificationRows:[{transactionId:'t',verificationStatus:'missing'}],
+    openBillsByLedger:{Party:{complete:true,existingAdvances:[],openBills:[
+      {referenceName:'INV/26-27/70201',pendingAmount:48500,invoiceDate:'2026-04-01'},
+      {referenceName:'INV/26-27/70211',pendingAmount:48500,invoiceDate:'2026-04-05'},...extra]}},
+  });
+  assert.equal(run('AHMEDABAD-INV 70211').t.allocations[0].referenceName,'INV/26-27/70211');
+  assert.deepEqual(run('INV70211',[{referenceName:'INV/25-26/70211',pendingAmount:48500}]),{});
+  assert.deepEqual(run('INV99999'),{});
+  assert.equal(run('NEFT CREDIT').t.allocations[0].referenceName,'INV/26-27/70201','Existing FIFO without an invoice reference is unchanged');
+});
+
 test("plans same-ledger transactions chronologically without reusing consumed bill value", () => {
   const plans = planChronologicalBillAllocations({
     transactions: [

@@ -20,6 +20,8 @@
     "build:api": "npm run build --workspace @gajkesari/api",
     "installer:tally-bridge": "node scripts/build-tally-connector-installer.mjs",
     "installer:tally-bridge:validate": "node scripts/build-tally-connector-installer.mjs --validate",
+    "installer:tally-bridge:nsis": "node scripts/build-tally-connector-nsis.mjs",
+    "test:tally-bridge:nsis-updates": "node scripts/test-tally-nsis-update.mjs",
     "heroku-postbuild": "npm run build:api",
     "build": "npm run build:web && npm run build:api",
     "lint:web": "npm run lint --workspace @gajkesari/web",
