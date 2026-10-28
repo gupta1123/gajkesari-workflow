@@ -1,25 +1,63 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
+import { loadLiveCashDiscountDashboard, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
 import {
-  createPipelines, findCandidates, getCustomerScope, listPipelines, runPipelineAction, saveCustomerScope, scanAllCandidates,
-  type FollowupCandidate, type FollowupPipeline, type PipelineAction, type ReminderMessage,
+  createPipelines, listPipelines, runPipelineAction,
+  type FollowupPipeline, type PipelineAction, type ReminderMessage,
 } from "@/lib/followups-client";
 
 type Company = { id: string; connectionId: string; companyName: string; financialYear: string };
+
+// One unpaid invoice as the live analysis reports it (Cash Discount page's data).
+type DueInvoice = {
+  id: string;
+  followUpStatus: "needs_follow_up" | "escalate" | "needs_review";
+  paymentCategory: "advance_rtgs" | "same_day_rtgs" | null;
+  ageDays: number | null;
+  ageLabel: string;
+  dueDate: string | null;
+  partyLedgerName: string;
+  partyPhone: string | null;
+  linkedInvoiceNumber: string | null;
+  linkedInvoiceDate: string | null;
+  originalInvoiceAmount: number;
+  outstandingAmount: number;
+  amountReceived: number;
+  narration: string | null;
+};
+type FollowUpPayload = {
+  kpis?: { paymentFollowUps?: number; paymentFollowUpAmount?: number };
+  tabs?: { paymentFollowUps?: DueInvoice[] };
+};
+
+type Sort = "priority" | "most_overdue" | "highest_outstanding" | "oldest_invoice" | "customer";
+const PAGE_SIZE = 25;
+const MAX_SELECTED = 50;
 
 const STATUS_LABEL: Record<FollowupPipeline["status"], string> = {
   active: "Active", paused: "Paused", review: "Needs review", settled: "Settled",
   finished: "Finished", stopped: "Stopped", sending: "Sending", uncertain: "Delivery uncertain",
 };
+const DUE_STATUS: Record<DueInvoice["followUpStatus"], { label: string; tone: string }> = {
+  needs_follow_up: { label: "Needs follow-up", tone: "bg-amber-100 text-amber-900" },
+  escalate: { label: "Escalate", tone: "bg-red-100 text-red-900" },
+  needs_review: { label: "Needs review", tone: "bg-slate-200 text-slate-800" },
+};
+const TYPE_LABEL: Record<string, string> = { advance_rtgs: "Advance RTGS", same_day_rtgs: "Same-day RTGS" };
 
 const inr = (value: number | null) =>
-  value == null ? "—" : new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(value);
+  value == null ? "—" : new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(value);
 
 function isDue(row: FollowupPipeline) {
   return row.status === "active" && !!row.next_due_at && Date.parse(row.next_due_at) <= Date.now();
+}
+
+function tenDigits(value: string | null | undefined) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits.length === 12 && digits.startsWith("91") ? digits.slice(2) : digits.length === 10 ? digits : "";
 }
 
 export function FollowUpPipelines() {
@@ -29,78 +67,28 @@ export function FollowUpPipelines() {
   const [messages, setMessages] = useState<ReminderMessage[]>([]);
   const [busyId, setBusyId] = useState("");
   const [notice, setNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
-  const [form, setForm] = useState({ customer: "", invoice: "", invoiceDate: "", phone: "", narration: "", template: "", everyDays: "3", limit: "3" });
-  const [adding, setAdding] = useState(false);
-  const [scopeText, setScopeText] = useState("");
-  const [scopeNames, setScopeNames] = useState<string[]>([]);
-  const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [candidates, setCandidates] = useState<FollowupCandidate[]>([]);
-  const [finding, setFinding] = useState(false);
+
+  const [due, setDue] = useState<DueInvoice[]>([]);
   const [scanning, setScanning] = useState(false);
   const [scanLine, setScanLine] = useState("");
-  const [scanDetail, setScanDetail] = useState("");
-  const [scanTotals, setScanTotals] = useState<{ dueInvoices: number; customers: number; shown: number } | null>(null);
+  const [scanInfo, setScanInfo] = useState<ScanInfo | null>(null);
+  const [scanError, setScanError] = useState("");
+  const [scannedAt, setScannedAt] = useState<Date | null>(null);
+
+  const [query, setQuery] = useState("");
+  const [paymentType, setPaymentType] = useState("all");
+  const [sort, setSort] = useState<Sort>("priority");
+  const [page, setPage] = useState(1);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  const [starting, setStarting] = useState(false);
+  const [phones, setPhones] = useState<Record<string, string>>({});
+  const [template, setTemplate] = useState("");
+  const [everyDays, setEveryDays] = useState("3");
+  const [limit, setLimit] = useState("3");
+  const [startBusy, setStartBusy] = useState(false);
 
   const company = companies.find((c) => c.id === companyId) ?? companies[0] ?? null;
-
-  useEffect(() => {
-    if (!company) return;
-    getCustomerScope(company)
-      .then(({ ledgerNames }) => { setScopeNames(ledgerNames); setScopeText(ledgerNames.join("\n")); setPicked(new Set()); setCandidates([]); })
-      .catch(() => undefined);
-  }, [company?.connectionId, company?.companyName]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const saveScope = async () => {
-    if (!company) return;
-    try {
-      const { ledgerNames } = await saveCustomerScope(company, scopeText.split("\n"));
-      setScopeNames(ledgerNames);
-      setScopeText(ledgerNames.join("\n"));
-      setNotice({ tone: "ok", text: `Customer scope saved (${ledgerNames.length}).` });
-    } catch (error) {
-      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not save the scope." });
-    }
-  };
-
-  const find = async () => {
-    if (!company || picked.size === 0) return;
-    setFinding(true);
-    setNotice(null);
-    try {
-      const { candidates: found } = await findCandidates(company, [...picked]);
-      setCandidates(found);
-      if (found.length === 0) setNotice({ tone: "ok", text: "No open invoices for those customers." });
-    } catch (error) {
-      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not read Tally." });
-    } finally {
-      setFinding(false);
-    }
-  };
-
-  const scanEverything = async () => {
-    if (!company) return;
-    setScanning(true);
-    setNotice(null);
-    setScanTotals(null);
-    setScanLine("Starting...");
-    try {
-      const result = await scanAllCandidates(company, {
-        onProgress: setScanLine,
-        onScanInfo: (info) => setScanDetail(`${info.label}: ${info.detail}`),
-      });
-      setCandidates(result.candidates);
-      setScanTotals({ dueInvoices: result.dueInvoices, customers: result.customers, shown: result.candidates.length });
-      if (result.candidates.length === 0) setNotice({ tone: "ok", text: "No invoices are due for a follow-up." });
-    } catch (error) {
-      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not read Tally." });
-    } finally {
-      setScanning(false);
-      setScanLine("");
-    }
-  };
-
-  const use = (c: FollowupCandidate) =>
-    setForm((f) => ({ ...f, customer: c.customer, invoice: c.invoice, invoiceDate: c.invoiceDate ?? "", narration: c.narration }));
 
   const refresh = useCallback(async () => {
     const data = await listPipelines();
@@ -125,6 +113,117 @@ export function FollowUpPipelines() {
     })();
   }, [refresh]);
 
+  const scan = useCallback(async () => {
+    if (!company) return;
+    setScanning(true);
+    setScanError("");
+    setScanLine("Starting...");
+    try {
+      const payload = await loadLiveCashDiscountDashboard<FollowUpPayload>({
+        connectionId: company.connectionId,
+        companyName: company.companyName,
+        financialYear: company.financialYear,
+        onProgress: setScanLine,
+        onScanInfo: setScanInfo,
+      });
+      setDue(payload.tabs?.paymentFollowUps ?? []);
+      setScannedAt(new Date());
+      setSelected(new Set());
+      setPage(1);
+    } catch (error) {
+      setScanError(error instanceof Error ? error.message : "Could not read Tally.");
+    } finally {
+      setScanning(false);
+      setScanLine("");
+    }
+  }, [company?.connectionId, company?.companyName, company?.financialYear]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Opening the page scans once; the connector keeps a saved copy of Tally's
+  // vouchers, so repeat scans take seconds.
+  useEffect(() => { void scan(); }, [scan]);
+
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    const filtered = due.filter((row) =>
+      (paymentType === "all" || (paymentType === "other" ? !row.paymentCategory : row.paymentCategory === paymentType)) &&
+      (!needle || row.partyLedgerName.toLowerCase().includes(needle) || String(row.linkedInvoiceNumber ?? "").toLowerCase().includes(needle)));
+    const sorted = [...filtered];
+    if (sort === "most_overdue") sorted.sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1));
+    else if (sort === "highest_outstanding") sorted.sort((a, b) => b.outstandingAmount - a.outstandingAmount);
+    else if (sort === "oldest_invoice") sorted.sort((a, b) => String(a.linkedInvoiceDate ?? "9999").localeCompare(String(b.linkedInvoiceDate ?? "9999")));
+    else if (sort === "customer") sorted.sort((a, b) => a.partyLedgerName.localeCompare(b.partyLedgerName));
+    return sorted;
+  }, [due, query, paymentType, sort]);
+
+  useEffect(() => { setPage(1); }, [query, paymentType, sort]);
+
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount);
+  const pageRows = visible.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const totals = useMemo(() => ({
+    needs: due.filter((row) => row.followUpStatus === "needs_follow_up").length,
+    escalate: due.filter((row) => row.followUpStatus === "escalate").length,
+    review: due.filter((row) => row.followUpStatus === "needs_review").length,
+    outstanding: due.reduce((sum, row) => sum + row.outstandingAmount, 0),
+  }), [due]);
+  const selectedRows = due.filter((row) => selected.has(row.id));
+
+  const toggle = (row: DueInvoice) => setSelected((current) => {
+    const next = new Set(current);
+    if (next.has(row.id)) next.delete(row.id);
+    else if (next.size < MAX_SELECTED && row.linkedInvoiceNumber) next.add(row.id);
+    return next;
+  });
+  const togglePage = () => setSelected((current) => {
+    const next = new Set(current);
+    const selectable = pageRows.filter((row) => row.linkedInvoiceNumber);
+    const allOn = selectable.every((row) => next.has(row.id));
+    for (const row of selectable) {
+      if (allOn) next.delete(row.id);
+      else if (next.size < MAX_SELECTED) next.add(row.id);
+    }
+    return next;
+  });
+
+  const openStart = () => {
+    setPhones(Object.fromEntries(selectedRows.map((row) => [row.id, tenDigits(row.partyPhone)])));
+    setTemplate((current) => current || messages[0]?.key || "");
+    setStarting(true);
+  };
+
+  const submitStart = async () => {
+    if (!company || !selectedRows.length) return;
+    if (!template) return setNotice({ tone: "error", text: "Choose a reminder message." });
+    setStartBusy(true);
+    setNotice(null);
+    try {
+      const result = await createPipelines({
+        connectionId: company.connectionId,
+        companyName: company.companyName,
+        financialYear: company.financialYear,
+        plan: { name: "Standard", stages: [{ name: "Reminder", template, delay: 0, every: Number(everyDays) || 3, unit: "days", limit: Number(limit) || 3 }] },
+        invoices: selectedRows.map((row) => ({
+          customer: row.partyLedgerName,
+          invoice: row.linkedInvoiceNumber ?? "",
+          invoiceDate: row.linkedInvoiceDate ?? "",
+          recipient: phones[row.id] ?? "",
+          narration: row.narration ?? "",
+        })),
+      });
+      const problems = result.skipped.map((entry) => `${entry.invoice}: ${entry.reason}`).join(" · ");
+      setNotice({
+        tone: result.skipped.length && !result.created.length ? "error" : "ok",
+        text: `${result.created.length} reminder(s) started. Nothing is sent until you press Send.${problems ? ` Skipped — ${problems}` : ""}`,
+      });
+      if (result.created.length) { setStarting(false); setSelected(new Set()); }
+      await refresh();
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not start the reminders." });
+    } finally {
+      setStartBusy(false);
+    }
+  };
+
   const act = async (row: FollowupPipeline, action: PipelineAction) => {
     if (!company) return setNotice({ tone: "error", text: "Connect a Tally company first." });
     if (action === "send" && !window.confirm(`Send a WhatsApp reminder to ${row.customer} for ${row.invoice}?`)) return;
@@ -145,155 +244,183 @@ export function FollowUpPipelines() {
     }
   };
 
-  const add = async () => {
-    if (!company) return setNotice({ tone: "error", text: "Connect a Tally company first." });
-    if (!form.template) return setNotice({ tone: "error", text: "Choose a reminder message." });
-    setAdding(true);
-    setNotice(null);
-    try {
-      const result = await createPipelines({
-        connectionId: company.connectionId,
-        companyName: company.companyName,
-        financialYear: company.financialYear,
-        plan: {
-          name: "Standard",
-          stages: [{ name: "Reminder", template: form.template, delay: 0, every: Number(form.everyDays) || 3, unit: "days", limit: Number(form.limit) || 3 }],
-        },
-        invoices: [{ customer: form.customer, invoice: form.invoice, invoiceDate: form.invoiceDate, recipient: form.phone, narration: form.narration }],
-      });
-      const skipped = result.skipped[0];
-      setNotice(skipped ? { tone: "error", text: skipped.reason } : { tone: "ok", text: "Reminder added. Nothing is sent until you press Send." });
-      if (!skipped) setForm((f) => ({ ...f, customer: "", invoice: "", invoiceDate: "", phone: "" }));
-      await refresh();
-    } catch (error) {
-      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not add the reminder." });
-    } finally {
-      setAdding(false);
-    }
-  };
-
-  const field = "rounded-md border border-slate-300 px-2 py-1.5 text-sm";
+  const field = "rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm";
+  const card = "rounded-lg border border-slate-200 bg-white p-4";
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6 p-6">
-      <header>
-        <h1 className="text-xl font-semibold">Payment follow-ups</h1>
-        <p className="text-sm text-slate-600">
-          Every send re-checks the outstanding amount in Tally first. Reminders are only sent when you press Send.
-        </p>
+    <div className="mx-auto max-w-6xl space-y-5 p-6">
+      <header className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold">Payment follow-ups</h1>
+          <p className="text-sm text-slate-600">Unpaid invoices past their terms, straight from Tally. Every send re-checks the outstanding amount first, and nothing is sent until you press Send.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {companies.length > 1 && (
+            <select className={field} value={company?.id ?? ""} onChange={(e) => setCompanyId(e.target.value)}>
+              {companies.map((c) => <option key={c.id} value={c.id}>{c.companyName}</option>)}
+            </select>
+          )}
+          <button className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm disabled:opacity-50" disabled={scanning || !company} onClick={() => void scan()}>
+            {scanning ? "Scanning…" : "Rescan Tally"}
+          </button>
+        </div>
       </header>
 
-      {companies.length > 1 && (
-        <select className={field} value={company?.id ?? ""} onChange={(e) => setCompanyId(e.target.value)}>
-          {companies.map((c) => <option key={c.id} value={c.id}>{c.companyName}</option>)}
-        </select>
+      {(scanning || scanInfo) && (
+        <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          {scanInfo ? <strong>{scanInfo.label}. </strong> : null}{scanInfo?.detail}{scanning && scanLine ? ` ${scanLine}` : ""}
+          {!scanning && scannedAt ? ` Scanned at ${scannedAt.toLocaleTimeString("en-IN")}.` : ""}
+        </p>
       )}
-
+      {scanError && <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-800">{scanError}</p>}
       {notice && (
         <p role="status" className={`rounded-md px-3 py-2 text-sm ${notice.tone === "ok" ? "bg-emerald-50 text-emerald-800" : "bg-red-50 text-red-800"}`}>
           {notice.text}
         </p>
       )}
 
-      <section className="space-y-3 rounded-lg border border-slate-200 p-4">
-        <h2 className="text-sm font-medium">Customers to follow up</h2>
-        <p className="text-xs text-slate-500">One exact Tally ledger name per line. Tally is read live, a few customers at a time (max 10).</p>
-        <textarea className={`${field} h-24 w-full`} value={scopeText} onChange={(e) => setScopeText(e.target.value)} />
-        <button className="text-sm underline" onClick={saveScope}>Save customers</button>
-        {scopeNames.length > 0 && (
-          <div className="space-y-2">
-            <div className="flex flex-wrap gap-3">
-              {scopeNames.map((name) => (
-                <label key={name} className="text-sm">
-                  <input type="checkbox" checked={picked.has(name)} onChange={() => setPicked((s) => { const n = new Set(s); if (n.has(name)) n.delete(name); else n.add(name); return n; })} /> {name}
-                </label>
-              ))}
-            </div>
-            <button className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50" disabled={finding || picked.size === 0 || picked.size > 10} onClick={find}>
-              {finding ? "Reading Tally…" : "Find open invoices"}
+      <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {[
+          ["Needs follow-up", totals.needs, "Up to 30 days overdue"],
+          ["Escalate", totals.escalate, "More than 30 days overdue"],
+          ["Needs review", totals.review, "Dates or allocations unclear"],
+          ["Outstanding", inr(totals.outstanding), `${due.length} invoice(s)`],
+        ].map(([label, value, note]) => (
+          <div key={String(label)} className={card}>
+            <div className="text-xs uppercase text-slate-500">{label}</div>
+            <div className="mt-1 text-2xl font-semibold">{value}</div>
+            <div className="text-xs text-slate-500">{note}</div>
+          </div>
+        ))}
+      </section>
+
+      <section className={`${card} space-y-3`}>
+        <div className="flex flex-wrap items-center gap-2">
+          <input className={`${field} w-64`} type="search" placeholder="Search customer or invoice" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <select className={field} value={paymentType} onChange={(e) => setPaymentType(e.target.value)}>
+            <option value="all">All payment types</option>
+            <option value="advance_rtgs">Advance RTGS</option>
+            <option value="same_day_rtgs">Same-day RTGS</option>
+            <option value="other">Other terms</option>
+          </select>
+          <select className={field} value={sort} onChange={(e) => setSort(e.target.value as Sort)}>
+            <option value="priority">Priority</option>
+            <option value="most_overdue">Most overdue</option>
+            <option value="highest_outstanding">Highest outstanding</option>
+            <option value="oldest_invoice">Oldest invoice</option>
+            <option value="customer">Customer</option>
+          </select>
+          <div className="ml-auto flex items-center gap-2 text-sm">
+            {selectedRows.length > 0 && <span className="text-slate-600">{selectedRows.length} selected</span>}
+            <button className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50" disabled={!selectedRows.length} onClick={openStart}>
+              Start reminders
             </button>
           </div>
-        )}
-        <div className="space-y-1 border-t border-slate-100 pt-3">
-          <button className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50" disabled={scanning || !company} onClick={scanEverything}>
-            {scanning ? "Scanning Tally…" : "Scan every customer for due invoices"}
-          </button>
-          {(scanning || scanDetail) && (
-            <p className="text-xs text-amber-800">{scanDetail}{scanning && scanLine ? ` ${scanLine}` : ""}</p>
-          )}
-          {scanTotals && (
-            <p className="text-xs text-slate-600">
-              {scanTotals.dueInvoices} due invoice(s) across {scanTotals.customers} customer(s)
-              {scanTotals.shown < scanTotals.dueInvoices ? `; showing the first ${scanTotals.shown}, oldest and largest first.` : "."}
-            </p>
-          )}
         </div>
-        {candidates.length > 0 && (
+
+        <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
+            <thead className="text-xs uppercase text-slate-500">
+              <tr>
+                <th className="w-8 p-2"><input type="checkbox" aria-label="Select this page" checked={pageRows.length > 0 && pageRows.filter((r) => r.linkedInvoiceNumber).every((r) => selected.has(r.id))} onChange={togglePage} /></th>
+                <th className="p-2">Customer</th><th className="p-2">Invoice</th><th className="p-2">Terms</th>
+                <th className="p-2 text-right">Outstanding</th><th className="p-2">Overdue</th><th className="p-2">Status</th>
+              </tr>
+            </thead>
             <tbody>
-              {candidates.map((c) => (
-                <tr key={`${c.customer}|${c.invoice}`} className="border-t border-slate-100">
-                  <td className="p-1">{c.customer}</td><td className="p-1">{c.invoice}</td>
-                  <td className="p-1">{inr(c.outstanding)}</td>
-                  <td className="p-1">{c.paymentCategory ? c.paymentCategory.replace("_", " ").toUpperCase() : ""}</td>
-                  <td className="p-1">{c.eligible ? c.ageLabel : "Not due yet"}</td>
-                  <td className="p-1"><button className="underline" onClick={() => use(c)}>Use</button></td>
+              {scanning && !due.length && <tr><td className="p-4 text-slate-500" colSpan={7}>Reading Tally…</td></tr>}
+              {!scanning && !visible.length && <tr><td className="p-4 text-slate-500" colSpan={7}>{due.length ? "No invoices match the filters." : "No invoices are due for a follow-up."}</td></tr>}
+              {pageRows.map((row) => (
+                <tr key={row.id} className="border-t border-slate-100 align-top">
+                  <td className="p-2"><input type="checkbox" aria-label={`Select ${row.linkedInvoiceNumber ?? row.partyLedgerName}`} disabled={!row.linkedInvoiceNumber} checked={selected.has(row.id)} onChange={() => toggle(row)} /></td>
+                  <td className="p-2">{row.partyLedgerName}<div className="text-xs text-slate-500">{row.partyPhone ? `+${tenDigits(row.partyPhone) ? "91" + tenDigits(row.partyPhone) : row.partyPhone}` : "No phone in Tally"}</div></td>
+                  <td className="p-2">{row.linkedInvoiceNumber ?? "—"}<div className="text-xs text-slate-500">{row.linkedInvoiceDate ?? ""}</div></td>
+                  <td className="p-2">{row.paymentCategory ? TYPE_LABEL[row.paymentCategory] : "—"}{row.dueDate && <div className="text-xs text-slate-500">Due {row.dueDate}</div>}</td>
+                  <td className="p-2 text-right">{inr(row.outstandingAmount)}{row.amountReceived > 0.5 && <div className="text-xs text-slate-500">of {inr(row.originalInvoiceAmount)}</div>}</td>
+                  <td className="p-2">{row.ageLabel}</td>
+                  <td className="p-2"><span className={`rounded-full px-2 py-0.5 text-xs ${DUE_STATUS[row.followUpStatus].tone}`}>{DUE_STATUS[row.followUpStatus].label}</span></td>
                 </tr>
               ))}
             </tbody>
           </table>
-        )}
-      </section>
-
-      <section className="rounded-lg border border-slate-200 p-4">
-        <h2 className="mb-3 text-sm font-medium">Add an invoice</h2>
-        {messages.length === 0 ? (
-          <p className="text-sm text-amber-700">No WhatsApp reminder template is configured yet.</p>
-        ) : (
-          <div className="grid gap-2 md:grid-cols-4">
-            <input className={field} placeholder="Customer ledger (exact Tally name)" value={form.customer} onChange={(e) => setForm({ ...form, customer: e.target.value })} />
-            <input className={field} placeholder="Invoice / bill number" value={form.invoice} onChange={(e) => setForm({ ...form, invoice: e.target.value })} />
-            <input className={field} type="date" value={form.invoiceDate} onChange={(e) => setForm({ ...form, invoiceDate: e.target.value })} />
-            <input className={field} placeholder="WhatsApp number (10 digits)" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
-            <input className={field} placeholder="Invoice narration (optional, e.g. ADVANCE RTGS)" value={form.narration} onChange={(e) => setForm({ ...form, narration: e.target.value })} />
-            <select className={field} value={form.template} onChange={(e) => setForm({ ...form, template: e.target.value })}>
-              <option value="">Message…</option>
-              {messages.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
-            </select>
-            <label className="text-sm">Repeat every <input className={`${field} w-16`} value={form.everyDays} onChange={(e) => setForm({ ...form, everyDays: e.target.value })} /> days</label>
-            <label className="text-sm">Up to <input className={`${field} w-16`} value={form.limit} onChange={(e) => setForm({ ...form, limit: e.target.value })} /> reminders</label>
-            <button className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50" disabled={adding || !company} onClick={add}>
-              {adding ? "Checking Tally…" : "Verify & add"}
-            </button>
+        </div>
+        {visible.length > PAGE_SIZE && (
+          <div className="flex items-center justify-between text-sm text-slate-600">
+            <span>{(safePage - 1) * PAGE_SIZE + 1}–{Math.min(safePage * PAGE_SIZE, visible.length)} of {visible.length}</span>
+            <div className="flex gap-2">
+              <button className="underline disabled:opacity-40" disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}>Previous</button>
+              <button className="underline disabled:opacity-40" disabled={safePage >= pageCount} onClick={() => setPage(safePage + 1)}>Next</button>
+            </div>
           </div>
         )}
       </section>
 
-      <section className="overflow-x-auto rounded-lg border border-slate-200">
-        <table className="w-full text-left text-sm">
-          <thead className="bg-slate-50 text-xs uppercase text-slate-500">
-            <tr><th className="p-2">Customer</th><th className="p-2">Invoice</th><th className="p-2">Outstanding</th><th className="p-2">Status</th><th className="p-2">Next</th><th className="p-2" /></tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && <tr><td className="p-4 text-slate-500" colSpan={6}>No reminders yet.</td></tr>}
-            {rows.map((row) => (
-              <tr key={row.id} className="border-t border-slate-100 align-top">
-                <td className="p-2">{row.customer}<div className="text-xs text-slate-500">+{row.recipient}</div></td>
-                <td className="p-2">{row.invoice}<div className="text-xs text-slate-500">{row.invoice_date ?? ""}</div></td>
-                <td className="p-2">{inr(row.outstanding)}</td>
-                <td className="p-2">{STATUS_LABEL[row.status]}{row.note && <div className="text-xs text-slate-500">{row.note}</div>}</td>
-                <td className="p-2">{row.next_due_at ? new Date(row.next_due_at).toLocaleString("en-IN") : "—"}</td>
-                <td className="space-x-2 whitespace-nowrap p-2">
-                  <button disabled={busyId === row.id} className="text-slate-700 underline" onClick={() => act(row, "check")}>Check</button>
-                  {isDue(row) && <button disabled={busyId === row.id} className="font-medium text-emerald-700 underline" onClick={() => act(row, "send")}>Send</button>}
-                  {row.status === "active" && <button disabled={busyId === row.id} className="underline" onClick={() => act(row, "pause")}>Pause</button>}
-                  {(row.status === "paused" || row.status === "review") && <button disabled={busyId === row.id} className="underline" onClick={() => act(row, "resume")}>Resume</button>}
-                  {["active", "paused", "review", "uncertain"].includes(row.status) && <button disabled={busyId === row.id} className="text-red-700 underline" onClick={() => act(row, "stop")}>Stop</button>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {starting && (
+        <section className={`${card} space-y-3`}>
+          <h2 className="text-sm font-medium">Start reminders for {selectedRows.length} invoice(s)</h2>
+          {messages.length === 0 ? (
+            <p className="text-sm text-amber-800">No WhatsApp reminder template is registered for this deployment yet (FOLLOWUP_WHATSAPP_TEMPLATES_JSON), so reminders cannot be started.</p>
+          ) : (
+            <>
+              <div className="flex flex-wrap items-center gap-3 text-sm">
+                <select className={field} value={template} onChange={(e) => setTemplate(e.target.value)}>
+                  <option value="">Message…</option>
+                  {messages.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
+                </select>
+                <label>Repeat every <input className={`${field} w-14`} value={everyDays} onChange={(e) => setEveryDays(e.target.value)} /> days</label>
+                <label>Up to <input className={`${field} w-14`} value={limit} onChange={(e) => setLimit(e.target.value)} /> reminders</label>
+              </div>
+              <table className="w-full text-left text-sm">
+                <tbody>
+                  {selectedRows.map((row) => (
+                    <tr key={row.id} className="border-t border-slate-100">
+                      <td className="p-1">{row.partyLedgerName}</td>
+                      <td className="p-1">{row.linkedInvoiceNumber}</td>
+                      <td className="p-1">{inr(row.outstandingAmount)}</td>
+                      <td className="p-1"><input className={`${field} w-44`} placeholder="WhatsApp, 10 digits" value={phones[row.id] ?? ""} onChange={(e) => setPhones((p) => ({ ...p, [row.id]: e.target.value }))} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="flex gap-3 text-sm">
+                <button className="rounded-md bg-slate-900 px-3 py-1.5 text-white disabled:opacity-50" disabled={startBusy || !template} onClick={() => void submitStart()}>
+                  {startBusy ? "Checking Tally…" : "Verify & start reminders"}
+                </button>
+                <button className="underline" disabled={startBusy} onClick={() => setStarting(false)}>Cancel</button>
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
+      <section className="space-y-2">
+        <h2 className="text-sm font-medium">Reminders</h2>
+        <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+              <tr><th className="p-2">Customer</th><th className="p-2">Invoice</th><th className="p-2">Outstanding</th><th className="p-2">Status</th><th className="p-2">Next</th><th className="p-2" /></tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && <tr><td className="p-4 text-slate-500" colSpan={6}>No reminders yet. Select invoices above and press Start reminders.</td></tr>}
+              {rows.map((row) => (
+                <tr key={row.id} className="border-t border-slate-100 align-top">
+                  <td className="p-2">{row.customer}<div className="text-xs text-slate-500">+{row.recipient}</div></td>
+                  <td className="p-2">{row.invoice}<div className="text-xs text-slate-500">{row.invoice_date ?? ""}</div></td>
+                  <td className="p-2">{inr(row.outstanding)}</td>
+                  <td className="p-2">{STATUS_LABEL[row.status]}{row.note && <div className="text-xs text-slate-500">{row.note}</div>}</td>
+                  <td className="p-2">{row.next_due_at ? new Date(row.next_due_at).toLocaleString("en-IN") : "—"}</td>
+                  <td className="space-x-2 whitespace-nowrap p-2">
+                    <button disabled={busyId === row.id} className="text-slate-700 underline" onClick={() => act(row, "check")}>Check</button>
+                    {isDue(row) && <button disabled={busyId === row.id} className="font-medium text-emerald-700 underline" onClick={() => act(row, "send")}>Send</button>}
+                    {row.status === "active" && <button disabled={busyId === row.id} className="underline" onClick={() => act(row, "pause")}>Pause</button>}
+                    {(row.status === "paused" || row.status === "review") && <button disabled={busyId === row.id} className="underline" onClick={() => act(row, "resume")}>Resume</button>}
+                    {["active", "paused", "review", "uncertain"].includes(row.status) && <button disabled={busyId === row.id} className="text-red-700 underline" onClick={() => act(row, "stop")}>Stop</button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
   );

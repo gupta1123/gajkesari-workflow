@@ -1,7 +1,6 @@
 "use client";
 
 import { apiFetch } from "@/lib/api-client";
-import { readLiveOpenBills, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 
 export type ReminderStage = {
   name: string;
@@ -96,24 +95,6 @@ export async function findCandidates(company: CompanyRef & { financialYear: stri
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...company, ledgerNames }),
-    })
-  );
-}
-
-/**
- * Reads every in-scope customer's open bills from Tally in one fast scan (shared
- * with the Cash Discount page), then ranks the invoices that are due.
- */
-export async function scanAllCandidates(
-  company: CompanyRef & { financialYear: string },
-  handlers: { onProgress?: (message: string) => void; onScanInfo?: (info: ScanInfo) => void } = {}
-) {
-  const { byLedger } = await readLiveOpenBills({ ...company, ...handlers });
-  return readJson<{ today: string; totalInvoices: number; dueInvoices: number; customers: number; candidates: FollowupCandidate[] }>(
-    await apiFetch("/api/collections/follow-ups/scan-candidates", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...company, byLedger }),
     })
   );
 }
