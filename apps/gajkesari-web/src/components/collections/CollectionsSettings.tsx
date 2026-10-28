@@ -25,22 +25,25 @@ const DEFAULT_SCOPE: Scope = {
 };
 
 const MODES: Array<{ value: Scope["mode"]; label: string; hint: string }> = [
-  { value: "automatic", label: "Automatic", hint: "Customers under the selected groups, plus ledgers that Tally sales show are customers." },
-  { value: "custom", label: "Custom", hint: "Only the groups you select, with your exclusions." },
-  { value: "strict", label: "Strict", hint: "Only the selected groups. No exceptions are detected." },
+  { value: "automatic", label: "Automatic", hint: "The chosen groups, plus ledgers that Tally sales show are customers. The count below is for the groups only, so a scan can add a few more." },
+  { value: "custom", label: "Custom", hint: "The chosen groups only, minus anything you leave out." },
+  { value: "strict", label: "Strict", hint: "Exactly the chosen groups. Nothing is added or guessed." },
 ];
 
-const toggleName = (list: string[], name: string) => (list.includes(name) ? list.filter((n) => n !== name) : [...list, name]);
+const key = (value: string) => value.trim().toLowerCase().replace(/\s+/g, " ");
+const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every((name) => b.includes(name));
 
 function CustomerScope({ company }: { company: Company }) {
+  const [saved, setSaved] = useState<{ scope: Scope; excluded: string }>({ scope: DEFAULT_SCOPE, excluded: "" });
   const [scope, setScope] = useState<Scope>(DEFAULT_SCOPE);
+  const [excludedText, setExcludedText] = useState("");
   const [groups, setGroups] = useState<ScopeMaster[]>([]);
   const [ledgers, setLedgers] = useState<ScopeMaster[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [excludedText, setExcludedText] = useState("");
-  const [includeSearch, setIncludeSearch] = useState("");
-  const [excludeSearch, setExcludeSearch] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const [groupSearch, setGroupSearch] = useState("");
+  const [previewSearch, setPreviewSearch] = useState("");
   const [notice, setNotice] = useState<{ tone: "ok" | "warn" | "err"; text: string } | null>(null);
 
   const query = useMemo(() => new URLSearchParams({ connectionId: company.connectionId, companyName: company.companyName }).toString(), [company]);
@@ -53,11 +56,16 @@ function CustomerScope({ company }: { company: Company }) {
       try {
         const response = await apiFetch(`/api/settings/cash-discount-customer-scope?${query}`, { cache: "no-store" });
         // 409: the scope table is not installed yet, so the default applies.
-        const saved = response.status === 409 ? DEFAULT_SCOPE : { ...DEFAULT_SCOPE, ...((await response.json()).settings ?? {}) };
-        if (!response.ok && response.status !== 409) throw new Error("Could not load the customer scope.");
-        if (live) { setScope(saved); setExcludedText(saved.excludedLedgerNames.join("\n")); }
+        if (!response.ok && response.status !== 409) throw new Error("Could not load the saved customer choices.");
+        const loaded: Scope = response.status === 409 ? DEFAULT_SCOPE : { ...DEFAULT_SCOPE, ...((await response.json()).settings ?? {}) };
+        if (live) {
+          const text = loaded.excludedLedgerNames.join("\n");
+          setSaved({ scope: loaded, excluded: text });
+          setScope(loaded);
+          setExcludedText(text);
+        }
       } catch (error) {
-        if (live) setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not load the customer scope." });
+        if (live) setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not load the saved customer choices." });
       }
       try {
         const masters = await runCashDiscountLiveRequest<{ ledgers?: ScopeMaster[]; groups?: ScopeMaster[] }>({
@@ -66,7 +74,7 @@ function CustomerScope({ company }: { company: Company }) {
         });
         if (live) { setGroups(masters.groups ?? []); setLedgers(masters.ledgers ?? []); }
       } catch (error) {
-        if (live) setNotice({ tone: "warn", text: `Groups could not be read from Tally (${error instanceof Error ? error.message : "unknown error"}). You can still edit the saved lists.` });
+        if (live) setNotice({ tone: "warn", text: `Tally's groups could not be read (${error instanceof Error ? error.message : "unknown error"}). Your saved choices still apply.` });
       } finally {
         if (live) setLoading(false);
       }
@@ -74,25 +82,63 @@ function CustomerScope({ company }: { company: Company }) {
     return () => { live = false; };
   }, [query, company]);
 
-  const groupNames = useMemo(() => [...new Set([...groups.map((g) => g.name), ...scope.selectedGroupNames, ...scope.excludedGroupNames])].sort((a, b) => a.localeCompare(b)), [groups, scope]);
   const excludedLedgerNames = useMemo(() => excludedText.split("\n").map((n) => n.trim()).filter(Boolean), [excludedText]);
+  const effective = useMemo<Scope>(() => ({ ...scope, excludedLedgerNames }), [scope, excludedLedgerNames]);
+  const dirty = !sameSet(scope.selectedGroupNames, saved.scope.selectedGroupNames) || !sameSet(scope.excludedGroupNames, saved.scope.excludedGroupNames)
+    || scope.mode !== saved.scope.mode || scope.includeNestedGroups !== saved.scope.includeNestedGroups
+    || !sameSet(excludedLedgerNames, saved.scope.excludedLedgerNames);
+
+  // Groups that can hold customers: the chosen groups and everything inside them.
+  const debtorGroups = useMemo(() => {
+    const roots = new Set([...scope.selectedGroupNames, "Sundry Debtors"].map(key));
+    const inside = new Set(roots);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const group of groups) {
+        if (!inside.has(key(group.name)) && group.parent && inside.has(key(group.parent))) { inside.add(key(group.name)); changed = true; }
+      }
+    }
+    return inside;
+  }, [groups, scope.selectedGroupNames]);
+
+  const groupRows = useMemo(() => {
+    const names = [...new Set([...groups.map((g) => g.name), ...scope.selectedGroupNames, ...scope.excludedGroupNames])];
+    const needle = groupSearch.trim().toLowerCase();
+    const rank = (name: string) => (scope.selectedGroupNames.includes(name) ? 0 : scope.excludedGroupNames.includes(name) ? 1 : 2);
+    return names
+      .filter((name) => (showAll || rank(name) < 2 || debtorGroups.has(key(name))) && (!needle || name.toLowerCase().includes(needle)))
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  }, [groups, scope, showAll, debtorGroups, groupSearch]);
+  const hiddenGroups = Math.max(0, groups.length - groupRows.length);
+
   const matched = useMemo(
-    () => (ledgers.length ? resolveScopedLedgers({ groups, ledgers }, { ...scope, excludedLedgerNames }).length : null),
-    [groups, ledgers, scope, excludedLedgerNames]
+    () => (ledgers.length ? resolveScopedLedgers({ groups, ledgers }, effective) : null),
+    [groups, ledgers, effective]
   );
+  const previewRows = useMemo(() => {
+    const needle = previewSearch.trim().toLowerCase();
+    return (matched ?? []).filter((l) => !needle || l.name.toLowerCase().includes(needle)).slice(0, 60);
+  }, [matched, previewSearch]);
+
+  const setGroup = (name: string, choice: "none" | "count" | "leave") => setScope((current) => ({
+    ...current,
+    selectedGroupNames: choice === "count" ? [...new Set([...current.selectedGroupNames, name])] : current.selectedGroupNames.filter((n) => n !== name),
+    excludedGroupNames: choice === "leave" ? [...new Set([...current.excludedGroupNames, name])] : current.excludedGroupNames.filter((n) => n !== name),
+  }));
 
   const save = async () => {
-    if (!scope.selectedGroupNames.length) return setNotice({ tone: "err", text: "Select at least one customer group." });
+    if (!scope.selectedGroupNames.length) return setNotice({ tone: "err", text: "Choose at least one group to count as customers." });
     setSaving(true);
     setNotice(null);
     try {
       const response = await apiFetch("/api/settings/cash-discount-customer-scope", {
         method: "PUT", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ connectionId: company.connectionId, companyName: company.companyName, settings: { ...scope, excludedLedgerNames } }),
+        body: JSON.stringify({ connectionId: company.connectionId, companyName: company.companyName, settings: effective }),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || "Could not save.");
-      setNotice({ tone: "ok", text: "Saved. The next scan of Cash Discounts and Payment Follow-ups uses this scope." });
+      setSaved({ scope: effective, excluded: excludedText });
+      setNotice({ tone: "ok", text: "Saved. Cash Discounts and Payment Follow-ups use this on their next scan." });
     } catch (error) {
       setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not save." });
     } finally {
@@ -100,26 +146,59 @@ function CustomerScope({ company }: { company: Company }) {
     }
   };
 
-  const pick = (list: string[], field: "selectedGroupNames" | "excludedGroupNames", search: string) => (
-    <div className="picker-list">
-      {list.filter((n) => n.toLowerCase().includes(search.toLowerCase())).map((name) => (
-        <label key={name}>
-          <input type="checkbox" checked={scope[field].includes(name)} onChange={() => setScope({ ...scope, [field]: toggleName(scope[field], name) })} />
-          {name}
-        </label>
-      ))}
-      {loading && <span className="muted" style={{ fontSize: 12, padding: 8, display: "block" }}>Reading groups from Tally…</span>}
-    </div>
-  );
+  const discard = () => { setScope(saved.scope); setExcludedText(saved.excluded); setNotice(null); };
 
   return (
     <div className="set-body">
       <h2>Customers</h2>
-      <p className="set-lead">Cash Discounts and Payment Follow-ups only look at bills from the ledgers you count as customers. Change this if a customer is missing, or a supplier shows up by mistake.</p>
+      <p className="set-lead">Cash Discounts and Payment Follow-ups only read bills from the ledgers counted as customers. Fix this if a customer is missing or a supplier shows up by mistake.</p>
       {notice && <div className={`alert ${notice.tone}`}>{notice.text}</div>}
 
       <section className="set-block">
-        <div className="matchnote"><b>{matched == null ? "…" : matched.toLocaleString("en-IN")}</b><span>ledgers are counted as customers with the current choices.</span></div>
+        <div className="matchnote">
+          <b>{matched == null ? (loading ? "…" : "–") : matched.length.toLocaleString("en-IN")}</b>
+          <span>{matched == null ? "ledgers once Tally has been read" : "ledgers are counted as customers"}</span>
+        </div>
+      </section>
+
+      <section className="set-block">
+        <h3>Groups</h3>
+        <p className="why">Count the groups where your customers live (usually Sundry Debtors). Leave out a group to remove its ledgers from the count.</p>
+        <div className="chips" aria-label="Chosen groups">
+          {scope.selectedGroupNames.map((name) => (
+            <span className="chip" key={`c-${name}`}>{name}<button aria-label={`Stop counting ${name}`} onClick={() => setGroup(name, "none")}>×</button></span>
+          ))}
+          {scope.excludedGroupNames.map((name) => (
+            <span className="chip out" key={`o-${name}`}>Leaving out {name}<button aria-label={`Stop leaving out ${name}`} onClick={() => setGroup(name, "none")}>×</button></span>
+          ))}
+          {!scope.selectedGroupNames.length && <span className="muted" style={{ fontSize: 12 }}>No group chosen yet.</span>}
+        </div>
+        <div className="grouplist">
+          <input type="search" aria-label="Find a group" placeholder="Find a group" value={groupSearch} onChange={(e) => setGroupSearch(e.target.value)} />
+          <ul>
+            {groupRows.map((name) => {
+              const choice = scope.selectedGroupNames.includes(name) ? "count" : scope.excludedGroupNames.includes(name) ? "leave" : "none";
+              return (
+                <li key={name}>
+                  <span className="gname">{name}</span>
+                  <span className="seg" role="group" aria-label={name}>
+                    <button aria-pressed={choice === "count"} onClick={() => setGroup(name, choice === "count" ? "none" : "count")}>Count</button>
+                    <button aria-pressed={choice === "leave"} onClick={() => setGroup(name, choice === "leave" ? "none" : "leave")}>Leave out</button>
+                  </span>
+                </li>
+              );
+            })}
+            {loading && <li className="muted" style={{ fontSize: 12 }}>Reading groups from Tally…</li>}
+            {!loading && !groupRows.length && <li className="muted" style={{ fontSize: 12 }}>No group matches.</li>}
+          </ul>
+          <button className="lnk" style={{ margin: "8px 4px 4px" }} onClick={() => setShowAll(!showAll)}>
+            {showAll ? "Show only groups that can hold customers" : hiddenGroups > 0 ? `Show all ${groups.length} groups (${hiddenGroups} more, such as expenses)` : "Show all groups"}
+          </button>
+        </div>
+        <label className="tick">
+          <input type="checkbox" checked={scope.includeNestedGroups} onChange={(e) => setScope({ ...scope, includeNestedGroups: e.target.checked })} />
+          Also include groups that sit inside the chosen ones
+        </label>
       </section>
 
       <section className="set-block">
@@ -136,36 +215,34 @@ function CustomerScope({ company }: { company: Company }) {
       </section>
 
       <section className="set-block">
-        <h3>Groups</h3>
-        <p className="why">Tick the Tally groups whose ledgers are customers, and any groups to leave out.</p>
-        <div className="picker">
-          <div className="picker-col">
-            <header>Count as customers <span>{scope.selectedGroupNames.length} chosen</span></header>
-            <input type="search" placeholder="Find a group" value={includeSearch} onChange={(e) => setIncludeSearch(e.target.value)} />
-            {pick(groupNames, "selectedGroupNames", includeSearch)}
-          </div>
-          <div className="picker-col">
-            <header>Leave out <span>{scope.excludedGroupNames.length} chosen</span></header>
-            <input type="search" placeholder="Find a group" value={excludeSearch} onChange={(e) => setExcludeSearch(e.target.value)} />
-            {pick(groupNames, "excludedGroupNames", excludeSearch)}
-          </div>
-        </div>
-        <label style={{ display: "flex", gap: 8, fontSize: 13, marginTop: 14, cursor: "pointer" }}>
-          <input type="checkbox" checked={scope.includeNestedGroups} onChange={(e) => setScope({ ...scope, includeNestedGroups: e.target.checked })} />
-          Include groups that sit inside the chosen ones
+        <h3>Check who is included</h3>
+        <p className="why">Search the ledgers that will be read. If someone is missing, count their group above. If someone should not be here, leave them out below.</p>
+        <input type="search" aria-label="Search counted customers" placeholder="Search customer names" value={previewSearch} onChange={(e) => setPreviewSearch(e.target.value)}
+          style={{ width: "100%", maxWidth: 360 }} />
+        <ul className="preview">
+          {previewRows.map((ledger) => (
+            <li key={ledger.name}>
+              <span>{ledger.name}</span>
+              <span className="muted">{ledger.parent}</span>
+              <button className="lnk" onClick={() => setExcludedText((text) => (text.trim() ? `${text.trim()}\n${ledger.name}` : ledger.name))}>Leave out</button>
+            </li>
+          ))}
+          {matched && !previewRows.length && <li className="muted">No counted ledger matches “{previewSearch}”.</li>}
+          {!matched && <li className="muted">Customers appear here once Tally has been read.</li>}
+        </ul>
+        {matched && matched.length > previewRows.length && !previewSearch && <p className="why" style={{ marginTop: 8 }}>Showing the first {previewRows.length}. Search to find a specific customer.</p>}
+        <label className="f" style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: "#51483f", marginTop: 16 }}>
+          Ledgers left out, one per line
+          <textarea value={excludedText} onChange={(e) => setExcludedText(e.target.value)} rows={3}
+            style={{ width: "100%", border: "1px solid #ded8d0", borderRadius: 10, padding: 10, fontSize: 13, fontFamily: "inherit", background: "#fff" }} />
         </label>
       </section>
 
-      <section className="set-block">
-        <h3>Individual ledgers to leave out</h3>
-        <p className="why">One ledger name per line, exactly as it appears in Tally.</p>
-        <textarea value={excludedText} onChange={(e) => setExcludedText(e.target.value)} rows={4}
-          style={{ width: "100%", border: "1px solid #ded8d0", borderRadius: 10, padding: 10, fontSize: 13, fontFamily: "inherit", background: "#fff" }} />
-      </section>
-
-      <div className="savebar">
-        <button className="btn lg primary" disabled={saving || loading} onClick={() => void save()}>{saving ? "Saving…" : "Save customers"}</button>
-        <span className="status">The next scan uses what you save.</span>
+      <div className="stickybar" role="region" aria-label="Save changes">
+        <span className="status">{dirty ? "You have changes that are not saved." : "All changes saved."}</span>
+        <span style={{ flex: 1 }} />
+        {dirty && <button className="btn lg" disabled={saving} onClick={discard}>Discard</button>}
+        <button className="btn lg primary" disabled={saving || loading || !dirty} onClick={() => void save()}>{saving ? "Saving…" : "Save customers"}</button>
       </div>
     </div>
   );
@@ -222,19 +299,22 @@ export function CollectionsSettings({ initial = "customers" }: { initial?: Secti
         <header className="ph">
           <div className="ph-top">
             <div className="ph-title"><h1>Settings</h1></div>
-            <div className="ph-actions">
-              {companies.length > 1 && (
-                <select className="cs" aria-label="Company" value={company?.id ?? ""} onChange={(e) => setCompanyId(e.target.value)}>
-                  {companies.map((c) => <option key={c.id} value={c.id}>{c.companyName} · {c.financialYear}</option>)}
-                </select>
-              )}
-            </div>
+            {section === "customers" && companies.length > 1 && (
+              <div className="ph-actions">
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#6f655a" }}>
+                  Company
+                  <select className="cs" aria-label="Company" value={company?.id ?? ""} onChange={(e) => setCompanyId(e.target.value)}>
+                    {companies.map((c) => <option key={c.id} value={c.id}>{c.companyName} · {c.financialYear}</option>)}
+                  </select>
+                </label>
+              </div>
+            )}
           </div>
         </header>
         {error && <div className="alert err">{error}</div>}
         <div className="set">
           <nav className="set-nav" aria-label="Settings sections">
-            {sections.map(([key, label]) => <button key={key} aria-current={section === key ? "page" : undefined} onClick={() => setSection(key)}>{label}</button>)}
+            {sections.map(([k, label]) => <button key={k} aria-current={section === k ? "page" : undefined} onClick={() => setSection(k)}>{label}</button>)}
           </nav>
           <div>
             {section === "customers" && (company ? <CustomerScope key={company.id} company={company} /> : <p className="empty">Connect a Tally company to choose customers.</p>)}

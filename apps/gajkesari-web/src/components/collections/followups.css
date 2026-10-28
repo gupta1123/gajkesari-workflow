@@ -160,3 +160,45 @@
 .fu .ratetable th{text-align:left;font-weight:500;color:#8a7f72;font-size:12px;padding:0 0 8px}
 .fu .ratetable td{padding:12px 0;border-top:1px solid #ece6dc;vertical-align:top}
 .fu .ratetable .rate{font-size:22px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;width:110px}
+
+/* Settings pass 2: contrast, native controls in palette, sticky save bar */
+.fu input[type=checkbox],.fu input[type=radio]{accent-color:#2f2924}
+.fu .set-lead,.fu .set-block .why,.fu .choice small,.fu .muted{color:#6a5f53}
+.fu input::placeholder{color:#7d7266}
+.fu .stickybar{position:sticky;bottom:0;z-index:10;display:flex;align-items:center;gap:10px;margin-top:8px;padding:12px 0;background:#f7f7f5;border-top:1px solid var(--fu-line)}
+.fu .stickybar .status{font-size:12px;color:#51483f}
+.fu .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.fu .chip{display:inline-flex;align-items:center;gap:6px;border-radius:999px;background:#2f2924;color:#fff;padding:4px 6px 4px 12px;font-size:12px}
+.fu .chip.out{background:#fff;color:#8f2f27;border:1px solid #e3b7b2}
+.fu .chip button{border:0;background:rgba(255,255,255,.18);color:inherit;width:18px;height:18px;border-radius:50%;cursor:pointer;line-height:1;font-size:13px}
+.fu .chip.out button{background:#f6e3e0}
+.fu .grouplist{border:1px solid var(--fu-line);border-radius:10px;background:#fff;padding:8px}
+.fu .grouplist input[type=search]{width:100%;height:32px;border-radius:8px;margin-bottom:6px}
+.fu .grouplist ul{list-style:none;margin:0;padding:0;max-height:260px;overflow-y:auto;overscroll-behavior:contain}
+.fu .grouplist li{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;font-size:13px}
+.fu .grouplist li:hover{background:#f7f4ef}
+.fu .gname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fu .seg{display:inline-flex;flex-shrink:0;border:1px solid #ded8d0;border-radius:8px;overflow:hidden}
+.fu .seg button{border:0;background:#fff;padding:4px 10px;font-size:11px;color:#51483f;cursor:pointer}
+.fu .seg button+button{border-left:1px solid #ded8d0}
+.fu .seg button[aria-pressed=true]{background:#2f2924;color:#fff}
+.fu .seg button:last-child[aria-pressed=true]{background:#8f2f27}
+.fu .tick{display:flex;gap:8px;align-items:center;font-size:13px;margin-top:14px;cursor:pointer}
+.fu .preview{list-style:none;margin:10px 0 0;padding:0;max-height:240px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--fu-line);border-radius:10px;background:#fff}
+.fu .preview li{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,.6fr) auto;gap:10px;align-items:center;padding:7px 12px;font-size:13px;border-bottom:1px solid #f0ebe3}
+.fu .preview li:last-child{border-bottom:0}
+.fu .preview li span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fu .msgrow{display:flex;flex-wrap:wrap;gap:20px;align-items:flex-start}
+.fu .wa.mini{margin:0;max-width:340px;flex:1 1 260px}
+.fu .wa.mini .wa-body{min-height:0;padding:12px 10px}
+.fu .wa.mini .wa-msg{font-size:12.5px}
+.fu .stagebox.compact{padding:10px 14px}
+.fu .stagehead{display:flex;align-items:center;gap:10px}
+.fu .stagehead input{flex:1;min-width:0;height:32px;font-weight:600;font-size:13px;border-color:transparent;background:transparent;padding:0 6px;margin-left:-6px}
+.fu .stagehead input:hover{border-color:#ded8d0;background:#fff}
+.fu .stagehead .rm{margin-left:0;font-size:12px;color:#8f2f27;border:0;background:none;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+.fu .stagehead .confirm{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:#51483f}
+.fu .stagehead .confirm button{border:1px solid #ded8d0;border-radius:6px;background:#fff;padding:3px 9px;font-size:12px;cursor:pointer}
+.fu .sentence{margin:8px 0 0;font-size:13px;line-height:2.1;color:#3d3530}
+.fu .sentence input[type=number]{width:60px;height:30px;margin:0 2px;text-align:center}
+.fu .sentence select{height:30px;margin:0 2px;padding:0 8px}
