@@ -1,0 +1,51 @@
+/* Invoice side panel: shared by Payment Follow-ups and Cash Discounts. Self-contained. */
+.ip-scrim{position:fixed;inset:0;background:rgba(32,26,20,.28);z-index:60}
+.ip{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);background:#fff;z-index:61;display:flex;flex-direction:column;box-shadow:-18px 0 40px rgba(32,26,20,.14);color:#2f2924;font-size:13px;animation:ip-in .18s ease-out}
+@keyframes ip-in{from{transform:translateX(24px);opacity:.4}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){.ip{animation:none}}
+.ip-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:20px 22px 14px;border-bottom:1px solid #ece6dc}
+.ip-head h2{margin:0;font-size:18px;font-weight:600;letter-spacing:-.01em;overflow-wrap:anywhere}
+.ip-head p{margin:4px 0 0;font-size:12.5px;color:#756b60;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px}
+.ip-x{border:0;background:none;font-size:24px;line-height:1;color:#756b60;cursor:pointer;width:32px;height:32px;border-radius:8px}
+.ip-x:hover{background:#f3eee8}
+.ip-body{flex:1;overflow-y:auto;padding:18px 22px 24px;display:flex;flex-direction:column;gap:22px}
+.ip-body h3{margin:0 0 10px;font-size:12px;font-weight:600;color:#756b60}
+.ip-status{align-self:flex-start;border-radius:999px;padding:5px 11px;font-size:12px;font-weight:600}
+.ip-status.bad{background:#fef2f2;color:#b91c1c}.ip-status.warn{background:#fffbeb;color:#92400e}
+.ip-status.ok{background:#ecfdf5;color:#065f46}.ip-status.quiet{background:#f5f5f4;color:#57534e}
+
+.ip-money{border:1px solid #ece6dc;border-radius:12px;padding:16px}
+.ip-due{display:flex;flex-direction:column;gap:2px}
+.ip-due span{font-size:12px;color:#756b60}
+.ip-due b{font-size:26px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.ip-bar{height:6px;border-radius:99px;background:#efe6da;margin:14px 0 12px;overflow:hidden}
+.ip-bar i{display:block;height:100%;background:#2f8f5b;border-radius:99px}
+.ip-money dl{margin:0;display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.ip-money dt{font-size:11.5px;color:#8a7f72}
+.ip-money dd{margin:2px 0 0;font-weight:600;font-variant-numeric:tabular-nums}
+
+.ip-dates{list-style:none;margin:0;padding:0;position:relative}
+.ip-dates li{display:flex;gap:12px;padding:0 0 16px;position:relative}
+.ip-dates li:last-child{padding-bottom:0}
+.ip-dates li:not(:last-child)::before{content:"";position:absolute;left:4px;top:14px;bottom:0;width:1px;background:#e3dbcf}
+.ip-dot{width:9px;height:9px;border-radius:50%;background:#cfc5b7;margin-top:5px;flex:none}
+.ip-dates li.bad .ip-dot{background:#c2362f}.ip-dates li.warn .ip-dot{background:#c58a1b}.ip-dates li.ok .ip-dot{background:#2f8f5b}
+.ip-dates b{display:block;font-weight:600}
+.ip-dates span{display:block;color:#51483f;font-variant-numeric:tabular-nums}
+.ip-dates em{display:block;font-style:normal;font-size:12px;color:#8a7f72;margin-top:1px}
+.ip-dates li.bad em{color:#b91c1c}.ip-dates li.warn em{color:#92400e}.ip-dates li.ok em{color:#065f46}
+
+.ip-receipts{list-style:none;margin:0;padding:0;border:1px solid #ece6dc;border-radius:10px}
+.ip-receipts li{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;border-top:1px solid #f1ece4}
+.ip-receipts li:first-child{border-top:0}
+.ip-receipts small{display:block;color:#8a7f72;font-size:11.5px;margin-top:2px}
+.ip-receipts b{font-variant-numeric:tabular-nums;font-weight:600}
+
+.ip-facts{margin:0}
+.ip-facts div{display:flex;justify-content:space-between;gap:16px;padding:8px 0;border-top:1px solid #f1ece4}
+.ip-facts div:first-child{border-top:0}
+.ip-facts dt{color:#8a7f72}
+.ip-facts dd{margin:0;text-align:right;overflow-wrap:anywhere}
+.ip-body blockquote{margin:0;padding:10px 12px;background:#faf8f5;border-radius:8px;color:#51483f;line-height:1.5;font-size:12.5px;overflow-wrap:anywhere}
+
+.ip-foot{display:flex;gap:8px;justify-content:flex-end;padding:14px 22px;border-top:1px solid #ece6dc;background:#fcfbfa}

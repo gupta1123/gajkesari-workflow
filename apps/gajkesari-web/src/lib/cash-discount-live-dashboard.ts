@@ -24,6 +24,13 @@ export function financialYearStart(financialYear: string | null | undefined) {
 }
 
 type LiveLedger = ScopeMaster & { gstin?: string | null };
+// Only the contact details travel with the scan, so the request stays small.
+function contactFields(ledger: LiveLedger) {
+  const raw = ((ledger as { raw?: Record<string, unknown> }).raw ?? {}) as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of ["phone", "email", "contactPerson"]) if (raw[key]) out[key] = raw[key];
+  return out;
+}
 type LedgerBucket = { complete?: boolean; openBills?: unknown[]; settledBills?: unknown[] };
 
 // Says how much of the scan came from the connector's local copy of Tally's vouchers.
@@ -180,7 +187,7 @@ async function runLiveCashDiscountDashboard<T>(params: LiveReadParams): Promise<
       scan: {
         financialYear,
         openBillsResult: { result: { byLedger } },
-        ledgers: customers.map((customer) => ({ name: customer.name, parent: customer.parent ?? null, gstin: customer.gstin ?? null, raw: {} })),
+        ledgers: customers.map((customer) => ({ name: customer.name, parent: customer.parent ?? null, gstin: customer.gstin ?? null, raw: contactFields(customer) })),
         scanSummary: { complete: true, customerCount: customers.length },
       },
     }),

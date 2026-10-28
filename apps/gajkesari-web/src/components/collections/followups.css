@@ -31,7 +31,7 @@
 .fu .tab.active{border-bottom-color:#2d2d2d;color:#1a1a1a;font-weight:500}
 .fu .tbadge{margin-left:8px;border-radius:999px;background:#fef3c7;color:#78350f;padding:2px 8px;font-size:12px}
 .fu .tb-right{display:flex;flex-shrink:0;justify-content:flex-end;align-items:center;gap:8px;padding:6px 0}
-.fu .sortlbl{display:flex;align-items:center;gap:8px;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#94a3b8}
+.fu .sortlbl{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;color:#756b60}
 .fu .sortlbl select{text-transform:none;letter-spacing:0;font-weight:500}
 .fu .bulkbar{position:absolute;inset:0;z-index:5;display:flex;align-items:center;gap:6px;padding:0 10px 0 16px;background:#2f2924;color:#fff;border-radius:10px 10px 0 0;overflow-x:auto;white-space:nowrap}
 .fu .bb-count{font-size:13px;font-weight:600;margin-right:6px}
@@ -287,3 +287,26 @@
 .fu .rem-note{margin:0;font-size:12px;color:#6a5f53;text-align:center}
 
 .fu tr.sub td { background: #faf8f5; font-size: 12px; }
+
+/* Customers with unpaid invoices: a grid so the columns always line up */
+.fu .cg{margin-top:12px;font-size:12px;color:#5a5046}
+.fu .cg-row{display:grid;grid-template-columns:28px minmax(220px,1fr) 80px 150px 150px 170px;gap:0 14px;align-items:center;min-height:56px;padding:0 4px;border-bottom:1px solid #ece6dc}
+.fu .cg-head{min-height:40px;background:#f7f4ef;font-weight:600;color:#3d3530;border-bottom:1px solid var(--fu-line)}
+.fu .cg .r{text-align:right}
+.fu .cg-group:hover>.cg-row{background:rgba(237,230,217,.35)}
+.fu .cg-name{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:8px;cursor:pointer;min-width:0;padding:8px 0}
+.fu .cg-name:focus-visible{outline:2px solid #2563eb;outline-offset:2px;border-radius:6px}
+.fu .cg-name b{display:block;font-size:13px;font-weight:500;color:#111827;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fu .cg-name small{display:block;margin-top:2px;font-size:11px;color:#8a7f72}
+.fu .cg-name>span{min-width:0}
+.fu .chev{flex:none;color:#8a7f72;transition:transform .15s}
+.fu .cg-group.open .chev{transform:rotate(90deg)}
+.fu .cg-sub{background:#faf8f5;border-bottom:1px solid #ece6dc;padding:4px 0 4px 46px}
+.fu .cg-inv{all:unset;box-sizing:border-box;display:grid;grid-template-columns:minmax(200px,1fr) 150px 190px auto;gap:14px;align-items:center;width:100%;min-height:44px;padding:0 18px 0 0;cursor:pointer;border-top:1px solid #f1ece4}
+.fu .cg-inv:first-child{border-top:0}
+.fu .cg-inv:hover{background:rgba(237,230,217,.5)}
+.fu .cg-inv:focus-visible{outline:2px solid #2563eb;outline-offset:-2px}
+.fu .cg-invno{font-size:12.5px;color:#2f2924}
+.fu .cg-invno small{display:block;font-size:11px;color:#8a7f72;margin-top:2px}
+.fu .cg-empty{padding:32px 0;text-align:center}
+@media (max-width:900px){.fu .cg{overflow-x:auto}.fu .cg-row,.fu .cg-inv{min-width:760px}}

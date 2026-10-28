@@ -8,6 +8,7 @@ import {
   createPipelines, listPipelines, runPipelineAction,
   type FollowupAttempt, type FollowupPipeline, type PipelineAction, type ReminderMessage, type ReminderStage,
 } from "@/lib/followups-client";
+import { InvoicePanel, type PanelDate, type PanelTone } from "./InvoicePanel";
 import "./followups.css";
 
 type Company = { id: string; connectionId: string; companyName: string; financialYear: string };
@@ -26,6 +27,11 @@ type DueInvoice = {
   originalInvoiceAmount: number;
   outstandingAmount: number;
   narration: string | null;
+  dueDate?: string | null;
+  amountReceived?: number | null;
+  lastReceiptDate?: string | null;
+  receipts?: Array<{ date: string | null; amount: number; voucherNumber: string | null; voucherType: string | null }>;
+  partyEmail?: string | null;
 };
 type FollowUpPayload = { tabs?: { paymentFollowUps?: DueInvoice[] } };
 
@@ -80,6 +86,29 @@ function kindOf(row: DueInvoice): Exclude<Kind, "all"> {
 const isDue = (row: FollowupPipeline) =>
   (row.status === "active" && !!row.next_due_at && Date.parse(row.next_due_at) <= Date.now()) || row.status === "review";
 const isOpen = (row: FollowupPipeline) => !["settled", "finished", "stopped"].includes(row.status);
+
+function billStatus(row: DueInvoice): { label: string; tone: PanelTone } {
+  const part = (row.amountReceived ?? 0) > 0.005;
+  if (kindOf(row) === "unclear") return { label: part ? "Part paid, terms unclear" : "Terms unclear", tone: "warn" };
+  const days = row.ageDays ?? 0;
+  const base = part ? "Part paid" : "Unpaid";
+  if (days > 0) return { label: `${base}, overdue ${days} days`, tone: days > 30 ? "bad" : "warn" };
+  return { label: `${base}, due today`, tone: "quiet" };
+}
+
+// Dates in the order they happened, each saying what it means for collection.
+function billDates(row: DueInvoice): PanelDate[] {
+  const days = row.ageDays ?? 0;
+  const list: PanelDate[] = [{ label: "Invoice date", date: row.linkedInvoiceDate }];
+  if (row.lastReceiptDate) list.push({ label: "Last payment", date: row.lastReceiptDate, tone: "ok" });
+  list.push({
+    label: "Payment due",
+    date: row.dueDate,
+    note: kindOf(row) === "unclear" ? "Due date could not be worked out" : days > 0 ? `${days} day${days === 1 ? "" : "s"} overdue` : "Due today",
+    tone: kindOf(row) === "unclear" ? "warn" : days > 30 ? "bad" : days > 0 ? "warn" : "quiet",
+  });
+  return list.filter((d) => d.date || d.label === "Payment due").sort((x, y) => String(x.date ?? "9999").localeCompare(String(y.date ?? "9999")));
+}
 
 function ageCell(row: DueInvoice) {
   if (kindOf(row) === "unclear") return <span className="muted">Terms unclear</span>;
@@ -159,6 +188,7 @@ export function FollowUpPipelines() {
   const [enrolling, setEnrolling] = useState<{ ids: string[]; once: boolean; customers?: boolean } | null>(null);
   const [view, setView] = useState<"invoice" | "customer">("customer");
   const [opened, setOpened] = useState<Set<string>>(new Set());
+  const [billId, setBillId] = useState("");
   const [phones, setPhones] = useState<Record<string, string>>({});
   const [template, setTemplate] = useState("");
   const [savedPlans, setSavedPlans] = useState<Array<{ id: string; name: string; stages: ReminderStage[] }>>([]);
@@ -243,7 +273,8 @@ export function FollowUpPipelines() {
   const visibleDues = useMemo(() => {
     const filtered = due.filter((row) => kind === "all" || kindOf(row) === kind);
     const sorted = [...filtered];
-    if (sort === "priority" || sort === "most_overdue") sorted.sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1));
+    if (sort === "priority") sorted.sort((a, b) => Math.floor((b.ageDays ?? -1) / 30) - Math.floor((a.ageDays ?? -1) / 30) || b.outstandingAmount - a.outstandingAmount);
+    else if (sort === "most_overdue") sorted.sort((a, b) => (b.ageDays ?? -1) - (a.ageDays ?? -1));
     else if (sort === "highest") sorted.sort((a, b) => b.outstandingAmount - a.outstandingAmount);
     else if (sort === "oldest") sorted.sort((a, b) => String(a.linkedInvoiceDate ?? "9999").localeCompare(String(b.linkedInvoiceDate ?? "9999")));
     else sorted.sort((a, b) => a.partyLedgerName.localeCompare(b.partyLedgerName));
@@ -267,7 +298,7 @@ export function FollowUpPipelines() {
     if (sort === "highest") list.sort((a, b) => b.total - a.total);
     else if (sort === "oldest") list.sort((a, b) => a.oldest.localeCompare(b.oldest));
     else if (sort === "customer") list.sort((a, b) => a.name.localeCompare(b.name));
-    else list.sort((a, b) => b.maxAge - a.maxAge);
+    else list.sort((a, b) => Math.floor(b.maxAge / 30) - Math.floor(a.maxAge / 30) || b.total - a.total);
     return list;
   }, [visibleDues, sort]);
   const byCustomer = tab === "dues" && view === "customer";
@@ -470,6 +501,7 @@ export function FollowUpPipelines() {
   const messageFor = (key: string | undefined) => messages.find((m) => m.key === key)?.text;
   const detail = rows.find((row) => row.id === detailId);
   const focusRow = review ? rows.find((row) => row.id === review.focus) : undefined;
+  const billRow = due.find((row) => row.id === billId);
   const enrollRows = enrolling && !enrolling.customers ? due.filter((row) => enrolling.ids.includes(row.id)) : [];
   const enrollGroups = enrolling?.customers ? groups.filter((group) => enrolling.ids.includes(group.name)) : [];
   const selGroups = groups.filter((group) => selected.has(`c:${group.name}`));
@@ -667,48 +699,47 @@ export function FollowUpPipelines() {
             </p>
             <div className="flat">
               {scanning && tab === "dues" && !due.length ? <div className="skel" /> : byCustomer ? (
-                <table className="grid">
-                  <thead><tr>
-                    <th style={{ width: 36 }}><input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} /></th>
-                    <th>Customer</th><th style={{ width: 110 }}>Invoices</th><th className="r" style={{ width: 150 }}>Outstanding</th>
-                    <th style={{ width: "18%" }}>Oldest overdue</th><th style={{ width: 170 }}>Reminders</th>
-                  </tr></thead>
-                  <tbody>
-                    {pageGroups.map((group) => {
-                      const pipe = customerPipeline(group.name);
-                      const open = opened.has(group.name);
-                      return (
-                        <Fragment key={group.name}>
-                          <tr>
-                            <td><input type="checkbox" aria-label={`Select ${group.name}`} checked={selected.has(`c:${group.name}`)} onChange={(e) => toggle(`c:${group.name}`, e.target.checked)} /></td>
-                            <td>
-                              <button className="lnk" style={{ textDecoration: "none", textAlign: "left" }} aria-expanded={open}
-                                onClick={() => setOpened((current) => { const next = new Set(current); if (open) next.delete(group.name); else next.add(group.name); return next; })}>
-                                <span className="cname">{group.name}</span>
+                <div className="cg" role="table" aria-label="Customers with unpaid invoices">
+                  <div className="cg-row cg-head" role="row">
+                    <input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} />
+                    <span>Customer</span><span className="r">Invoices</span><span className="r">Outstanding</span><span>Oldest overdue</span><span>Reminders</span>
+                  </div>
+                  {pageGroups.map((group) => {
+                    const pipe = customerPipeline(group.name);
+                    const open = opened.has(group.name);
+                    return (
+                      <div key={group.name} className={`cg-group${open ? " open" : ""}`}>
+                        <div className="cg-row" role="row">
+                          <input type="checkbox" aria-label={`Select ${group.name}`} checked={selected.has(`c:${group.name}`)} onChange={(e) => toggle(`c:${group.name}`, e.target.checked)} />
+                          <button className="cg-name" aria-expanded={open} aria-label={`${open ? "Hide" : "Show"} invoices of ${group.name}`}
+                            onClick={() => setOpened((current) => { const next = new Set(current); if (open) next.delete(group.name); else next.add(group.name); return next; })}>
+                            <svg className="chev" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                            <span><b title={group.name}>{group.name}</b>{!group.phone && <small>No contact on file</small>}</span>
+                          </button>
+                          <span className="r num">{group.invoices.length}</span>
+                          <span className="r num">{money(group.total)}</span>
+                          <span>{group.maxAge > 0 ? <span className={group.maxAge > 30 ? "age-bad" : "age-warn"}>{group.maxAge} days</span> : "Due today"}</span>
+                          <span>{pipe
+                            ? <span className="pill pill-stone">{STATUS_LABEL[pipe.status]}</span>
+                            : <button className="btn" onClick={() => openEnrollCustomers([group.name], false)}>Remind customer</button>}</span>
+                        </div>
+                        {open && (
+                          <div className="cg-sub">
+                            {group.invoices.map((row) => (
+                              <button key={row.id} className="cg-inv" onClick={() => setBillId(row.id)}>
+                                <span className="cg-invno">{row.linkedInvoiceNumber}<small>{fmtDate(row.linkedInvoiceDate)}</small></span>
+                                <span className="r num">{money(row.outstandingAmount)}</span>
+                                <span>{ageCell(row)}</span>
+                                {(row.amountReceived ?? 0) > 0.005 && <span className="pill pill-amber">Part paid</span>}
                               </button>
-                              {!group.phone && <span className="csub">No contact on file</span>}
-                            </td>
-                            <td>{group.invoices.length}</td>
-                            <td className="r num">{money(group.total)}</td>
-                            <td>{group.maxAge > 0 ? <span className={group.maxAge > 30 ? "age-bad" : "age-warn"}>{group.maxAge} days</span> : <span>Due today</span>}</td>
-                            <td>{pipe
-                              ? <span className="pill pill-stone">{STATUS_LABEL[pipe.status]}</span>
-                              : <button className="btn" onClick={() => openEnrollCustomers([group.name], false)}>Remind customer</button>}</td>
-                          </tr>
-                          {open && group.invoices.map((row) => (
-                            <tr key={row.id} className="sub">
-                              <td />
-                              <td colSpan={2}>{row.linkedInvoiceNumber}<span className="csub">{fmtDate(row.linkedInvoiceDate)}</span></td>
-                              <td className="r num">{money(row.outstandingAmount)}</td>
-                              <td colSpan={2}>{ageCell(row)}</td>
-                            </tr>
-                          ))}
-                        </Fragment>
-                      );
-                    })}
-                    {!pageGroups.length && <tr><td colSpan={6} className="empty">{scanError ? "Tally could not be read." : "No customers have unpaid invoices that need a follow-up."}</td></tr>}
-                  </tbody>
-                </table>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {!pageGroups.length && <div className="empty cg-empty">{scanError ? "Tally could not be read." : "No customers have unpaid invoices that need a follow-up."}</div>}
+                </div>
               ) : tab === "dues" ? (
                 <table className="grid">
                   <thead><tr>
@@ -724,7 +755,7 @@ export function FollowUpPipelines() {
                         <tr key={row.id}>
                           <td><input type="checkbox" aria-label={`Select ${row.linkedInvoiceNumber}`} disabled={!row.linkedInvoiceNumber} checked={selected.has(row.id)} onChange={(e) => toggle(row.id, e.target.checked)} /></td>
                           <td><span className="cname" title={row.partyLedgerName}>{row.partyLedgerName}</span>{!phone && <span className="csub">No contact on file</span>}</td>
-                          <td>{row.linkedInvoiceNumber ?? "—"}<span className="csub">{fmtDate(row.linkedInvoiceDate)}</span></td>
+                          <td>{row.linkedInvoiceNumber ? <button className="lnk" style={{ textDecoration: "none" }} onClick={() => setBillId(row.id)}>{row.linkedInvoiceNumber}</button> : "—"}<span className="csub">{fmtDate(row.linkedInvoiceDate)}</span></td>
                           <td className="r num">{money(row.outstandingAmount)}</td>
                           <td>{KIND_LABEL[kindOf(row)]}</td>
                           <td>{ageCell(row)}</td>
@@ -820,6 +851,31 @@ export function FollowUpPipelines() {
           </>
         )}
       </div>
+
+      {billRow && (
+        <InvoicePanel
+          invoice={billRow.linkedInvoiceNumber ?? "Invoice"}
+          customer={billRow.partyLedgerName}
+          status={billStatus(billRow)}
+          invoiceAmount={billRow.originalInvoiceAmount}
+          received={billRow.amountReceived ?? Math.max(billRow.originalInvoiceAmount - billRow.outstandingAmount, 0)}
+          outstanding={billRow.outstandingAmount}
+          dates={billDates(billRow)}
+          receipts={(billRow.receipts ?? []).map((r) => ({ date: r.date, amount: r.amount, reference: [r.voucherType, r.voucherNumber].filter(Boolean).join(" ") || null }))}
+          facts={[
+            { label: "Payment terms", value: KIND_LABEL[kindOf(billRow)] },
+            { label: "WhatsApp", value: tenDigits(billRow.partyPhone) ? maskPhone(`91${tenDigits(billRow.partyPhone)}`) : "No number on file" },
+            ...(billRow.partyEmail ? [{ label: "Email", value: billRow.partyEmail }] : []),
+            { label: "Reminders", value: pipelineFor(billRow) ? STATUS_LABEL[pipelineFor(billRow)!.status] : "Not started" },
+          ]}
+          narration={billRow.narration}
+          onClose={() => setBillId("")}
+        >
+          {!pipelineFor(billRow) && billRow.linkedInvoiceNumber && (
+            <button className="btn primary" onClick={() => { setBillId(""); openEnroll([billRow.id], false); }}>Start reminders</button>
+          )}
+        </InvoicePanel>
+      )}
 
       {review && focusRow && (
         <>

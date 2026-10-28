@@ -1,6 +1,7 @@
 "use client";
 
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { InvoicePanel, type PanelDate } from "./InvoicePanel";
 import {
   CheckCircle2,
   Loader2,
@@ -396,6 +397,7 @@ export function CollectionsDashboardPage() {
   const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
   const [scanInfo, setScanInfo] = useState<ScanInfo | null>(null);
   const [scanProgress, setScanProgress] = useState<string | null>(null);
+  const [panelId, setPanelId] = useState("");
   const initialLoadStartedRef = useRef(false);
   const lastLoadedConnectionRef = useRef("");
 
@@ -885,6 +887,7 @@ export function CollectionsDashboardPage() {
 
   const pendingProposals = proposals.filter(isPendingDebitNote);
   const createdProposals = proposals.filter(isCreatedDebitNote);
+  const panelProposal = proposals.find((proposal) => proposal.id === panelId);
   const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectedPendingProposals = selectablePendingProposals.filter((proposal) => selectedPendingIds.has(proposal.id));
   const selectableCreatedProposals = createdProposals.filter((proposal) => proposal.communicationStatus !== "sent");
@@ -1176,9 +1179,9 @@ export function CollectionsDashboardPage() {
                             ) : null}
                           </td>
                           <td className="px-4 py-4">
-                            <div className="truncate text-sm font-semibold text-[#1a1a1a]" title={proposal.linkedInvoiceNumber ?? ""}>
+                            <button className="block max-w-full truncate text-left text-sm font-semibold text-[#1a1a1a] hover:underline" title="Show invoice details" onClick={() => setPanelId(proposal.id)} type="button">
                               {shortText(proposal.linkedInvoiceNumber, "No invoice")}
-                            </div>
+                            </button>
                             <div className="mt-1 text-[11px] text-slate-500">{formatDate(proposal.linkedInvoiceDate)}</div>
                             <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
                               <span className="rounded-full bg-[#f7f4ee] px-2 py-0.5 text-slate-600">
@@ -1318,7 +1321,7 @@ export function CollectionsDashboardPage() {
                             </div>
                           </td>
                           <td className="px-4 py-4">
-                            <div className="truncate text-sm font-semibold text-[#1a1a1a]">{shortText(proposal.linkedInvoiceNumber, "No invoice")}</div>
+                            <button className="block max-w-full truncate text-left text-sm font-semibold text-[#1a1a1a] hover:underline" title="Show invoice details" onClick={() => setPanelId(proposal.id)} type="button">{shortText(proposal.linkedInvoiceNumber, "No invoice")}</button>
                             <div className="mt-1 text-[11px] text-slate-500">{formatDate(proposal.linkedInvoiceDate)}</div>
                             <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
                               <span className="rounded-full bg-[#f7f4ee] px-2 py-0.5 text-slate-600">
@@ -1528,6 +1531,51 @@ export function CollectionsDashboardPage() {
           </div>
         </div>
       ) : null}
+
+      {panelProposal ? (
+        <InvoicePanel
+          invoice={panelProposal.linkedInvoiceNumber ?? "Invoice"}
+          customer={panelProposal.partyLedgerName}
+          status={panelStatus(panelProposal)}
+          invoiceAmount={panelProposal.originalInvoiceAmount}
+          received={panelProposal.amountReceived}
+          outstanding={panelProposal.pendingAmount ?? (typeof panelProposal.originalInvoiceAmount === "number" && typeof panelProposal.amountReceived === "number" ? Math.max(panelProposal.originalInvoiceAmount - panelProposal.amountReceived, 0) : null)}
+          dates={panelDates(panelProposal)}
+          facts={[
+            { label: "Cash discount rule", value: panelProposal.cashDiscountRuleName || "Cash discount" },
+            { label: "Debit note amount", value: formatMoney(panelProposal.recoverableAmount) },
+            ...(typeof panelProposal.expectedDiscount === "number" ? [{ label: "Discount allowed", value: formatMoney(panelProposal.expectedDiscount) }] : []),
+            ...(panelProposal.tallyVoucherNumber ? [{ label: "Debit note in Tally", value: panelProposal.tallyVoucherNumber }] : []),
+            { label: "WhatsApp", value: panelProposal.partyPhone || "No number on file" },
+          ]}
+          narration={panelProposal.narration}
+          onClose={() => setPanelId("")}
+        />
+      ) : null}
     </div>
   );
 }
+
+function panelStatus(proposal: DebitNoteProposal): { label: string; tone: "bad" | "warn" | "ok" | "quiet" } {
+  if (proposal.lastError) return { label: "Tally action failed", tone: "bad" };
+  if (isCreatedDebitNote(proposal)) return { label: "Debit note created", tone: "ok" };
+  const late = daysPast(proposal.discountDeadline);
+  if (proposal.issueType === "invoice_unpaid") return { label: "Unpaid after the discount date", tone: "bad" };
+  if (proposal.issueType === "partial_unpaid") return { label: "Part paid", tone: "warn" };
+  return { label: late ? "Paid " + late + " day" + (late === 1 ? "" : "s") + " late" : "Paid late", tone: "warn" };
+}
+
+// Dates in the order they happened. A payment after the discount deadline is flagged.
+function panelDates(proposal: DebitNoteProposal): PanelDate[] {
+  const received = proposal.receiptDate;
+  const deadline = proposal.discountDeadline;
+  const paidLate = Boolean(received && deadline && received.slice(0, 10) > deadline.slice(0, 10));
+  const list: PanelDate[] = [
+    { label: "Invoice date", date: proposal.linkedInvoiceDate },
+    { label: "Discount allowed until", date: deadline, tone: received ? (paidLate ? "bad" : "ok") : "warn", note: received ? (paidLate ? "Payment came after this date" : "Paid in time") : "Passed without full payment" },
+  ];
+  if (received) list.push({ label: "Payment received", date: received, tone: paidLate ? "bad" : "ok" });
+  if (proposal.tallyVoucherDate) list.push({ label: "Debit note dated", date: proposal.tallyVoucherDate });
+  return list.filter((d) => d.date).sort((x, y) => String(x.date).localeCompare(String(y.date)));
+}
+
