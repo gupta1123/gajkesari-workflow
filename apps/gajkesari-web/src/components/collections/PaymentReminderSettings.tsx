@@ -108,6 +108,8 @@ export function PaymentReminderSettings() {
 
       {notice && <div className={`alert ${notice.tone === "ok" ? "ok" : "err"}`}>{notice.text}</div>}
 
+      <div className="rem">
+      <div className="rem-main">
       <section className="set-block">
         {plans.length > 0 && (
           <>
@@ -122,25 +124,6 @@ export function PaymentReminderSettings() {
           Plan name
           <input type="text" value={draft.name} maxLength={80} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />
         </label>
-      </section>
-
-      <section className="set-block">
-        <h3>Message</h3>
-        {messages.length === 0 ? (
-          <div className="alert warn" style={{ margin: 0 }}>No WhatsApp message is available yet. Ask your administrator to register one, then reload this page.</div>
-        ) : (
-          <div className="msgrow">
-            <label className="f" style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: "#51483f" }}>
-              Message to send
-              <select value={messageKey} onChange={(e) => setMessage(e.target.value)} style={{ minWidth: 240 }}>
-                {messages.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
-              </select>
-            </label>
-            <div className="wa mini" aria-label="Message preview">
-              <div className="wa-body"><div className="wa-msg">{sampleText.split("\n").map((line, i) => <span key={i}>{line}<br /></span>)}</div></div>
-            </div>
-          </div>
-        )}
       </section>
 
       <section className="set-block">
@@ -175,6 +158,34 @@ export function PaymentReminderSettings() {
         </ol>
         <button className="btn" disabled={draft.stages.length >= 8} onClick={() => setDraft((d) => ({ ...d, stages: [...d.stages, { name: "Another reminder", template: messageKey, delay: 1, every: 1, unit: "days", limit: 1 }] }))}>Add a stage</button>
       </section>
+
+      </div>
+      <aside className="rem-side" aria-label="Message preview">
+        {messages.length === 0 ? (
+          <div className="alert warn" style={{ margin: 0 }}>No WhatsApp message is available yet. Ask your administrator to register one, then reload this page.</div>
+        ) : (
+          <>
+            {messages.length > 1 && (
+              <select aria-label="Message to send" value={messageKey} onChange={(e) => setMessage(e.target.value)}>
+                {messages.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
+              </select>
+            )}
+            <div className="wa">
+              <div className="wa-bar"><span className="wa-av">A</span><span className="wa-who"><b>Your company</b><small>Business account</small></span></div>
+              <div className="wa-body">
+                <div className="wa-day">Today</div>
+                <div className="wa-msg">
+                  {sampleText.split("
+").map((line, i) => <span key={i}>{line}<br /></span>)}
+                  <span className="wa-time">10:42 am</span>
+                </div>
+              </div>
+            </div>
+            <p className="rem-note">Sample values. Wording is fixed by WhatsApp.</p>
+          </>
+        )}
+      </aside>
+      </div>
 
       <div className="stickybar" role="region" aria-label="Save changes">
         <span className="status">{incomplete && dirty ? "Give the plan a name, a message and a name for every stage." : dirty ? "You have changes that are not saved." : "All changes saved."}</span>

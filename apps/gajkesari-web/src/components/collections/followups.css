@@ -273,3 +273,15 @@
 .fu .set-nav button[aria-current=page]{background:none;border-bottom-color:#2563eb;color:#1a1a1a}
 .fu .set-body{max-width:none}
 .fu .set-block:first-of-type{margin-top:0;border-top:0;padding-top:0}
+
+/* Payment reminders: stages on the left, the WhatsApp message on the right */
+.fu .rem{display:grid;grid-template-columns:minmax(0,7fr) minmax(280px,3fr);gap:32px;align-items:start}
+@media(max-width:900px){.fu .rem{grid-template-columns:1fr}}
+.fu .rem-main{min-width:0}
+.fu .rem-side{position:sticky;top:16px;display:flex;flex-direction:column;gap:10px}
+.fu .rem-side select{width:100%}
+.fu .rem-side .wa{max-width:none;margin:0}
+.fu .rem-side .wa-msg{max-width:92%;font-size:13px}
+.fu .wa-time{display:block;text-align:right;font-size:10.5px;color:#667781;margin-top:2px}
+.fu .wa-time::after{content:" ✓✓";color:#53bdeb}
+.fu .rem-note{margin:0;font-size:12px;color:#6a5f53;text-align:center}
