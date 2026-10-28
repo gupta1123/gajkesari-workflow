@@ -14,7 +14,7 @@ import {
 
 import { apiFetch } from "@/lib/api-client";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
-import { loadLiveCashDiscountDashboard } from "@/lib/cash-discount-live-dashboard";
+import { loadLiveCashDiscountDashboard, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 
 type CompanyOption = {
   id: string;
@@ -394,6 +394,8 @@ export function CollectionsDashboardPage() {
   const [whatsappSaveToTally, setWhatsappSaveToTally] = useState(true);
   const [whatsappDialogSending, setWhatsappDialogSending] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
+  const [scanInfo, setScanInfo] = useState<ScanInfo | null>(null);
+  const [scanProgress, setScanProgress] = useState<string | null>(null);
   const initialLoadStartedRef = useRef(false);
   const lastLoadedConnectionRef = useRef("");
 
@@ -441,7 +443,16 @@ export function CollectionsDashboardPage() {
         return;
       }
       if (CASH_DISCOUNT_LIVE && companyName) {
-        setDashboard(await loadLiveCashDiscountDashboard<DashboardPayload>({ connectionId, companyName, financialYear }));
+        setScanProgress("Starting...");
+        try {
+          setDashboard(await loadLiveCashDiscountDashboard<DashboardPayload>({
+            connectionId, companyName, financialYear,
+            onProgress: setScanProgress,
+            onScanInfo: setScanInfo,
+          }));
+        } finally {
+          setScanProgress(null);
+        }
         return;
       }
       const params = new URLSearchParams({ connectionId });
@@ -1025,6 +1036,13 @@ export function CollectionsDashboardPage() {
           </button>
         </div>
       </div>
+
+      {CASH_DISCOUNT_LIVE && (scanInfo || scanProgress) ? (
+        <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-900">
+          {scanInfo ? <span className="rounded-full bg-amber-200 px-2.5 py-0.5 font-bold">{scanInfo.label}</span> : null}
+          <span>{scanProgress ?? scanInfo?.detail}</span>
+        </div>
+      ) : null}
 
       {message ? (
         <div

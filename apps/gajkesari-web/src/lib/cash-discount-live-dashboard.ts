@@ -3,7 +3,10 @@ import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { chunk, resolveScopedLedgers, type CustomerScope, type ScopeMaster } from "@/lib/cash-discount-scope-ledgers";
 
 // The connector answers one small, filtered open-bills question at a time.
-const LEDGERS_PER_READ = 10;
+const LEDGERS_PER_READ = 50;
+
+// How the open bills were read, so the page can say so plainly.
+export type ScanInfo = { mode: "batch"; label: string; detail: string };
 
 export const DEFAULT_CUSTOMER_SCOPE: CustomerScope = {
   mode: "automatic",
@@ -64,8 +67,9 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
   financialYear?: string | null;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
+  onScanInfo?: (info: ScanInfo) => void;
 }): Promise<T> {
-  const { connectionId, companyName, signal, onProgress } = params;
+  const { connectionId, companyName, signal, onProgress, onScanInfo } = params;
   const financialYear = params.financialYear ?? null;
   const scope = await loadCustomerScope(connectionId, companyName);
   const dateFrom = financialYearStart(financialYear);
@@ -81,9 +85,14 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
 
   const byLedger: Record<string, LedgerBucket> = {};
   const batches = chunk(customers.map((customer) => customer.name), LEDGERS_PER_READ);
+  onScanInfo?.({
+    mode: "batch",
+    label: "Batch mode (slower)",
+    detail: `${customers.length} customers in ${batches.length} reads of up to ${LEDGERS_PER_READ}. This connector cannot scan the whole company in one pass.`,
+  });
   for (const [index, ledgerNames] of batches.entries()) {
     signal?.throwIfAborted();
-    onProgress?.(`Reading open bills ${index * LEDGERS_PER_READ + ledgerNames.length} of ${customers.length} customers...`);
+    onProgress?.(`Batch mode: read ${index + 1} of ${batches.length} (${index * LEDGERS_PER_READ + ledgerNames.length} of ${customers.length} customers)...`);
     const read = await withBusyRetry(signal, () => runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
       connectionId, companyName, financialYear, signal, onProgress,
       operation: "fetch_customer_open_bills",
