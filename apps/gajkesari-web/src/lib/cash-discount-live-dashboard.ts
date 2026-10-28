@@ -34,7 +34,7 @@ async function withBusyRetry<T>(signal: AbortSignal | undefined, run: () => Prom
       return await run();
     } catch (error) {
       const busy = error instanceof Error && /tally is busy/i.test(error.message);
-      if (!busy || attempt >= 4) throw error;
+      if (!busy || attempt >= 8) throw error;
       await new Promise((resolve) => setTimeout(resolve, 5000));
       signal?.throwIfAborted();
     }
@@ -91,11 +91,11 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
   try {
     onScanInfo?.({ mode: "fast", label: "Fast scan", detail: `Reading all ${customers.length} customers in one pass.` });
     onProgress?.("Fast scan: reading the whole company from Tally...");
-    const read = await runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
+    const read = await withBusyRetry(signal, () => runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
       connectionId, companyName, financialYear, signal, onProgress,
       operation: "fetch_customer_open_bills",
       payload: { companyName, financialYear, queryStrategy: "company_scan", ledgerNames: [], scopeLedgerNames: customers.map((customer) => customer.name) },
-    });
+    }));
     Object.assign(byLedger, read.byLedger ?? {});
     scanned = true;
   } catch (error) {
