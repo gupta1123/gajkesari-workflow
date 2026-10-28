@@ -11,7 +11,7 @@ const tools = path.join(installer, 'nsis');
 const payload = path.join(installer, 'payload-clean');
 const app = path.join(payload, 'resources/app');
 const versionIndex = process.argv.indexOf('--version');
-const version = versionIndex < 0 ? '0.1.86' : process.argv[versionIndex + 1];
+const version = versionIndex < 0 ? '0.1.87' : process.argv[versionIndex + 1];
 if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Provide a numeric connector version.');
 if (!process.argv.includes('--reuse-payload')) {
   execFileSync(process.execPath, [path.join(root, 'scripts/build-tally-connector-installer.mjs'), '--payload-only'], {cwd: root, stdio: 'inherit'});
@@ -24,6 +24,7 @@ if (!process.argv.includes('--reuse-payload')) {
   fs.cpSync(path.join(root, 'apps/tally-bridge/src'), path.join(app, 'src'), {recursive:true});
   // Match the normal payload builder's standalone module replacements.
   fs.copyFileSync(path.join(root, 'packages/shared/src/lib/bank-bill-reference.mjs'), path.join(app, 'src/local-matching/bill-reference.mjs'));
+  fs.copyFileSync(path.join(root, 'packages/shared/src/lib/bank-duplicate-resolution.mjs'), path.join(app, 'src/local-matching/duplicate-resolution.mjs'));
   for (const name of fs.readdirSync(path.join(app, 'src/document-parsing/backend-logic'))) {
     fs.copyFileSync(path.join(root, 'apps/api/worker', name), path.join(app, 'src/document-parsing/backend-logic', name));
   }

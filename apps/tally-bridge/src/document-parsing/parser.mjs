@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { formatFromBytes, formatFromExtension, toDocument, toMarkdownBytes } from "@firecrawl/anydoc";
+import { enrichBankStatementTransactions, validatePrintedStatementSummary } from "./transaction-details.mjs";
+import { readScannedPdf } from "./scanned-pdf.mjs";
 
 export const MAX_DOCUMENT_BYTES = 25 * 1024 * 1024;
 export const SUPPORTED_DOCUMENT_EXTENSIONS = [
@@ -170,20 +172,31 @@ function approximatePdfPageCount(bytes) {
   return Math.max(1, (source.match(/\/Type\s*\/Page\b/g) || []).length);
 }
 
+function requiresDocumentOcr(error) {
+  return error?.code === "needsOcr" || /needs?\s+OCR|OCR\s+is\s+required/i.test(error?.message || "");
+}
+
 function physicalDate(value) {
+  const iso = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) {
+    const date = new Date(Date.UTC(Number(iso[1]),Number(iso[2])-1,Number(iso[3])));
+    return date.toISOString().slice(0,10) === iso[0] ? iso[0] : null;
+  }
   const match = String(value || "").match(/^(\d{1,2})[-/ ](\d{1,2}|[A-Za-z]{3})[-/ ](\d{2,4})/);
   if (!match) return null;
   const month = /^[A-Za-z]/.test(match[2])
     ? String(['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(match[2].toLowerCase()) + 1)
     : match[2];
-  return `${match[3].length === 2 ? '20' : ''}${match[3]}-${month.padStart(2, '0')}-${match[1].padStart(2, '0')}`;
+  const result = `${match[3].length === 2 ? '20' : ''}${match[3]}-${month.padStart(2, '0')}-${match[1].padStart(2, '0')}`;
+  const date = new Date(Date.UTC(Number(result.slice(0,4)),Number(month)-1,Number(match[1])));
+  return date.toISOString().slice(0,10) === result ? result : null;
 }
 
 function transactionsFromPhysicalRows(rows) {
   return rows.map((row, sourceIndex) => ({
     row_index: sourceIndex + 1,
     transaction_date: physicalDate(row.sourceDate),
-    value_date: physicalDate(row.sourceDate),
+    value_date: physicalDate(row.valueDate || row.sourceDate),
     description: String(row.narration || "").replace(/\s+/g, " ").trim(),
     reference_number: row.reference || null,
     debit_amount: row.debitAmount > 0 ? row.debitAmount : null,
@@ -211,34 +224,62 @@ function transactionsFromPhysicalRows(rows) {
   }));
 }
 
-export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1, pdfBytes = null } = {}) {
+export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1, pdfBytes = null, physicalEvidence = null } = {}) {
   const { deterministic, account, amounts, runningBalance, resilience, pdfColumns } = await loadBankStatementModules();
   let normalized = deterministic.deterministicTransactionsFromAnydoc(markdown);
   let pipeline = "deterministic_anydoc";
-  let physical = null;
-  if (!normalized?.transactions?.length && pdfBytes) {
-    physical = await pdfColumns.readBankStatementPhysicalColumns(pdfBytes);
-    if (physical.detected && physical.rows.length) {
-      normalized = {
-        headers: [`physical:${physical.layout}`],
-        transactions: transactionsFromPhysicalRows(physical.rows),
-      };
-      pipeline = "physical_pdf_columns";
+  let physical = physicalEvidence;
+  let physicalWarning = null;
+  if (pdfBytes && !physicalEvidence) {
+    try {
+      physical = await pdfColumns.readBankStatementPhysicalColumns(pdfBytes);
+    } catch (error) {
+      if (!normalized?.transactions?.length || /\bTxn No\.?\b/i.test(markdown)) throw error;
+      physicalWarning = "Physical table verification was unavailable; the normalized rows were checked against their running balances.";
     }
+    // PNB's Markdown may contain the right amounts but clipped narrations.
+    // Its printed table cells remain authoritative even when balances pass.
+    if (physical?.imageOnlyPages?.length) {
+      const error = new Error("This statement contains scanned pages and needs OCR.");
+      error.code = "ocr_required";
+      throw error;
+    }
+  }
+  if (physical?.detected && physical.rows.length && (physicalEvidence || !normalized?.transactions?.length || physical.layout === "pnb")) {
+    normalized = {
+      headers: [`physical:${physical.layout}`],
+      transactions: transactionsFromPhysicalRows(physical.rows),
+    };
+    pipeline = "physical_pdf_columns";
   }
   if (!normalized?.transactions?.length) {
     const error = new Error("The bank-statement tables could not be normalized deterministically.");
     error.code = "deterministic_extraction_unavailable";
     throw error;
   }
+  if (normalized.transactions.some(row=>!row.transaction_date)) {
+    const error = new Error("A transaction date could not be read reliably. Please review the original statement.");
+    error.code = "statement_date_uncertain";
+    throw error;
+  }
+  const sourceCoverage = physical?.detected && physical.rows.length ? {
+    checked:true,sourceRows:physical.rows.length,extractedRows:normalized.transactions.length,
+    complete:physical.rows.length===normalized.transactions.length,
+  } : {checked:false};
+  if (sourceCoverage.checked && !sourceCoverage.complete) {
+    const error = new Error("Some statement entries could not be read reliably. Please review the original PDF.");
+    error.code = "statement_row_count_mismatch";
+    throw error;
+  }
   const source = amounts.extractBankStatementMarkdownAmounts(markdown);
+  const openingBalance = physical?.openingBalance ?? source.openingBalance;
   const references = amounts.restoreSourceBankReferences(normalized.transactions, source.rows);
   normalized.transactions = references.transactions;
   const accountFromMarkdown = account.extractAccountFromBankStatementMarkdown(markdown);
   const statementPeriod = account.extractBankStatementPeriodFromMarkdown(markdown);
   let balanceValidation = runningBalance.validateRunningBalanceContinuity(
     normalized.transactions,
-    source.openingBalance,
+    openingBalance,
   );
   if (balanceValidation.status === "failed" && pdfBytes && !physical) {
     physical = await pdfColumns.readBankStatementPhysicalColumns(pdfBytes);
@@ -251,7 +292,7 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
     if (physical.detected && physical.rows.length && JSON.stringify(sourceIdentities) === JSON.stringify(physicalIdentities)) {
       normalized.transactions = transactionsFromPhysicalRows(physical.rows);
       pipeline = "physical_pdf_columns";
-      balanceValidation = runningBalance.validateRunningBalanceContinuity(normalized.transactions, source.openingBalance);
+      balanceValidation = runningBalance.validateRunningBalanceContinuity(normalized.transactions, openingBalance);
     }
   }
   if (balanceValidation.status === "failed") {
@@ -260,11 +301,23 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
     error.diagnostics = { balanceValidation };
     throw error;
   }
+  const summaryValidation = validatePrintedStatementSummary(markdown, normalized.transactions, openingBalance, balanceValidation.orientation);
+  if (summaryValidation.status === "failed") {
+    const error = new Error("The extracted entries do not match the totals printed on this statement. Please review the original PDF.");
+    error.code = "statement_summary_mismatch";
+    error.diagnostics = { summaryValidation };
+    throw error;
+  }
+  const printedReferenceKind = physical?.referenceKind ?? (normalized.headers.some(header=>/cheque|chq/i.test(header)) ? "cheque" : "reference");
+  normalized.transactions = enrichBankStatementTransactions(normalized.transactions, {
+    physicalLayout:physical?.layout, bankName:accountFromMarkdown.bankName,
+    accountHolderName:accountFromMarkdown.accountHolderName, printedReferenceKind,
+  });
   return {
     parsed: {
       account: account.mergeBankStatementAccount({}, accountFromMarkdown),
       ...statementPeriod,
-      openingBalance: source.openingBalance,
+      openingBalance,
       transactions: pipeline === "physical_pdf_columns"
         ? normalized.transactions
         : resilience.addBankStatementPageProvenance(normalized.transactions, {
@@ -295,6 +348,9 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
         ],
       },
       balanceValidation,
+      summaryValidation,
+      sourceCoverage,
+      ...(physicalWarning ? {warnings:[physicalWarning]} : {}),
       used: true,
     },
   };
@@ -309,21 +365,53 @@ export async function parseDocumentLocal(request = {}) {
 
   try {
     if (output === "markdown") {
-      const markdown = await toMarkdownBytes(bytes, format);
-      return { outputFormat: "markdown", content: markdown, metadata: metadata({ fileName, format, bytes, startedAt, structured: false }) };
+      try {
+        const markdown = await toMarkdownBytes(bytes, format);
+        return { outputFormat: "markdown", content: markdown, metadata: metadata({ fileName, format, bytes, startedAt, structured: false }) };
+      } catch (error) {
+        if (format !== "pdf" || !requiresDocumentOcr(error)) throw error;
+        const {pdfColumns} = await loadBankStatementModules();
+        const ocr = await readScannedPdf(bytes,pdfColumns.extractBankStatementPhysicalColumns);
+        await processBankStatementMarkdownLocal(ocr.markdown,{pageCount:ocr.pages,physicalEvidence:ocr.physical});
+        return {outputFormat:"markdown",content:ocr.markdown,metadata:{...metadata({fileName,format,bytes,startedAt,structured:false}),ocrUsed:true}};
+      }
     }
     if (format === "pdf") {
-      const markdown = await toMarkdownBytes(bytes, format);
-      const bankStatement = await processBankStatementMarkdownLocal(markdown, {
+      let markdown;
+      try { markdown = await toMarkdownBytes(bytes, format); }
+      catch (error) {
+        if (!requiresDocumentOcr(error)) throw error;
+        markdown = "";
+      }
+      let ocr = null;
+      let bankStatement;
+      try {
+      bankStatement = await processBankStatementMarkdownLocal(markdown, {
         pageCount: request.pageCount || approximatePdfPageCount(bytes),
         pdfBytes: bytes,
       });
+      } catch (error) {
+        if (!["ocr_required","deterministic_extraction_unavailable"].includes(error.code)) throw error;
+        try {
+          const {pdfColumns} = await loadBankStatementModules();
+          ocr = await readScannedPdf(bytes,pdfColumns.extractBankStatementPhysicalColumns);
+          bankStatement = await processBankStatementMarkdownLocal(ocr.markdown,{pageCount:ocr.pages,physicalEvidence:ocr.physical});
+          bankStatement.parsed.transactions = bankStatement.parsed.transactions.map(row=>({...row,confidence:Math.min(row.confidence,0.8),raw_payload:{...row.raw_payload,ocrUsed:true}}));
+          bankStatement.diagnostics.ocr = {used:true,languages:ocr.languages,reviewRecommended:true};
+          bankStatement.diagnostics.warnings = [...(bankStatement.diagnostics.warnings||[]),"This statement was read from scanned images. Please review the names and amounts before posting."];
+        } catch (ocrError) {
+          const failure = new Error("The scanned statement could not be read reliably. Please upload a clearer scan or a text PDF.");
+          failure.code = ocrError.code || "ocr_review_required";
+          throw failure;
+        }
+      }
       return {
         outputFormat: "json",
         content: bankStatement.parsed,
         metadata: {
           ...metadata({ fileName, format, bytes, startedAt, structured: true }),
-          sourceFormat: "anydoc_markdown",
+          ocrUsed: Boolean(ocr),
+          sourceFormat: ocr ? "windows_ocr_physical" : "anydoc_markdown",
           diagnostics: bankStatement.diagnostics,
         },
       };

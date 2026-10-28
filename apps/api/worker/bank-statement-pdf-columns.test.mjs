@@ -67,3 +67,32 @@ test('generic statement headings get deterministic physical row evidence',()=>{
   ['05/09/2026','Customer receipt',null,1250,5000],
  ]);
 });
+
+test('printed PNB row rules preserve long wrapped narrations and exclude branch/footer text',()=>{
+ const page={pageNumber:1,width:1000,horizontalRules:[{y:660,left:50,right:1000},{y:500,left:50,right:1000}],items:[
+  ...headers,item('Branch Name',560,700,80),
+  item('U123456',65,600,70),item('03-09-2026',165,600,70),
+  item('NRTGS/ICICR42026092300596742/',350,645,180),
+  item('MAHADEV STEEL',350,625,180),item('AND CEMENT',350,540,180),
+  item('-',590,600,10),item('100.00',660,600,85),item('1000.00 Dr.',860,600,85),
+  item('Disclaimer below the table',350,490,180),
+ ]};
+ const result=extractBankStatementPhysicalColumns([page]);
+ assert.equal(result.rows[0].narration,'NRTGS/ICICR42026092300596742/ MAHADEV STEEL AND CEMENT');
+ assert.equal(result.rows[0].balanceAmount,-1000);
+});
+
+test('combined SVC date/narration cells preserve cheque numbers, signed balances and a separate opening',()=>{
+ const head=[item('Date',15,700,22),item('Particulars',70,700,45),item('Chq No.',235,700,34),item('Debit',332,700,22),item('Credit',429,700,25),item('Balance',542,700,34)];
+ const page={pageNumber:1,width:595,items:[...head,
+  item('24 Sep 2026 By Opening Balance',15,650,136),item('0',221,650,5),item('-1000.00',516,650,60),
+  item('24 Sep 2026 ANITA SINGH',15,620,150),item('001789',221,620,30),item('100.00',315,620,40),item('-1100.00',516,620,60),
+  item('24 Sep 2026 ACME ROADWAYS',15,590,150),item('001790',221,590,30),item('50.00',430,590,30),item('-1050.00',516,590,60),
+  item('---------------------------------------*',327,555,164),
+ ]};
+ const result=extractBankStatementPhysicalColumns([page]);
+ assert.equal(result.openingBalance,-1000);assert.equal(result.rows.length,2);
+ assert.deepEqual(result.rows.map(r=>[r.narration,r.reference,r.debitAmount,r.creditAmount,r.balanceAmount]),[
+  ['ANITA SINGH','001789',100,null,-1100],['ACME ROADWAYS','001790',null,50,-1050],
+ ]);
+});

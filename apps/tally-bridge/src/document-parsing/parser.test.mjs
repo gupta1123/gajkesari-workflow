@@ -112,3 +112,29 @@ NRTGS/PUNBR wrapped continuation U123456 03-09-2026 50.00 950.00 Dr.`;
     /could not be normalized deterministically/
   );
 });
+
+test('connector rejects a balanced partial extraction when the printed statement count disagrees',async()=>{
+ const md='|Date|Description|Reference|Debit|Credit|Balance|\n|---|---|---|---|---|---|\n|24-Oct-2026|ANITA SINGH|REF001||50.00|1050.00|\n\n|Opening Balance|Debit Count|Credit Count|Total Debit|Total Credit|Closing Balance|\n|---|---|---|---|---|---|\n|1000.00|0|2|0.00|100.00|1100.00|';
+ await assert.rejects(()=>processBankStatementMarkdownLocal(md),{code:'statement_summary_mismatch'});
+});
+
+test('physical date validation rejects invalid calendar dates instead of inventing an ISO date',async()=>{
+ const physical={detected:true,layout:'generic_statement',rows:[{sourceDate:'31/02/2026',narration:'ANITA SINGH',reference:'001',creditAmount:50,debitAmount:null,balanceAmount:1050,page:1}],openingBalance:1000};
+ await assert.rejects(()=>processBankStatementMarkdownLocal('',{physicalEvidence:physical}),{code:'statement_date_uncertain'});
+});
+
+test('image-only PDFs reach OCR and produce a review message rather than a native unsupported-input error',async()=>{
+ const stream='q 595 0 0 842 0 0 cm /Im0 Do Q';
+ const objects=[
+  Buffer.from('<< /Type /Catalog /Pages 2 0 R >>'),
+  Buffer.from('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+  Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>'),
+  Buffer.concat([Buffer.from('<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n'),Buffer.from([255,255,255]),Buffer.from('\nendstream')]),
+  Buffer.from(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`),
+ ];
+ const parts=[Buffer.from('%PDF-1.4\n')],offsets=[];
+ for(let i=0;i<objects.length;i++) {offsets.push(parts.reduce((n,p)=>n+p.length,0));parts.push(Buffer.from(`${i+1} 0 obj\n`),objects[i],Buffer.from('\nendobj\n'));}
+ const xref=parts.reduce((n,p)=>n+p.length,0);
+ parts.push(Buffer.from(`xref\n0 6\n0000000000 65535 f \n${offsets.map(n=>String(n).padStart(10,'0')+' 00000 n \n').join('')}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`));
+ await assert.rejects(()=>parseDocumentLocal({bytes:Buffer.concat(parts),fileName:'unreadable-scan.pdf',output:'json'}),{code:process.platform==='win32'?'ocr_review_required':'ocr_unavailable'});
+});

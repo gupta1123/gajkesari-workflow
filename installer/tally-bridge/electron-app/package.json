@@ -1,6 +1,6 @@
 {
   "name": "gajkesari-tally-connector-wrapper",
-  "version": "0.1.82",
+  "version": "0.1.87",
   "private": true,
   "type": "module",
   "main": "main.mjs",
