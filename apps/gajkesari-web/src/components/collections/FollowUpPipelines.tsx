@@ -6,7 +6,7 @@ import { loadLiveCashDiscountDashboard, type ScanInfo } from "@/lib/cash-discoun
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
 import {
   createPipelines, listPipelines, runPipelineAction,
-  type FollowupAttempt, type FollowupPipeline, type PipelineAction, type ReminderMessage,
+  type FollowupAttempt, type FollowupPipeline, type PipelineAction, type ReminderMessage, type ReminderStage,
 } from "@/lib/followups-client";
 import "./followups.css";
 
@@ -137,6 +137,8 @@ export function FollowUpPipelines() {
   const [enrolling, setEnrolling] = useState<{ ids: string[]; once: boolean } | null>(null);
   const [phones, setPhones] = useState<Record<string, string>>({});
   const [template, setTemplate] = useState("");
+  const [savedPlans, setSavedPlans] = useState<Array<{ id: string; name: string; stages: ReminderStage[] }>>([]);
+  const [planId, setPlanId] = useState("");
   const [enrollBusy, setEnrollBusy] = useState(false);
   const [enrollError, setEnrollError] = useState("");
 
@@ -167,6 +169,8 @@ export function FollowUpPipelines() {
           setCompanyId(payload.selectedCompanyId || payload.companies?.[0]?.id || "");
         }
         await refresh();
+        const plansResponse = await apiFetch("/api/settings/payment-reminders", { cache: "no-store" });
+        if (plansResponse.ok) setSavedPlans((await plansResponse.json()).plans ?? []);
       } catch (error) {
         setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not load reminders." });
       }
@@ -266,6 +270,8 @@ export function FollowUpPipelines() {
     setEnrollError("");
   };
 
+  const chosenPlan = savedPlans.find((plan) => plan.id === planId);
+
   const submitEnroll = async () => {
     if (!company || !enrolling) return;
     const chosen = due.filter((row) => enrolling.ids.includes(row.id));
@@ -280,10 +286,12 @@ export function FollowUpPipelines() {
         companyName: company.companyName,
         financialYear: company.financialYear,
         plan: {
-          name: enrolling.once ? "Send once" : "Standard",
+          name: enrolling.once ? "Send once" : chosenPlan?.name ?? "Standard",
           stages: enrolling.once
             ? [{ name: "One-time message", template, delay: 0, every: 1, unit: "days", limit: 1 }]
-            : STANDARD_STAGES.map((stage) => ({ ...stage, template })),
+            : chosenPlan
+              ? chosenPlan.stages
+              : STANDARD_STAGES.map((stage) => ({ ...stage, template })),
         },
         invoices: chosen.map((row) => ({
           customer: row.partyLedgerName,
@@ -516,11 +524,24 @@ export function FollowUpPipelines() {
                   {messages.map((m) => <option key={m.key} value={m.key}>{m.name}</option>)}
                 </select>
               </label>
+              {!enrolling.once && savedPlans.length > 0 && (
+                <label className="f">
+                  <span>Reminder plan</span>
+                  <select value={planId} onChange={(e) => setPlanId(e.target.value)}>
+                    <option value="">Standard schedule</option>
+                    {savedPlans.map((plan) => <option key={plan.id} value={plan.id}>{plan.name}</option>)}
+                  </select>
+                </label>
+              )}
               {!enrolling.once && (
                 <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.7, color: "#51483f" }}>
-                  <li><b>First reminder</b> when you start, one message</li>
-                  <li><b>Regular follow-up</b> 2 days later, every 2 days, up to 3 messages</li>
-                  <li><b>Final reminders</b> 1 day later, every day, up to 3 messages</li>
+                  {(chosenPlan?.stages ?? STANDARD_STAGES).map((stage) => (
+                    <li key={stage.name}>
+                      <b>{stage.name}</b>{" "}
+                      {stage.delay === 0 ? "starts right away" : `starts ${stage.delay} ${stage.unit} later`}
+                      {stage.limit === 1 ? ", one message" : `, every ${stage.every} ${stage.unit}, up to ${stage.limit} messages`}
+                    </li>
+                  ))}
                 </ol>
               )}
               {enrollError && <div className="alert err" style={{ margin: 0 }}>{enrollError}</div>}

@@ -1,10 +1,10 @@
 import { AppShell } from "@/components/dashboard/AppShell";
-import { PaymentReminderSettings } from "@/components/collections/PaymentReminderSettings";
+import { CollectionsSettings } from "@/components/collections/CollectionsSettings";
 
 export default function PaymentReminderSettingsRoute() {
   return (
     <AppShell>
-      <PaymentReminderSettings />
+      <CollectionsSettings initial="reminders" />
     </AppShell>
   );
 }
