@@ -127,8 +127,8 @@ function CustomerScope({ company }: { company: Company }) {
 
   // Open the chosen groups once the tree is known, so the page starts on the customers.
   useEffect(() => {
-    if (groups.length) setOpen(new Set(groups.map((g) => key(g.name))));
-  }, [groups]);
+    if (groups.length) setOpen(new Set(groups.filter((g) => tree.children.has(key(g.name))).map((g) => key(g.name))));
+  }, [groups, tree]);
 
   const matched = useMemo(
     () => (ledgers.length ? resolveScopedLedgers({ groups, ledgers }, scope) : null),
@@ -248,11 +248,36 @@ function CustomerScope({ company }: { company: Company }) {
     const direct = tree.ledgersIn.get(k) ?? [];
     const expandable = kids.length > 0 || direct.length > 0;
     const isOpen = found ? found.show.has(k) && (found.below.has(k) || open.has(k)) : open.has(k);
-    const ledgersShown = found ? found.below.has(k) : showLedgers.has(k);
-    const via = state === "out" && !explicitOut ? "left out with its parent" : "";
-    const shownLedgers = (found ? direct.filter((l) => l.name.toLowerCase().includes(needle)) : direct);
+    const leaf = kids.length === 0;
+    const via = state === "out" && !explicitOut ? ", left out with its parent" : "";
+    const shownLedgers = found ? direct.filter((l) => l.name.toLowerCase().includes(needle)) : direct;
     const limit = more.has(k) ? shownLedgers.length : LEDGER_CAP;
     const indent = 4 + depth * 24;
+    const ownKey = `${k}::own`;
+    const ownOpen = found ? found.below.has(k) : open.has(ownKey);
+    const ledgerRows = (pad: number) => (
+      <>
+        {shownLedgers.slice(0, limit).map((l) => {
+          const ls = ledgerState(l);
+          return (
+            <li key={`l-${l.name}`} className="trow ledger" style={{ paddingLeft: pad }}>
+              <span className="chev" />
+              <label className="rowtick">
+                <input type="checkbox" checked={ls === "in"} disabled={ls === "none" || (ls === "out" && outSet.has(key(l.parent)))}
+                  onChange={() => (ls === "in" ? leaveLedgers([l.name]) : countLedger(l.name))} />
+                <span className={ls === "out" ? "struck" : ""}>{l.name}</span>
+              </label>
+            </li>
+          );
+        })}
+        {shownLedgers.length > limit && (
+          <li className="trow ledger" style={{ paddingLeft: pad }}>
+            <span className="chev" />
+            <button className="lnk" onClick={() => setMore(new Set(more).add(k))}>Show all {shownLedgers.length.toLocaleString("en-IN")}</button>
+          </li>
+        )}
+      </>
+    );
     return (
       <li key={k} className="tnode">
         <div className={`trow ${state}${state === "none" && holdsPick.has(k) ? " holds" : ""}`} style={{ paddingLeft: indent }} onClick={() => expandable && toggleOpen(k)}>
@@ -260,35 +285,19 @@ function CustomerScope({ company }: { company: Company }) {
           <input type="checkbox" aria-label={`Count ${group.name} as customers`} checked={state === "in"} disabled={state === "out" && !leftKeys.has(k)}
             onClick={(e) => e.stopPropagation()}
             ref={(el) => { if (el) el.indeterminate = partial; }} onChange={() => toggleGroup(group.name)} />
-          <span className="tname">{group.name}</span>
-          <span className="tmeta">{(tree.totals.get(k) ?? 0).toLocaleString("en-IN")}{via ? `, ${via}` : ""}</span>
+          <span className="tname">{group.name} <span className="cnt">({(tree.totals.get(k) ?? 0).toLocaleString("en-IN")}{via})</span></span>
         </div>
         {isOpen && (
           <ul className="tlist">
             {kids.map((c) => renderGroup(c, depth + 1, state))}
-            {direct.length > 0 && !ledgersShown && !found && (
-              <li className="trow ledger" style={{ paddingLeft: indent + 24 }}>
-                <span className="chev" />
-                <button className="lnk" onClick={() => setShowLedgers(new Set(showLedgers).add(k))}>Show the {direct.length.toLocaleString("en-IN")} ledgers directly in {group.name}</button>
-              </li>
-            )}
-            {ledgersShown && shownLedgers.slice(0, limit).map((l) => {
-              const ls = ledgerState(l);
-              return (
-                <li key={`l-${l.name}`} className="trow ledger" style={{ paddingLeft: indent + 24 }}>
-                  <span className="chev" />
-                  <label className="rowtick">
-                    <input type="checkbox" checked={ls === "in"} disabled={ls === "none" || (ls === "out" && outSet.has(key(l.parent)))}
-                      onChange={() => (ls === "in" ? leaveLedgers([l.name]) : countLedger(l.name))} />
-                    <span className={ls === "out" ? "struck" : ""}>{l.name}</span>
-                  </label>
-                </li>
-              );
-            })}
-            {ledgersShown && shownLedgers.length > limit && (
-              <li className="trow ledger" style={{ paddingLeft: indent + 24 }}>
-                <span className="chev" />
-                <button className="lnk" onClick={() => setMore(new Set(more).add(k))}>Show all {shownLedgers.length.toLocaleString("en-IN")} ledgers in {group.name}</button>
+            {leaf && ledgerRows(indent + 24 + 22)}
+            {!leaf && shownLedgers.length > 0 && (
+              <li className="tnode">
+                <div className="trow own" style={{ paddingLeft: indent + 24 }} onClick={() => setOpen((cur) => { const next = new Set(cur); if (!next.delete(ownKey)) next.add(ownKey); return next; })}>
+                  <span className="chev" aria-hidden>{ownOpen ? "▾" : "▸"}</span>
+                  <span className="tname own">Ledgers directly in {group.name} <span className="cnt">({direct.length.toLocaleString("en-IN")})</span></span>
+                </div>
+                {ownOpen && <ul className="tlist">{ledgerRows(indent + 48 + 22)}</ul>}
               </li>
             )}
           </ul>
@@ -312,7 +321,7 @@ function CustomerScope({ company }: { company: Company }) {
 
       <section className="set-block">
         <h3>Groups and ledgers</h3>
-        <p className="why">Tick the groups that hold customers. A ticked group (blue) counts everything inside it. Untick a subgroup to leave it out. A grey group only contains a ticked one. Numbers on the right are ledgers.</p>
+        <p className="why">Tick the groups that hold customers. A blue group counts everything inside it; untick a subgroup to leave it out. A grey group only contains a ticked one. The number in brackets is how many ledgers a group holds.</p>
         <div className="tree">
           <input type="search" aria-label="Search groups and ledgers" placeholder="Search a group or a customer" value={search} onChange={(e) => setSearch(e.target.value)} />
           {found && (found.groupHits.length > 0 || found.ledgerHits.length > 0) && (
@@ -327,7 +336,7 @@ function CustomerScope({ company }: { company: Company }) {
           )}
           {!needle && (
             <div className="treetools">
-              <button className="lnk" onClick={() => setOpen(new Set(groups.map((g) => key(g.name))))}>Expand all</button>
+              <button className="lnk" onClick={() => setOpen(new Set(groups.map((g) => key(g.name))))}>Expand all groups</button>
               <button className="lnk" onClick={() => setOpen(new Set())}>Collapse all</button>
             </div>
           )}

@@ -259,3 +259,8 @@
 .fu .trow.ledger{background:transparent}
 .fu .treetools{display:flex;gap:14px;margin:2px 6px 6px;font-size:12px}
 .fu .tlist.root{max-height:560px;overflow-y:auto;overscroll-behavior:contain}
+
+.fu .trow{grid-template-columns:22px 18px minmax(0,1fr)}
+.fu .trow.own,.fu .trow.ledger{grid-template-columns:22px minmax(0,1fr)}
+.fu .tname.own{font-weight:400;color:#51483f}
+.fu .cnt{font-weight:400;font-size:12px;color:#6a5f53}
