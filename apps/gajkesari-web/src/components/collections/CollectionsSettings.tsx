@@ -115,10 +115,31 @@ function CustomerScope({ company }: { company: Company }) {
     () => (ledgers.length ? resolveScopedLedgers({ groups, ledgers }, effective) : null),
     [groups, ledgers, effective]
   );
-  const previewRows = useMemo(() => {
+  const previewAll = useMemo(() => {
     const needle = previewSearch.trim().toLowerCase();
-    return (matched ?? []).filter((l) => !needle || l.name.toLowerCase().includes(needle)).slice(0, 60);
+    return (matched ?? []).filter((l) => !needle || l.name.toLowerCase().includes(needle));
   }, [matched, previewSearch]);
+  const previewRows = useMemo(() => previewAll.slice(0, 60), [previewAll]);
+
+  const [pickedGroups, setPickedGroups] = useState<Set<string>>(new Set());
+  const [pickedLedgers, setPickedLedgers] = useState<Set<string>>(new Set());
+  const flip = (set: Set<string>, name: string) => { const next = new Set(set); if (!next.delete(name)) next.add(name); return next; };
+
+  // One action for every ticked group, so a long list is not changed row by row.
+  const bulkGroups = (choice: "count" | "leave" | "none") => {
+    const names = [...pickedGroups];
+    setScope((current) => {
+      const counted = current.selectedGroupNames.filter((n) => !names.includes(n));
+      const left = current.excludedGroupNames.filter((n) => !names.includes(n));
+      return { ...current, selectedGroupNames: choice === "count" ? [...counted, ...names] : counted, excludedGroupNames: choice === "leave" ? [...left, ...names] : left };
+    });
+    setPickedGroups(new Set());
+  };
+  const leaveOutPicked = () => {
+    const names = [...pickedLedgers];
+    setExcludedText((text) => [...text.split("\n").map((n) => n.trim()).filter(Boolean), ...names].join("\n"));
+    setPickedLedgers(new Set());
+  };
 
   const setGroup = (name: string, choice: "none" | "count" | "leave") => setScope((current) => ({
     ...current,
@@ -175,11 +196,27 @@ function CustomerScope({ company }: { company: Company }) {
         </div>
         <div className="grouplist">
           <input type="search" aria-label="Find a group" placeholder="Find a group" value={groupSearch} onChange={(e) => setGroupSearch(e.target.value)} />
+          <div className="selbar">
+            <label className="tick" style={{ margin: 0 }}>
+              <input type="checkbox" aria-label="Tick all groups shown"
+                checked={groupRows.length > 0 && groupRows.every((n) => pickedGroups.has(n))}
+                onChange={(e) => setPickedGroups(e.target.checked ? new Set(groupRows) : new Set())} />
+              {pickedGroups.size ? `${pickedGroups.size} ticked` : `Tick all ${groupRows.length} shown`}
+            </label>
+            {pickedGroups.size > 0 && (
+              <span className="bulk">
+                <button className="btn primary" onClick={() => bulkGroups("count")}>Count them</button>
+                <button className="btn" onClick={() => bulkGroups("leave")}>Leave them out</button>
+                <button className="btn" onClick={() => bulkGroups("none")}>Clear choice</button>
+              </span>
+            )}
+          </div>
           <ul>
             {groupRows.map((name) => {
               const choice = scope.selectedGroupNames.includes(name) ? "count" : scope.excludedGroupNames.includes(name) ? "leave" : "none";
               return (
                 <li key={name}>
+                  <input type="checkbox" aria-label={`Tick ${name}`} checked={pickedGroups.has(name)} onChange={() => setPickedGroups(flip(pickedGroups, name))} />
                   <span className="gname">{name}</span>
                   <span className="seg" role="group" aria-label={name}>
                     <button aria-pressed={choice === "count"} onClick={() => setGroup(name, choice === "count" ? "none" : "count")}>Count</button>
@@ -219,12 +256,35 @@ function CustomerScope({ company }: { company: Company }) {
         <p className="why">Search the ledgers that will be read. If someone is missing, count their group above. If someone should not be here, leave them out below.</p>
         <input type="search" aria-label="Search counted customers" placeholder="Search customer names" value={previewSearch} onChange={(e) => setPreviewSearch(e.target.value)}
           style={{ width: "100%", maxWidth: 360 }} />
+        {previewAll.length > 0 && (
+          <div className="selbar" style={{ marginTop: 10 }}>
+            <label className="tick" style={{ margin: 0 }}>
+              <input type="checkbox" aria-label="Tick all customers shown"
+                checked={previewRows.length > 0 && previewRows.every((l) => pickedLedgers.has(l.name))}
+                onChange={(e) => setPickedLedgers(e.target.checked ? new Set(previewRows.map((l) => l.name)) : new Set())} />
+              {pickedLedgers.size ? `${pickedLedgers.size} ticked` : `Tick the ${previewRows.length} shown`}
+            </label>
+            {previewAll.length > previewRows.length && (
+              <button className="lnk" style={{ margin: 0 }} onClick={() => setPickedLedgers(new Set(previewAll.map((l) => l.name)))}>
+                Tick all {previewAll.length.toLocaleString("en-IN")} matching
+              </button>
+            )}
+            {pickedLedgers.size > 0 && (
+              <span className="bulk">
+                <button className="btn primary" onClick={leaveOutPicked}>Leave out {pickedLedgers.size.toLocaleString("en-IN")}</button>
+                <button className="btn" onClick={() => setPickedLedgers(new Set())}>Clear ticks</button>
+              </span>
+            )}
+          </div>
+        )}
         <ul className="preview">
           {previewRows.map((ledger) => (
             <li key={ledger.name}>
-              <span>{ledger.name}</span>
+              <label className="rowtick">
+                <input type="checkbox" aria-label={`Tick ${ledger.name}`} checked={pickedLedgers.has(ledger.name)} onChange={() => setPickedLedgers(flip(pickedLedgers, ledger.name))} />
+                <span>{ledger.name}</span>
+              </label>
               <span className="muted">{ledger.parent}</span>
-              <button className="lnk" onClick={() => setExcludedText((text) => (text.trim() ? `${text.trim()}\n${ledger.name}` : ledger.name))}>Leave out</button>
             </li>
           ))}
           {matched && !previewRows.length && <li className="muted">No counted ledger matches “{previewSearch}”.</li>}
