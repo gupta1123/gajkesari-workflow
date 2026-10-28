@@ -175,8 +175,7 @@ export function PaymentReminderSettings() {
               <div className="wa-body">
                 <div className="wa-day">Today</div>
                 <div className="wa-msg">
-                  {sampleText.split("
-").map((line, i) => <span key={i}>{line}<br /></span>)}
+                  {sampleText.split(String.fromCharCode(10)).map((line, i) => <span key={i}>{line}<br /></span>)}
                   <span className="wa-time">10:42 am</span>
                 </div>
               </div>
