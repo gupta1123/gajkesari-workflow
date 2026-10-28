@@ -9,6 +9,7 @@ import {
   type FollowupAttempt, type FollowupPipeline, type PipelineAction, type ReminderMessage, type ReminderStage,
 } from "@/lib/followups-client";
 import { InvoicePanel, type PanelDate, type PanelTone } from "./InvoicePanel";
+import { readCompaniesCache, writeCompaniesCache } from "@/lib/company-cache";
 import "./followups.css";
 
 type Company = { id: string; connectionId: string; companyName: string; financialYear: string };
@@ -213,21 +214,32 @@ export function FollowUpPipelines() {
   }, []);
 
   useEffect(() => {
+    // Start from the last known company so the scan can begin straight away,
+    // then confirm the list. Reminders and plans load alongside, not after.
+    const cached = readCompaniesCache<Company>();
+    if (cached) { setCompanies(cached.companies); setCompanyId(cached.selectedCompanyId); }
+    const plansLoaded = apiFetch("/api/settings/payment-reminders", { cache: "no-store" })
+      .then(async (response) => { if (response.ok) setSavedPlans((await response.json()).plans ?? []); })
+      .catch(() => undefined);
+    const remindersLoaded = refresh().catch((error) => {
+      setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not load reminders." });
+    });
     (async () => {
       try {
         const connectorId = await resolveTallyConnectionId();
         const response = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectorId)}`, { cache: "no-store" });
         const payload = await response.json();
         if (response.ok) {
-          setCompanies(payload.companies ?? []);
-          setCompanyId(payload.selectedCompanyId || payload.companies?.[0]?.id || "");
+          const list: Company[] = payload.companies ?? [];
+          const chosen: string = payload.selectedCompanyId || list[0]?.id || "";
+          setCompanies(list);
+          setCompanyId((current) => (current && list.some((c) => c.id === current) ? current : chosen));
+          writeCompaniesCache(list, chosen);
         }
-        await refresh();
-        const plansResponse = await apiFetch("/api/settings/payment-reminders", { cache: "no-store" });
-        if (plansResponse.ok) setSavedPlans((await plansResponse.json()).plans ?? []);
       } catch (error) {
-        setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not load reminders." });
+        setNotice({ tone: "err", text: error instanceof Error ? error.message : "Could not load companies." });
       }
+      await Promise.all([plansLoaded, remindersLoaded]);
     })();
   }, [refresh]);
 
