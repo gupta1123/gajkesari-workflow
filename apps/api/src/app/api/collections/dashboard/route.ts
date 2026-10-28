@@ -17,7 +17,7 @@ import {
   type CashDiscountAiInput,
   type CashDiscountAiReview,
   type CashDiscountNarrationAnalysis,
-} from "@/lib/cash-discount-narration";
+} from "@/lib/cash-discount-narration-legacy";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 type TallyLedgerRow = {
