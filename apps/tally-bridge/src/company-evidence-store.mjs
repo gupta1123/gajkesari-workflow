@@ -96,6 +96,7 @@ function openDatabase(Database, file) {
     db.pragma("synchronous = NORMAL");
     createSchema(db);
     readMeta(db);
+    try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* a reader holds it; try next time */ }
     return db;
   } catch (error) {
     // Unreadable or damaged: the cache can always be rebuilt from Tally.
