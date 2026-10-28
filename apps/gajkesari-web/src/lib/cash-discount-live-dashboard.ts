@@ -154,3 +154,47 @@ async function runLiveCashDiscountDashboard<T>(params: {
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as T;
 }
+
+/**
+ * Queues one Cash Discount debit note. The customer's bills are re-read from
+ * Tally just now and the server re-checks eligibility on that fresh evidence
+ * before it queues the create command, so a stale dashboard row can never post.
+ */
+export async function queueLiveDebitNote(params: {
+  connectionId: string;
+  companyName: string;
+  financialYear?: string | null;
+  proposal: { partyLedgerName: string; linkedInvoiceNumber: string | null };
+}) {
+  const { connectionId, companyName, proposal } = params;
+  const financialYear = params.financialYear ?? null;
+  const masters = await withBusyRetry(undefined, () => runCashDiscountLiveRequest<{ ledgers?: LiveLedger[] }>({
+    connectionId, companyName, financialYear,
+    operation: "ledger_masters",
+    payload: { requestedMasterTypes: ["ledger"] },
+  }));
+  const ledger = (masters.ledgers ?? []).find((entry) => entry.name === proposal.partyLedgerName);
+  const read = await withBusyRetry(undefined, () => runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
+    connectionId, companyName, financialYear,
+    operation: "fetch_customer_open_bills",
+    payload: { companyName, financialYear, ledgerNames: [proposal.partyLedgerName] },
+  }));
+  const response = await apiFetch("/api/collections/live/prepare-debit-note", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      connectionId,
+      companyName,
+      queue: true,
+      proposal: { partyLedgerName: proposal.partyLedgerName, linkedInvoiceNumber: proposal.linkedInvoiceNumber, financialYear },
+      scan: {
+        financialYear,
+        openBillsResult: { result: { byLedger: read.byLedger ?? {} } },
+        ledgers: ledger ? [{ name: ledger.name, parent: ledger.parent ?? null, gstin: ledger.gstin ?? null, raw: (ledger as { raw?: unknown }).raw ?? {} }] : [],
+        scanSummary: { complete: true, customerCount: 1 },
+      },
+    }),
+  });
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as { command?: { id: string; connectionId?: string } };
+}

@@ -14,7 +14,7 @@ import {
 
 import { apiFetch } from "@/lib/api-client";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
-import { loadLiveCashDiscountDashboard, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
+import { loadLiveCashDiscountDashboard, queueLiveDebitNote, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 
 type CompanyOption = {
   id: string;
@@ -655,7 +655,15 @@ export function CollectionsDashboardPage() {
   async function createDebitNoteForProposal(proposal: DebitNoteProposal) {
     const id = proposal.id;
     let command: TallyCommand | null = null;
-    if (proposal.sourceKind === "tally_open_bill" || id.startsWith("tally:")) {
+    if (CASH_DISCOUNT_LIVE) {
+      const queued = await queueLiveDebitNote({
+        connectionId: selectedConnectionId,
+        companyName: selectedCompany?.companyName ?? proposal.companyName,
+        financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
+        proposal: { partyLedgerName: proposal.partyLedgerName, linkedInvoiceNumber: proposal.linkedInvoiceNumber },
+      });
+      command = (queued.command as TallyCommand | undefined) ?? null;
+    } else if (proposal.sourceKind === "tally_open_bill" || id.startsWith("tally:")) {
       command = await approveTallySuggestion(proposal);
     } else {
       const response = await apiFetch(`/api/collections/debit-note-proposals/${id}/approve`, {
@@ -685,7 +693,7 @@ export function CollectionsDashboardPage() {
       setMessage({ tone: "info", text: "Creating debit note in Tally..." });
       await createDebitNoteForProposal(proposal);
       if (selectedConnectionId) {
-        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        if (!CASH_DISCOUNT_LIVE) await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
         await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
       } else {
         await loadDashboard();
