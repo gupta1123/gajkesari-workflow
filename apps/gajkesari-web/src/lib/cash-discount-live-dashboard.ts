@@ -6,7 +6,7 @@ import { chunk, resolveScopedLedgers, type CustomerScope, type ScopeMaster } fro
 const LEDGERS_PER_READ = 50;
 
 // How the open bills were read, so the page can say so plainly.
-export type ScanInfo = { mode: "batch"; label: string; detail: string };
+export type ScanInfo = { mode: "fast" | "batch"; label: string; detail: string };
 
 export const DEFAULT_CUSTOMER_SCOPE: CustomerScope = {
   mode: "automatic",
@@ -84,11 +84,29 @@ export async function loadLiveCashDiscountDashboard<T>(params: {
   if (!customers.length) throw new Error("No customers match the Cash Discount customer scope. Review it in Settings.");
 
   const byLedger: Record<string, LedgerBucket> = {};
-  const batches = chunk(customers.map((customer) => customer.name), LEDGERS_PER_READ);
-  onScanInfo?.({
+
+  // Preferred: one whole-company read inside the connector. Older connectors
+  // reject it immediately, and then we fall back to per-customer batches.
+  let scanned = false;
+  try {
+    onScanInfo?.({ mode: "fast", label: "Fast scan", detail: `Reading all ${customers.length} customers in one pass.` });
+    onProgress?.("Fast scan: reading the whole company from Tally...");
+    const read = await runCashDiscountLiveRequest<{ byLedger?: Record<string, LedgerBucket> }>({
+      connectionId, companyName, financialYear, signal, onProgress,
+      operation: "fetch_customer_open_bills",
+      payload: { companyName, financialYear, queryStrategy: "company_scan", ledgerNames: [], scopeLedgerNames: customers.map((customer) => customer.name) },
+    });
+    Object.assign(byLedger, read.byLedger ?? {});
+    scanned = true;
+  } catch (error) {
+    if (!(error instanceof Error) || !/requires ledgerName/i.test(error.message)) throw error;
+  }
+
+  const batches = scanned ? [] : chunk(customers.map((customer) => customer.name), LEDGERS_PER_READ);
+  if (!scanned) onScanInfo?.({
     mode: "batch",
     label: "Batch mode (slower)",
-    detail: `${customers.length} customers in ${batches.length} reads of up to ${LEDGERS_PER_READ}. This connector cannot scan the whole company in one pass.`,
+    detail: `${customers.length} customers in ${batches.length} reads of up to ${LEDGERS_PER_READ}. This connector version cannot scan the whole company in one pass; update the connector for the fast scan.`,
   });
   for (const [index, ledgerNames] of batches.entries()) {
     signal?.throwIfAborted();
