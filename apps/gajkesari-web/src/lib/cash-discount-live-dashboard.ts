@@ -19,7 +19,7 @@ export const DEFAULT_CUSTOMER_SCOPE: CustomerScope = {
 // "2026-27" -> "2026-04-01". Limiting the voucher history Tally scans keeps one
 // read inside Tally's own 60-second export limit on large companies.
 export function financialYearStart(financialYear: string | null | undefined) {
-  const match = /^(d{4})s*-s*d{2,4}$/.exec(String(financialYear ?? "").trim());
+  const match = /^(\d{4})\s*-\s*\d{2,4}$/.exec(String(financialYear ?? "").trim());
   return match ? `${match[1]}-04-01` : null;
 }
 
@@ -70,7 +70,7 @@ export async function loadCustomerScope(connectionId: string, companyName: strin
 // fail with "Tally is busy". Callers share the scan that is already running.
 const scansInFlight = new Map<string, Promise<unknown>>();
 
-export function loadLiveCashDiscountDashboard<T>(params: Parameters<typeof runLiveCashDiscountDashboard>[0]): Promise<T> {
+export function loadLiveCashDiscountDashboard<T>(params: LiveReadParams): Promise<T> {
   const key = `${params.connectionId}::${params.companyName}::${params.financialYear ?? ""}`;
   const running = scansInFlight.get(key);
   if (running) return running as Promise<T>;
@@ -79,20 +79,36 @@ export function loadLiveCashDiscountDashboard<T>(params: Parameters<typeof runLi
   return scan;
 }
 
-/**
- * Reads the in-scope customers' open bills live from Tally, then has the API
- * analyse the result. A whole-company scan is tried first; connectors without it
- * fall back to per-customer batches. Nothing partial is ever analysed: a failed
- * read fails the whole refresh.
- */
-async function runLiveCashDiscountDashboard<T>(params: {
+export type LiveReadParams = {
   connectionId: string;
   companyName: string;
   financialYear?: string | null;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
   onScanInfo?: (info: ScanInfo) => void;
-}): Promise<T> {
+};
+
+export type LiveOpenBills = { customers: LiveLedger[]; byLedger: Record<string, LedgerBucket> };
+
+// Cash Discount and follow-ups read the same data; callers on the same company
+// share one running read so Tally is never asked twice at once.
+const readsInFlight = new Map<string, Promise<LiveOpenBills>>();
+
+export function readLiveOpenBills(params: LiveReadParams): Promise<LiveOpenBills> {
+  const key = `${params.connectionId}::${params.companyName}::${params.financialYear ?? ""}`;
+  const running = readsInFlight.get(key);
+  if (running) return running;
+  const read = readLiveOpenBillsNow(params).finally(() => readsInFlight.delete(key));
+  readsInFlight.set(key, read);
+  return read;
+}
+
+/**
+ * Reads the in-scope customers' open bills live from Tally. A whole-company scan
+ * is tried first; connectors without it fall back to per-customer batches.
+ * Nothing partial is ever returned: a failed read fails the whole refresh.
+ */
+async function readLiveOpenBillsNow(params: LiveReadParams): Promise<LiveOpenBills> {
   const { connectionId, companyName, signal, onProgress, onScanInfo } = params;
   const financialYear = params.financialYear ?? null;
   const scope = await loadCustomerScope(connectionId, companyName);
@@ -144,6 +160,14 @@ async function runLiveCashDiscountDashboard<T>(params: {
     Object.assign(byLedger, read.byLedger ?? {});
   }
 
+  return { customers, byLedger };
+}
+
+/** Reads the open bills, then has the API analyse them for the Cash Discount page. */
+async function runLiveCashDiscountDashboard<T>(params: LiveReadParams): Promise<T> {
+  const { connectionId, companyName, signal, onProgress } = params;
+  const financialYear = params.financialYear ?? null;
+  const { customers, byLedger } = await readLiveOpenBills(params);
   onProgress?.("Analysing...");
   const response = await apiFetch("/api/collections/live/analyse", {
     method: "POST",

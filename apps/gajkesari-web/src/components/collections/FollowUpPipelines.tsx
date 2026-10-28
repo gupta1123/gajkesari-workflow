@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
 import {
-  createPipelines, findCandidates, getCustomerScope, listPipelines, runPipelineAction, saveCustomerScope,
+  createPipelines, findCandidates, getCustomerScope, listPipelines, runPipelineAction, saveCustomerScope, scanAllCandidates,
   type FollowupCandidate, type FollowupPipeline, type PipelineAction, type ReminderMessage,
 } from "@/lib/followups-client";
 
@@ -36,6 +36,10 @@ export function FollowUpPipelines() {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [candidates, setCandidates] = useState<FollowupCandidate[]>([]);
   const [finding, setFinding] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanLine, setScanLine] = useState("");
+  const [scanDetail, setScanDetail] = useState("");
+  const [scanTotals, setScanTotals] = useState<{ dueInvoices: number; customers: number; shown: number } | null>(null);
 
   const company = companies.find((c) => c.id === companyId) ?? companies[0] ?? null;
 
@@ -70,6 +74,28 @@ export function FollowUpPipelines() {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not read Tally." });
     } finally {
       setFinding(false);
+    }
+  };
+
+  const scanEverything = async () => {
+    if (!company) return;
+    setScanning(true);
+    setNotice(null);
+    setScanTotals(null);
+    setScanLine("Starting...");
+    try {
+      const result = await scanAllCandidates(company, {
+        onProgress: setScanLine,
+        onScanInfo: (info) => setScanDetail(`${info.label}: ${info.detail}`),
+      });
+      setCandidates(result.candidates);
+      setScanTotals({ dueInvoices: result.dueInvoices, customers: result.customers, shown: result.candidates.length });
+      if (result.candidates.length === 0) setNotice({ tone: "ok", text: "No invoices are due for a follow-up." });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not read Tally." });
+    } finally {
+      setScanning(false);
+      setScanLine("");
     }
   };
 
@@ -188,6 +214,20 @@ export function FollowUpPipelines() {
             </button>
           </div>
         )}
+        <div className="space-y-1 border-t border-slate-100 pt-3">
+          <button className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50" disabled={scanning || !company} onClick={scanEverything}>
+            {scanning ? "Scanning Tally…" : "Scan every customer for due invoices"}
+          </button>
+          {(scanning || scanDetail) && (
+            <p className="text-xs text-amber-800">{scanDetail}{scanning && scanLine ? ` ${scanLine}` : ""}</p>
+          )}
+          {scanTotals && (
+            <p className="text-xs text-slate-600">
+              {scanTotals.dueInvoices} due invoice(s) across {scanTotals.customers} customer(s)
+              {scanTotals.shown < scanTotals.dueInvoices ? `; showing the first ${scanTotals.shown}, oldest and largest first.` : "."}
+            </p>
+          )}
+        </div>
         {candidates.length > 0 && (
           <table className="w-full text-left text-sm">
             <tbody>
