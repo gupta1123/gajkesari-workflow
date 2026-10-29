@@ -123,13 +123,20 @@ function ageCell(row: DueInvoice) {
 
 type ListedInvoice = { invoice: string; invoice_date: string | null; outstanding: number };
 
-// Same one-line list the server sends: oldest five, then "and N more".
+// Same one-line list the server sends: oldest first, up to 20 within a character budget, then "and N more".
 function invoiceListLine(invoices: ListedInvoice[]) {
   const sorted = [...invoices].sort((a, b) => String(a.invoice_date ?? "9999").localeCompare(String(b.invoice_date ?? "9999")));
-  const parts = sorted.slice(0, 5).map((item) => {
+  const entries = sorted.slice(0, 20).map((item) => {
     const date = item.invoice_date ? new Date(`${item.invoice_date}T00:00:00`).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "";
     return `${item.invoice} ₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(item.outstanding)}${date ? ` (${date})` : ""}`;
   });
+  const parts: string[] = [];
+  let used = 0;
+  for (const entry of entries) {
+    if (used + entry.length + 2 > 640) break;
+    parts.push(entry);
+    used += entry.length + 2;
+  }
   const rest = sorted.length - parts.length;
   return `${parts.join("; ")}${rest > 0 ? `; and ${rest} more` : ""}`;
 }

@@ -75,12 +75,22 @@ const shortDate = (value: string | null | undefined, year = true) =>
  * One line for the summary message: the oldest invoices first, then "and N more".
  * WhatsApp variables cannot hold line breaks, so invoices are separated by semicolons.
  */
-export function invoiceListLine(invoices: SummaryInvoice[], show = 5) {
+// Up to 20 invoices, but the list stays within a character budget so the whole message fits WhatsApp's 1,024 limit.
+const LIST_MAX = 20;
+const LIST_CHARS = 640;
+export function invoiceListLine(invoices: SummaryInvoice[], show = LIST_MAX) {
   const sorted = [...invoices].sort((a, b) => String(a.invoice_date ?? "9999").localeCompare(String(b.invoice_date ?? "9999")));
-  const parts = sorted.slice(0, show).map((i) => {
+  const entries = sorted.slice(0, show).map((i) => {
     const date = shortDate(i.invoice_date, false);
     return `${i.invoice.replace(/\s+/g, " ")} ₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(i.outstanding)}${date ? ` (${date})` : ""}`;
   });
+  const parts: string[] = [];
+  let used = 0;
+  for (const entry of entries) {
+    if (used + entry.length + 2 > LIST_CHARS) break;
+    parts.push(entry);
+    used += entry.length + 2;
+  }
   const rest = sorted.length - parts.length;
   return `${parts.join("; ")}${rest > 0 ? `; and ${rest} more` : ""}`;
 }
