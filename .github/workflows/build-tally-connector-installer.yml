@@ -2,6 +2,11 @@ name: Build Gajkesari Tally Connector
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the build as a GitHub release for the in-app updater (permanent). Leave off to only build and download the installer for testing."
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -72,9 +77,9 @@ jobs:
           if-no-files-found: error
 
       # Releases feed the in-app updater, so they are published only on an
-      # explicit manual run, never as a side effect of pushing to main.
+      # explicit manual run with "publish" ticked, never as a side effect of pushing to main.
       - name: Publish permanent GitHub release
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
