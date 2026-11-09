@@ -245,7 +245,9 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
       throw error;
     }
   }
-  if (physical?.detected && physical.rows.length && (physicalEvidence || !normalized?.transactions?.length || physical.layout === "pnb")) {
+  if (physical?.detected && physical.rows.length && (physicalEvidence || !normalized?.transactions?.length || physical.layout === "pnb" ||
+      // The Markdown table can drop a row that wraps onto the next page; the printed columns are complete.
+      (physical.layout === "hdfc_statement" && physical.rows.length !== normalized.transactions.length))) {
     normalized = {
       headers: [`physical:${physical.layout}`],
       transactions: transactionsFromPhysicalRows(physical.rows),

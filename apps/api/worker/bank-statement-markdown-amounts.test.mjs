@@ -8,6 +8,31 @@ import {
   restoreSourceBankReferences,
 } from "./bank-statement-markdown-amounts.mjs";
 
+test("reads signed opening balances below HDFC summary headers", () => {
+  const summary = `|Opening Balance|Debit Count|Credit Count|Total Debit|Total Credit|Closing Balance|
+|---|---|---|---|---|---|
+|-231042707.76|33|18|34,829,329.00 End Of Statement|34,869,742.00|-231,002,294.76|`;
+  assert.equal(extractBankStatementMarkdownAmounts(summary).openingBalance, -231042707.76);
+  assert.equal(extractBankStatementMarkdownAmounts(summary.replace("-231042707.76", "231042707.76 DR")).openingBalance, -231042707.76);
+  assert.equal(extractBankStatementMarkdownAmounts(summary.replace("-231042707.76", "0.00")).openingBalance, 0);
+  assert.equal(extractBankStatementMarkdownAmounts(summary.replace("-231042707.76", "")).openingBalance, null);
+});
+
+test("does not confuse closing balances or counts with missing opening balances", () => {
+  assert.equal(extractBankStatementMarkdownAmounts(`|Debit Count|Closing Balance|
+|---|---|
+|33|-900.00|`).openingBalance, null);
+  assert.equal(extractBankStatementMarkdownAmounts("|Opening Balance -900.00|Closing Balance|\n|---|---|").openingBalance, -900);
+});
+
+test("handles HDFC's isolated blank leading summary column without borrowing labelled values", () => {
+  const summary = `||Opening Balance|Debit Count|Credit Count|Total Debit|Total Credit|Closing Balance|
+|---|---|---|---|---|---|---|
+|-282,392,727.00||35|9|49,363,479.00|51,897,513.00|-279,858,693.00|`;
+  assert.equal(extractBankStatementMarkdownAmounts(summary).openingBalance, -282392727);
+  assert.equal(extractBankStatementMarkdownAmounts(summary.replace("||Opening Balance", "|Total Debit|Opening Balance")).openingBalance, null);
+});
+
 test('source references are recovered per complete row without collapsing repeated amounts', () => {
   const source = extractBankStatementMarkdownAmounts(`| Date | Description | Bank reference | Debit | Credit | Balance |\n|---|---|---|---|---|---|\n| 08-Oct-26 | Credit from Arvind | UTRAX261009003 | | 303.33 | 1303.33 |\n| 08-Oct-26 | Credit from Arvind | UTRAX261009103 | | 303.33 | 1606.66 |\n| 08-Oct-26 | Credit from Arvind | - | | 303.33 | 1909.99 |`).rows;
   const transactions = source.map(row => ({ transaction_date: '2026-10-08', description: row.narration,
