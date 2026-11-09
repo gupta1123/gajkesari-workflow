@@ -1,6 +1,6 @@
 {
   "name": "@gajkesari/tally-bridge",
-  "version": "0.1.93",
+  "version": "0.1.94",
   "private": true,
   "type": "module",
   "exports": {
@@ -25,5 +25,8 @@
   "devDependencies": {
     "@electron/rebuild": "^3.7.0",
     "electron": "^31.7.7"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "12.11.1"
   }
 }

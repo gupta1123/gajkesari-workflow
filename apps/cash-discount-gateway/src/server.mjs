@@ -327,6 +327,7 @@ async function handleConnectorResult(socket, message, meta) {
     try {
       const prepared = await apiRequest("/api/collections/live/prepare-debit-note", {
         accessToken: item.accessToken,
+        browserBinding: item.browserBinding,
         body: {
           connectionId: item.connectionId,
           companyName: message.companyName,

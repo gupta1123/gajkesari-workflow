@@ -6,11 +6,13 @@ import { useRef, useState } from "react";
 import {
   CircleAlert,
   CircleDashed,
+  FileText,
   Landmark,
   LogOut,
   ChevronsUpDown,
   Settings,
   ChevronLeft,
+  MessageCircle,
   PlugZap,
 } from "lucide-react";
 
@@ -19,12 +21,19 @@ import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import styles from "./DashboardSidebar.module.css";
 
 /* ── Sectioned nav ───────────────────────────── */
+// Collections ships behind the same flag as the live Cash Discount scan.
+const COLLECTIONS_ENABLED = process.env.NEXT_PUBLIC_CASH_DISCOUNT_LIVE === "true";
+
 const SIDEBAR_SECTIONS = [
   {
-    id: "reconciliation",
-    title: "Reconciliation",
+    id: "agents",
+    title: "Agents",
     items: [
-      { href: "/bank-statements", label: "Bank Statements", icon: Landmark },
+      { href: "/bank-statements", label: "Bank Reconciliation", icon: Landmark },
+      ...(COLLECTIONS_ENABLED ? [
+        { href: "/collections", label: "Cash Discounts", icon: FileText },
+        { href: "/collections/follow-ups", label: "Payment Follow-ups", icon: MessageCircle },
+      ] : []),
     ],
   },
   {
@@ -38,7 +47,7 @@ const SIDEBAR_SECTIONS = [
 
 function isActivePath(pathname: string, href: string) {
   const hrefPath = href.split("?")[0];
-  if (hrefPath === "/") return pathname === "/";
+  if (hrefPath === "/" || hrefPath === "/collections") return pathname === hrefPath;
   return pathname === hrefPath || pathname.startsWith(`${hrefPath}/`);
 }
 

@@ -1,5 +1,10 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import {
+  DEFAULT_CASH_DISCOUNT_CUSTOMER_SCOPE,
+  getCashDiscountCustomerScopeOrDefault,
+  getCashDiscountCustomerScopesByCompany,
+} from "@/lib/cash-discount-customer-scope";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { hashSecret, connectorSupportsReliableActiveCompany, TALLY_CONNECTION_SELECT, type TallyConnectionRow } from "@/lib/tally/connections";
 import { browserOwnsConnection, resolveTallyTarget } from "@/lib/tally/browser-scope";
@@ -41,8 +46,15 @@ export async function POST(request: Request) {
       if (!data) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
       if (!connectorSupportsReliableActiveCompany(data.bridge_version)) return jsonWithCors(request, { error: "Connector update required: install version 0.1.58 or later and re-pair this PC." }, { status: 426 });
       const target = body.companyName ? await resolveTallyTarget(request, user.id, connectionId, String(body.companyName)) : null;
+      const companyName = String(body.companyName ?? "").trim();
+      const customerScope = companyName
+        ? await getCashDiscountCustomerScopeOrDefault({ ownerUserId: user.id, connectionId, companyName })
+        : await getCashDiscountCustomerScopesByCompany({ ownerUserId: user.id, connectionId });
       return jsonWithCors(request, { authenticated: true, ownerUserId: user.id, connectionId,
-        installationId: data.installation_ref, sessionGeneration: data.session_generation, bridgeVersion: data.bridge_version, target });
+        installationId: data.installation_ref, sessionGeneration: data.session_generation, bridgeVersion: data.bridge_version, target,
+        customerScope: companyName ? customerScope : null,
+        customerScopes: companyName ? null : customerScope,
+        defaultCustomerScope: DEFAULT_CASH_DISCOUNT_CUSTOMER_SCOPE });
     }
 
     const token = bearerToken(request);

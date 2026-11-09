@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { CollectionsSettings } from "@/components/collections/CollectionsSettings";
 import { apiFetch } from "@/lib/api-client";
 import { Button } from "@/components/ui/button";
 import {
@@ -180,7 +181,7 @@ async function getResponseError(response: Response) {
   return `Request failed with status ${response.status}`;
 }
 
-export default function SettingsPage() {
+function LegacySettingsPage() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("documents");
   const [selectedDocType, setSelectedDocType] = useState<string>(AVAILABLE_DOC_TYPES[0] ?? "");
   const [docTypeEnabled, setDocTypeEnabled] = useState<DocTypeEnabledState>(() =>
@@ -1077,4 +1078,17 @@ export default function SettingsPage() {
       </div>
     </AppShell>
   );
+}
+
+// With the Collections features on, Settings is for Cash Discounts and Payment
+// Follow-ups; otherwise the original review-rules page is unchanged.
+export default function SettingsPage() {
+  if (process.env.NEXT_PUBLIC_CASH_DISCOUNT_LIVE === "true") {
+    return (
+      <AppShell>
+        <CollectionsSettings />
+      </AppShell>
+    );
+  }
+  return <LegacySettingsPage />;
 }

@@ -37,6 +37,28 @@ test('changed layout, duplicate references and ambiguous amounts fail verificati
  assert.throws(()=>extractPnbPhysicalColumns([{...first,items:[...headers,...row('T123456',600,'100.00','100.00','1000.00')]}]),/incomplete/);
  assert.equal(extractPnbPhysicalColumns([{pageNumber:1,width:1000,items:[]}]).detected,false);
 });
+test('PNB accepts one Txn No. printed on two different postings',()=>{
+ const page={pageNumber:1,width:1000,items:[...headers,...row('T55478828',600,'10.62',null,'2,75,62,748.44 Dr.'),...row('T55478828',520,'92,307.00',null,'2,75,62,737.82 Dr.'),...row('T54925022',440,null,'20,70,026.00','2,74,70,430.82 Dr.')]};
+ const result=extractPnbPhysicalColumns([page]);
+ assert.deepEqual(result.rows.map(entry=>[entry.reference,entry.debitAmount,entry.creditAmount,entry.balanceAmount]),[
+  ['T55478828',10.62,null,-27562748.44],['T55478828',92307,null,-27562737.82],['T54925022',null,2070026,-27470430.82]]);
+});
+test('HDFC statements with split headings read a row that continues on the next page',()=>{
+ const head=y=>[item('Transaction',27,y,53),item('Date',44,y-8,19),item('Transaction',96,y,53),item('Description',96,y-8,53),item('Reference',161,y,43),item('No.',209,y,14),
+  item('Value',235,y,24),item('Date',263,y,19),item('Debit',310,y,24),item('Amount',339,y,29),item('Credit',402,y,29),item('Amount',436,y,29),item('Closing Balance',492,y,72)];
+ const line=(y,ref,narration,debit,credit,balance)=>[item('30-Oct-2026',34,y,40),item('12:45:35',39,y-6,29),item(narration,90,y,65),item('wrapped narration',90,y-12,65),item(ref,163,y,58),item('30-Oct-2026',239,y,40),
+  ...(debit?[item(debit,352,y,32)]:[]),...(credit?[item(credit,436,y,32)]:[]),item(balance,519,y,54)];
+ const summary=[item('Statement',20,712,43),item('Summary',68,712,34),item('Closing',483,694,25),item('Balance',511,694,25)];
+ const footer=[item('30-Oct-2026',10,10,40),item('Page',284,10,14)];
+ const pages=[{pageNumber:1,width:595,items:[...head(554),...line(532,'HDFCH0136352','NEFT first','89,138.00',null,'-270,485,120.79'),...line(488,'HDFCH0136353','NEFT second',null,'5,200.00','-270,479,920.79'),...footer]},
+  {pageNumber:2,width:595,items:[...head(780),...line(758,'2058897037','FT carried over','332,052.00',null,'-268,270,541.79'),...summary,...footer]}];
+ const result=extractBankStatementPhysicalColumns(pages);
+ assert.equal(result.layout,'hdfc_statement');
+ assert.deepEqual(result.rows.map(r=>[r.page,r.reference,r.narration,r.debitAmount,r.creditAmount,r.balanceAmount]),[
+  [1,'HDFCH0136352','NEFT first wrapped narration',89138,null,-270485120.79],
+  [1,'HDFCH0136353','NEFT second wrapped narration',null,5200,-270479920.79],
+  [2,'2058897037','FT carried over wrapped narration',332052,null,-268270541.79]]);
+});
 test('PNB accepts the real S and U reference families',()=>{
  const page={pageNumber:1,width:1000,items:[...headers,...row('S3692997',600,'400.00',null,'1000.00'),...row('U89691391',520,null,'500.00','1500.00')]};
  assert.deepEqual(extractPnbPhysicalColumns([page]).rows.map(entry=>entry.reference),['S3692997','U89691391']);
@@ -65,5 +87,34 @@ test('generic statement headings get deterministic physical row evidence',()=>{
  assert.equal(physical.layout,'generic_statement');
  assert.deepEqual(physical.rows.map(row=>[row.sourceDate,row.narration,row.debitAmount,row.creditAmount,row.balanceAmount]),[
   ['05/09/2026','Customer receipt',null,1250,5000],
+ ]);
+});
+
+test('printed PNB row rules preserve long wrapped narrations and exclude branch/footer text',()=>{
+ const page={pageNumber:1,width:1000,horizontalRules:[{y:660,left:50,right:1000},{y:500,left:50,right:1000}],items:[
+  ...headers,item('Branch Name',560,700,80),
+  item('U123456',65,600,70),item('03-09-2026',165,600,70),
+  item('NRTGS/ICICR42026092300596742/',350,645,180),
+  item('MAHADEV STEEL',350,625,180),item('AND CEMENT',350,540,180),
+  item('-',590,600,10),item('100.00',660,600,85),item('1000.00 Dr.',860,600,85),
+  item('Disclaimer below the table',350,490,180),
+ ]};
+ const result=extractBankStatementPhysicalColumns([page]);
+ assert.equal(result.rows[0].narration,'NRTGS/ICICR42026092300596742/ MAHADEV STEEL AND CEMENT');
+ assert.equal(result.rows[0].balanceAmount,-1000);
+});
+
+test('combined SVC date/narration cells preserve cheque numbers, signed balances and a separate opening',()=>{
+ const head=[item('Date',15,700,22),item('Particulars',70,700,45),item('Chq No.',235,700,34),item('Debit',332,700,22),item('Credit',429,700,25),item('Balance',542,700,34)];
+ const page={pageNumber:1,width:595,items:[...head,
+  item('24 Sep 2026 By Opening Balance',15,650,136),item('0',221,650,5),item('-1000.00',516,650,60),
+  item('24 Sep 2026 ANITA SINGH',15,620,150),item('001789',221,620,30),item('100.00',315,620,40),item('-1100.00',516,620,60),
+  item('24 Sep 2026 ACME ROADWAYS',15,590,150),item('001790',221,590,30),item('50.00',430,590,30),item('-1050.00',516,590,60),
+  item('---------------------------------------*',327,555,164),
+ ]};
+ const result=extractBankStatementPhysicalColumns([page]);
+ assert.equal(result.openingBalance,-1000);assert.equal(result.rows.length,2);
+ assert.deepEqual(result.rows.map(r=>[r.narration,r.reference,r.debitAmount,r.creditAmount,r.balanceAmount]),[
+  ['ANITA SINGH','001789',100,null,-1100],['ACME ROADWAYS','001790',null,50,-1050],
  ]);
 });
