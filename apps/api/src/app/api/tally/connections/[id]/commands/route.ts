@@ -1,4 +1,5 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { resolveTallyTarget } from "@/lib/tally/browser-scope";
 import { queueTallyCommandAndWake } from "@/lib/tally/queue-command";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -15,6 +16,17 @@ import {
   type TallyBridgeCommandType,
 } from "@/lib/tally/commands";
 import { toNullableText, toRequiredText, type TallyMasterRow } from "@/lib/tally/masters";
+
+const supportCommands = ["get_connector_diagnostics", "reconnect_live_channel"];
+
+function canUseConnectorSupport(ownerId: string) {
+  return !isLocalDbMode() && (process.env.CONNECTOR_SUPPORT_ADMIN_IDS ?? "").split(",").some((id) => id.trim() === ownerId);
+}
+
+function supportsDiagnostics(version: string | null) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
+  return Boolean(match && (Number(match[1]) > 0 || Number(match[2]) > 1 || (Number(match[2]) === 1 && Number(match[3]) >= 96)));
+}
 
 function parseCommandType(value: unknown): TallyBridgeCommandType | null {
   if (typeof value !== "string") return null;
@@ -67,7 +79,7 @@ async function requireConnection(ownerUserId: string, connectionId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("tally_connections")
-    .select("id, owner_user_id, status, last_company_name, last_tally_reachable, last_company_loaded, revoked_at")
+    .select("id, owner_user_id, status, last_company_name, last_tally_reachable, last_company_loaded, bridge_version, last_heartbeat_at, revoked_at")
     .eq("id", connectionId)
     .eq("owner_user_id", ownerUserId)
     .maybeSingle();
@@ -106,6 +118,11 @@ export async function GET(
     }
 
     const url = new URL(request.url);
+    if (url.searchParams.has("support")) {
+      const allowed = canUseConnectorSupport(user.id);
+      return jsonWithCors(request, { allowed, supported: allowed && supportsDiagnostics(connection.bridge_version),
+        version: connection.bridge_version, lastHeartbeatAt: connection.last_heartbeat_at });
+    }
     const requestedCommandIds = (url.searchParams.get("ids") ?? "")
       .split(",")
       .map((value) => value.trim())
@@ -138,6 +155,7 @@ export async function GET(
       .order("created_at", { ascending: false })
       .limit(limit);
 
+    if (!canUseConnectorSupport(user.id)) query = query.not("command_type", "in", "(get_connector_diagnostics,reconnect_live_channel)");
     if (requestedCommandIds.length > 0) {
       query = query.in("id", requestedCommandIds);
     }
@@ -189,6 +207,23 @@ export async function POST(
     const rawPayload = body.payload && typeof body.payload === "object"
       ? (body.payload as Record<string, unknown>)
       : {};
+
+    if (supportCommands.includes(commandType)) {
+      if (!canUseConnectorSupport(user.id)) return jsonWithCors(request, { error: "Connector support administrator access required." }, { status: 403 });
+      if (!supportsDiagnostics(connection.bridge_version)) return jsonWithCors(request, { error: "Install connector 0.1.96 or later for remote support." }, { status: 409 });
+      const companyName = toRequiredText(rawPayload.companyName).trim();
+      if (!companyName) return jsonWithCors(request, { error: "Select the company to diagnose." }, { status: 400 });
+      const payload = { companyName, requestedAt: new Date().toISOString() };
+      let target;
+      try {
+        target = await resolveTallyTarget(request, user.id, id, companyName);
+      } catch (error) {
+        return jsonWithCors(request, { error: error instanceof Error ? error.message : "Connector unavailable." }, { status: 409 });
+      }
+      const { command } = await queueTallyCommandAndWake({ supabase: createSupabaseAdminClient(), connectionId: id,
+        ownerUserId: user.id, commandType, payload: { ...payload, target }, companyDatasetId: target.companyDatasetId, priority: 10 });
+      return jsonWithCors(request, { command: serializeTallyBridgeCommand(command as unknown as TallyBridgeCommandRow) });
+    }
 
     if (commandType === "parse_document" || commandType === "parse_and_suggest") {
       const documentUrl = toNullableText(rawPayload.documentUrl ?? rawPayload.sourceUrl, 4000);

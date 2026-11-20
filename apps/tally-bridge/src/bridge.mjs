@@ -15,9 +15,10 @@ import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs
 import { warmZvecCollection } from "./local-matching/vector.mjs";
 import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
 import {
-  needsKeyReconcile, planEvidenceRefresh,
+  needsKeyReconcile, planEvidenceRefresh, RECONCILE_EVERY_MS,
 } from "./company-evidence-cache.mjs";
 import { getEvidenceStore } from "./company-evidence-store.mjs";
+import { createCustomerDues } from "./customer-dues.mjs";
 import { applySeparatePaymentDecision } from "./local-matching/duplicate-resolution.mjs";
 import {
   activeVouchers,
@@ -35,7 +36,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.94";
+const BRIDGE_VERSION = "0.1.96";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -4492,7 +4493,7 @@ function dateRangeChunks(fromIso, toIso, months = 2) {
 
 // Tally's company-wide change counters (no TDL needed). AltVchID moves whenever
 // any voucher is created, edited or deleted.
-async function readTallyChangeCounters(tallyUrl, companyName, exportCollection) {
+async function readTallyChangeCounters(tallyUrl, companyName, exportCollection, expectedGuid) {
   const xml = await exportCollection(tallyUrl, {
     collectionName: "Gajkesari Change Counters", tallyType: "Company",
     fetchFields: "Name,GUID,AltVchID,AltMstID", timeoutMs: 15_000,
@@ -4501,11 +4502,15 @@ async function readTallyChangeCounters(tallyUrl, companyName, exportCollection) 
   const block = extractBlocks(xml, "COMPANY").find((candidate) =>
     normalizeLooseName(getAttribute(candidate, "NAME") || getTagText(candidate, "NAME")) === wanted);
   if (!block) throw new Error(`Tally did not report change counters for ${companyName}.`);
-  return {
-    altVchId: Number(getTagText(block, "ALTVCHID") || 0),
-    altMstId: Number(getTagText(block, "ALTMSTID") || 0),
-    companyGuid: getTagText(block, "GUID") || null,
-  };
+  const rawVoucherId = getTagText(block, "ALTVCHID");
+  const rawMasterId = getTagText(block, "ALTMSTID");
+  const companyGuid = getTagText(block, "GUID") || null;
+  if (expectedGuid && (companyGuid?.trim().toLowerCase() !== expectedGuid ||
+      !/^\d+$/.test(rawVoucherId || "") || !/^\d+$/.test(rawMasterId || "") ||
+      !Number.isSafeInteger(Number(rawVoucherId)) || !Number.isSafeInteger(Number(rawMasterId)))) {
+    throw new Error("Tally did not provide valid change counters for the active company.");
+  }
+  return { altVchId: Number(rawVoucherId || 0), altMstId: Number(rawMasterId || 0), companyGuid };
 }
 
 function evidenceVoucherKey(block) {
@@ -4524,8 +4529,8 @@ function refreshCompanyEvidence(args) {
 
 async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, asOfDate, exportCollection, dependencies }) {
   const store = getEvidenceStore({ dir: dependencies.cacheDir || CONFIG_DIR, companyName });
-  const counters = await readTallyChangeCounters(tallyUrl, companyName, exportCollection);
-  let cache = store.meta;
+  const counters = dependencies.counters || await readTallyChangeCounters(tallyUrl, companyName, exportCollection);
+  let cache = dependencies.forceRebuild ? null : store.meta;
   const plan = planEvidenceRefresh({ cache, counters, companyGuid: counters.companyGuid, neededFrom: evidenceFrom, asOfDate });
   if (!plan.cache) cache = store.reset({ companyName, companyGuid: counters.companyGuid });
   const previousFrom = cache.coveredFrom;
@@ -4564,6 +4569,8 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
   }
 
   const windowFrom = previousFrom && previousFrom < evidenceFrom ? previousFrom : evidenceFrom;
+  let reconcile = dependencies.prepareDues && plan.mode !== "rebuilt" &&
+    Date.now() - (cache.lastReconciledAt || 0) >= RECONCILE_EVERY_MS;
   if (plan.deltaAfter !== null) {
     dependencies.onProgress?.("Reading vouchers changed in Tally since the last scan...");
     const changedCount = collect(await read("Changed", {
@@ -4571,14 +4578,15 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
       formulae: [{ name: "GajkesariAfterAlterId", formula: `$AlterID > ${plan.deltaAfter}` }],
       filterNames: ["GajkesariAfterAlterId"],
     }));
-    if (needsKeyReconcile({ cache, counterMovedBy: counters.altVchId - previousAltVchId, deltaCount: changedCount })) {
-      dependencies.onProgress?.("Checking for vouchers deleted in Tally...");
-      const keysXml = await read("Keys", { fetchFields: "MasterID,AlterID,GUID", dateFrom: windowFrom, dateTo: asOfDate });
-      const present = new Set(extractBlocks(keysXml, "VOUCHER").map(evidenceVoucherKey).filter(Boolean));
-      stats.removed = store.dropMissing(present, { from: windowFrom, to: asOfDate });
-      stats.reconciled = true;
-      cache.lastReconciledAt = Date.now();
-    }
+    reconcile ||= needsKeyReconcile({ cache, counterMovedBy: counters.altVchId - previousAltVchId, deltaCount: changedCount });
+  }
+  if (reconcile) {
+    dependencies.onProgress?.("Checking for vouchers deleted in Tally...");
+    const keysXml = await read("Keys", { fetchFields: "MasterID,AlterID,GUID", dateFrom: windowFrom, dateTo: asOfDate });
+    const present = new Set(extractBlocks(keysXml, "VOUCHER").map(evidenceVoucherKey).filter(Boolean));
+    stats.removed = store.dropMissing(present, { from: windowFrom, to: asOfDate });
+    stats.reconciled = true;
+    cache.lastReconciledAt = Date.now();
   }
 
   cache.companyGuid = counters.companyGuid || cache.companyGuid;
@@ -4587,7 +4595,7 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
   cache.coveredFrom = !cache.coveredFrom || windowFrom < cache.coveredFrom ? windowFrom : cache.coveredFrom;
   cache.coveredTo = !cache.coveredTo || asOfDate > cache.coveredTo ? asOfDate : cache.coveredTo;
   if (plan.mode === "rebuilt") cache.lastReconciledAt = Date.now();
-  if (plan.mode !== "unchanged") {
+  if (stats.reconciled || plan.mode !== "unchanged") {
     try { store.commit(); } catch (error) { stats.reason += ` (cache not saved: ${error.message})`; }
   }
 
@@ -4597,9 +4605,8 @@ async function refreshCompanyEvidenceNow({ tallyUrl, companyName, evidenceFrom, 
 
 async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependencies = {}) {
   const startedAt = Date.now();
-  const scopeNames = uniquePayloadLedgerNames({ ledgerNames: commandPayload.scopeLedgerNames });
-  if (scopeNames.length === 0) throw new Error("Company scan requires scopeLedgerNames.");
-  const scopeByKey = new Map(scopeNames.map((name) => [normalizeLooseName(name), name]));
+  let scopeNames = uniquePayloadLedgerNames({ ledgerNames: commandPayload.scopeLedgerNames });
+  if (!dependencies.prepareDues && scopeNames.length === 0) throw new Error("Company scan requires scopeLedgerNames.");
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || new Date().toISOString().slice(0, 10);
@@ -4613,7 +4620,13 @@ async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependenci
   });
   dependencies.signal?.throwIfAborted();
   const billsReadAt = Date.now();
-  const scopedBills = extractBlocks(billXml, "BILL").filter((block) => scopeByKey.has(normalizeLooseName(billLedgerName(block))));
+  const allBills = extractBlocks(billXml, "BILL");
+  if (dependencies.prepareDues) {
+    scopeNames = uniquePayloadLedgerNames({ ledgerNames: allBills.map(billLedgerName) });
+    if (scopeNames.length === 0) return { success: true, result: { byLedger: {} } };
+  }
+  const scopeByKey = new Map(scopeNames.map((name) => [normalizeLooseName(name), name]));
+  const scopedBills = dependencies.prepareDues ? allBills : allBills.filter((block) => scopeByKey.has(normalizeLooseName(billLedgerName(block))));
   // Receipts and narrations are needed from the oldest in-scope open bill on.
   const evidenceFrom = earliestBillDate(scopedBills);
 
@@ -4621,7 +4634,7 @@ async function fetchCompanyOpenBillsScan(config, commandPayload = {}, dependenci
     ? await refreshCompanyEvidence({ tallyUrl, companyName, evidenceFrom, asOfDate, exportCollection, dependencies })
     : { mode: "skipped", reason: "no open bills in scope", vouchers: [], readCalls: 0 };
   // The cache holds every customer's vouchers; keep only those of in-scope customers.
-  const keptVouchers = evidence.vouchers.filter((voucher) => [
+  const keptVouchers = dependencies.prepareDues ? evidence.vouchers : evidence.vouchers.filter((voucher) => [
     getTagText(voucher, "PARTYLEDGERNAME"),
     ...extractBlocks(voucher, "ALLLEDGERENTRIES.LIST").map((entry) => getTagText(entry, "LEDGERNAME")),
   ].some((name) => name && scopeByKey.has(normalizeLooseName(name))));
@@ -5737,7 +5750,8 @@ async function assertCommandTarget(config, command) {
     throw new Error("The command targets an old or different connector session. Review it before retrying.");
   }
   // Rendering a previously verified document is not a new Tally read/write.
-  if (command.commandType === "parse_document" ||
+  if (command.commandType === "get_connector_diagnostics" || command.commandType === "reconnect_live_channel" ||
+      command.commandType === "parse_document" ||
       command.commandType === "parse_and_suggest" ||
       command.commandType === "export_debit_note_pdf" ||
       (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf")) return;
@@ -5759,6 +5773,19 @@ async function executeCommand(config, command, options = {}) {
     await assertCommandTarget(config, command);
   } catch (error) {
     await sendCommandResult(config, command, { success: false, error: error.message, result: { beforeExecution: true } });
+    return;
+  }
+
+  if (command.commandType === "get_connector_diagnostics" || command.commandType === "reconnect_live_channel") {
+    let result;
+    try {
+      if (!options.connectorSupport) throw new Error("Start the paired connector to use remote support.");
+      result = await options.connectorSupport(command);
+    } catch (error) {
+      await sendCommandResult(config, command, { success: false, error: error.message });
+      return;
+    }
+    await sendCommandResult(config, command, { success: true, result });
     return;
   }
 
@@ -6463,6 +6490,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   let reconnectTimer = null;
   let stopped = false;
   const operations = new Map();
+  const observation = { state: "disconnected", gatewayHost: null, lastAttemptAt: null,
+    lastAuthenticatedAt: null, lastCloseCode: null, lastError: null };
 
   const log = (level, message) => emitLog(options, level, message);
   const send = (payload) => {
@@ -6515,6 +6544,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           if (active.length !== 1 || String(active[0].guid || "").trim().toLowerCase() !== message.target.companyGuid) {
             throw new Error("The active Tally company changed. Select the intended company and check again.");
           }
+          return active[0];
         };
         if (operation === "local_ledger_catalogue") {
           const db = loadLocalDb({ appUserDataPath: options.appUserDataPath, baseDir: options.localMatchingBaseDir });
@@ -6525,7 +6555,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           if (!catalogue) throw new Error("The connector has no local ledger catalogue for this company. Open Ledger matching and update ledgers first.");
           return { source: "connector_local_db", ...catalogue };
         }
-        await assertCompany();
+        const activeCompany = await assertCompany();
         if (operation === "bank_ledgers") {
           const outcome = await fetchBankLedgersFromTally(config, {
             companyNames: message.companyNames,
@@ -6640,8 +6670,29 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "fetch_customer_open_bills") {
-          const outcome = message.payload?.queryStrategy === "company_scan"
-            ? await fetchCompanyOpenBillsScan(config, message.payload, { signal: controller.signal, onProgress })
+          const payload = message.payload || {};
+          const companyScan = payload.queryStrategy === "company_scan";
+          const tallyUrl = normalizeTallyUrl(config.tallyUrl);
+          const financialYear = payload.financialYear || message.financialYear;
+          if (companyScan && options.customerDues && payload.queryPurpose !== "bank_statement_match" &&
+              !payload.asOfDate && !payload.dateTo && !payload.dateFrom &&
+              !payload.tallyUrl && (!financialYear || financialYear === activeCompany.financialYear) &&
+              normalizeLooseName(payload.companyName) === normalizeLooseName(activeCompany.companyName)) {
+            const names = uniquePayloadLedgerNames({ ledgerNames: payload.scopeLedgerNames });
+            if (names.length > 0) {
+              const prepared = await options.customerDues.read({
+                ...activeCompany, guid: message.target.companyGuid, tallyUrl,
+              }, names, () => readTallyChangeCounters(tallyUrl, activeCompany.companyName, exportTallyCollection, message.target.companyGuid))
+                .catch(() => null);
+              if (prepared) {
+                await assertCompany();
+                onProgress("Using prepared customer dues");
+                return prepared;
+              }
+            }
+          }
+          const outcome = companyScan
+            ? await fetchCompanyOpenBillsScan(config, payload, { signal: controller.signal, onProgress })
             : await fetchCustomerOpenBillsFromTally(config, message.payload || {}, { signal: controller.signal, onProgress });
           await assertCompany();
           return outcome.result || outcome;
@@ -6697,10 +6748,15 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   const connect = () => {
     if (stopped) return;
     try {
-      socket = new WebSocket(tallyLiveGatewayUrl(config), {
+      observation.state = "connecting";
+      observation.lastAttemptAt = new Date().toISOString();
+      const gateway = tallyLiveGatewayUrl(config);
+      observation.gatewayHost = new URL(gateway).host;
+      const attemptSocket = socket = new WebSocket(gateway, {
         ca: windowsTlsCertificates(),
       });
       socket.addEventListener("open", () => {
+        if (socket !== attemptSocket || stopped) return;
         send({
           type: "authenticate",
           role: "connector",
@@ -6709,15 +6765,19 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         });
       });
       socket.addEventListener("message", (event) => {
+        if (socket !== attemptSocket || stopped) return;
         try {
           const message = JSON.parse(String(event.data || "{}"));
           if (message.type === "authenticated") {
+            observation.state = "authenticated";
+            observation.lastAuthenticatedAt = new Date().toISOString();
             log("info", "Live Tally channel connected.");
           } else if (message.type === "operation") {
             void handleOperation(message);
           } else if (message.type === "cancel") {
             operations.get(String(message.requestId || ""))?.abort();
           } else if (message.type === "error") {
+            observation.lastError = "Gateway rejected the connector session.";
             log("error", `Live Tally channel: ${message.error || "unknown error"}`);
           }
         } catch (error) {
@@ -6725,12 +6785,17 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         }
       });
       socket.addEventListener("error", (event) => {
+        if (socket !== attemptSocket || stopped) return;
         const detail = String(event?.message || event?.error?.message || "").trim();
+        observation.lastError = "WebSocket connection failed.";
         log("error", `Live Tally channel is unavailable${detail ? `: ${detail}` : ""}; retrying.`);
       });
       socket.addEventListener("close", (event) => {
+        if (socket !== attemptSocket || stopped) return;
         for (const controller of operations.values()) controller.abort();
         const code = Number(event?.code || 0);
+        observation.state = "disconnected";
+        observation.lastCloseCode = code;
         const reason = String(event?.reason || "").trim();
         if (!stopped && (code !== 1000 || reason)) {
           log("error", `Live Tally channel closed (code ${code || "unknown"}${reason ? `: ${reason}` : ""}); retrying.`);
@@ -6738,17 +6803,37 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         scheduleReconnect();
       });
     } catch (error) {
+      observation.state = "disconnected";
+      observation.lastError = "Could not open the gateway connection.";
       log("error", error instanceof Error ? error.message : "Could not start the live Tally channel.");
       scheduleReconnect();
     }
   };
 
   connect();
-  return () => {
-    stopped = true;
-    for (const controller of operations.values()) controller.abort();
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    socket?.close();
+  return {
+    status: () => ({ ...observation, activeOperations: operations.size }),
+    async reconnect() {
+      if (stopped) throw new Error("The connector has stopped.");
+      if (operations.size || executeExclusive.hasPendingInteractive()) throw new Error("Tally is busy. Retry when the current operation finishes.");
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      const previous = socket;
+      socket = null;
+      previous?.close();
+      connect();
+      const deadline = Date.now() + 12000;
+      while (!stopped && observation.state !== "authenticated" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (observation.state !== "authenticated" || stopped) throw new Error("Live channel authentication was not confirmed. Run diagnostics for the latest status.");
+    },
+    stop() {
+      stopped = true;
+      for (const controller of operations.values()) controller.abort();
+      clearTimeout(reconnectTimer);
+      socket?.close();
+    },
   };
 }
 
@@ -6955,34 +7040,7 @@ async function startBridge(args) {
   }
 
   const intervalMs = Number(args.interval || DEFAULT_HEARTBEAT_INTERVAL_MS);
-  console.log(`Starting Tally bridge for ${config.tallyUrl}`);
-  console.log(`Sending heartbeat every ${intervalMs} ms.`);
-
-  const executeExclusive = createExclusiveScheduler();
-  const runnerOptions = { companyHeartbeatCache: {}, tallyReadinessCache: {} };
-  let backgroundCycleRunning = false;
-  const runSerially = async () => {
-    if (backgroundCycleRunning) {
-      console.log("Previous bridge cycle is still running; skipping this heartbeat.");
-      return;
-    }
-
-    backgroundCycleRunning = true;
-    try {
-      await runOnce(config, runnerOptions, executeExclusive);
-    } finally {
-      backgroundCycleRunning = false;
-    }
-  };
-
-  await runOnce(config, runnerOptions, executeExclusive);
-  startCommandWakeChannel(config, executeExclusive, runnerOptions);
-  startTallyLiveChannel(config, executeExclusive);
-  setInterval(() => {
-    runSerially().catch((error) => {
-      console.error(error instanceof Error ? error.message : error);
-    });
-  }, intervalMs);
+  await createBridgeRunner({ config, intervalMs }).start();
 }
 
 async function testBridge(args) {
@@ -7029,21 +7087,78 @@ function createBridgeRunner(options = {}) {
   let lastCommandPollAt = 0;
   let backgroundCycleRunning = false;
   let stopped = false;
-  let stopTallyLiveChannel = null;
+  let liveChannel = null;
   let stopCommandWakeChannel = null;
   const companyHeartbeatCache = {};
   const tallyReadinessCache = {};
   const executeExclusive = createExclusiveScheduler({ isStopped: () => stopped });
+  const duesAbort = new AbortController();
+  const duesSignal = duesAbort.signal;
+  const duesTallyTask = (task) => executeExclusive(() => liveReadContext.run({ signal: duesSignal }, task), "background", { signal: duesSignal });
+  const duesExport = (url, request) => duesTallyTask(() => exportTallyCollection(url, request));
+  const tallyUrl = config.tallyUrl;
+  let duesTimer = null;
+  let duesCompany = null;
+  const activeDuesCompany = (companies = []) => {
+    const active = companies.filter((company) => company.isActive);
+    const [company] = active;
+    const guid = String(company?.guid || "").trim().toLowerCase();
+    return active.length === 1 && guid ? { ...company, guid, tallyUrl: normalizeTallyUrl(tallyUrl) } : null;
+  };
+  const customerDues = createCustomerDues({
+    dir: path.join(options.appUserDataPath || CONFIG_DIR, "customer-dues"),
+    normalizeLedger: normalizeLooseName,
+    today: () => new Date().toISOString().slice(0, 10),
+    async readActiveCompany() {
+      const readiness = await duesTallyTask(() => testTally(tallyUrl));
+      duesCompany = readiness.companyLoaded
+        ? activeDuesCompany(await duesTallyTask(() => fetchAvailableCompanies(tallyUrl, readiness.companyName)))
+        : null;
+      return duesCompany;
+    },
+    readCounters(company) {
+      return readTallyChangeCounters(tallyUrl, company.companyName, duesExport, company.guid);
+    },
+    async scan(company, { date, ...dependencies }) {
+      const outcome = await fetchCompanyOpenBillsScan(config, { companyName: company.companyName, asOfDate: date }, {
+        ...dependencies, exportCollection: duesExport, prepareDues: true, signal: duesSignal,
+      });
+      return outcome.result;
+    },
+    onStatus: () => options.onCustomerDuesStatus?.(customerDues.status(duesCompany)),
+  });
+
+  const runnerOptions = {
+    ...options,
+    async connectorSupport(command) {
+      if (!liveChannel) throw new Error("Live channel has not started.");
+      if (command.commandType === "reconnect_live_channel") {
+        if (!(Date.now() - Date.parse(command.createdAt) < 90000)) throw new Error("Reconnect request expired. Submit a new request.");
+        if (customerDues.status(duesCompany).status === "checking") throw new Error("Customer dues check in progress. Retry when idle.");
+        await liveChannel.reconnect();
+      }
+      const companyMatches = Boolean(duesCompany && duesCompany.guid === command.payload.target.companyGuid);
+      return {
+        bridgeVersion: BRIDGE_VERSION, checkedAt: new Date().toISOString(), connectionId: config.connectionId,
+        live: liveChannel.status(), companyObservedAt: tallyReadinessCache.fetchedAt ? new Date(tallyReadinessCache.fetchedAt).toISOString() : null,
+        companyName: duesCompany?.companyName ?? null, companyGuid: duesCompany?.guid ?? null,
+        financialYear: duesCompany?.financialYear ?? null, companyMatches,
+        dues: companyMatches ? customerDues.summary(duesCompany) : null,
+      };
+    },
+  };
 
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
     stopped = true;
+    duesAbort.abort();
+    clearInterval(duesTimer);
     if (timer) {
       clearInterval(timer);
       timer = null;
     }
-    stopTallyLiveChannel?.();
-    stopTallyLiveChannel = null;
+    liveChannel?.stop();
+    liveChannel = null;
     stopCommandWakeChannel?.();
     stopCommandWakeChannel = null;
     executeExclusive.stop();
@@ -7066,12 +7181,14 @@ function createBridgeRunner(options = {}) {
     try {
       const cycle = await runOnce(
         config,
-        { ...options, companyHeartbeatCache, tallyReadinessCache, skipCommandPolling: true },
+        { ...runnerOptions, companyHeartbeatCache, tallyReadinessCache, skipCommandPolling: true },
         executeExclusive
       );
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
+      duesCompany = cycle.result.companyLoaded ? activeDuesCompany(companyHeartbeatCache.companies) : null;
+      options.onCustomerDuesStatus?.(customerDues.status(duesCompany));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Bridge cycle failed.");
       emitLog(options, "error", message);
@@ -7103,9 +7220,13 @@ function createBridgeRunner(options = {}) {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
       stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, {
-        ...options, onWakeHealth: (healthy) => { wakeHealthy = healthy; },
+        ...runnerOptions, onWakeHealth: (healthy) => { wakeHealthy = healthy; },
       });
-      stopTallyLiveChannel = startTallyLiveChannel(config, executeExclusive, options);
+      liveChannel = startTallyLiveChannel(config, executeExclusive, { ...options, customerDues });
+      duesTimer = setInterval(() => {
+        if (!duesCompany || executeExclusive.isBusy() || customerDues.status(duesCompany).status !== "prepared") return;
+        customerDues.prepare({ automatic: true }).catch((error) => emitLog(options, "warn", `Customer dues refresh: ${error.message}`));
+      }, 60_000);
       void warmConnectorPipeline(config, options);
       leaseTimer = setInterval(async () => {
         const claims = [...commandLeases.values()].filter((claim) => claim.connectionId === config.connectionId).map(({ id, token }) => ({ id, token }));
@@ -7145,7 +7266,7 @@ function createBridgeRunner(options = {}) {
         if (stopped || commandPollRunning || Date.now() - lastCommandPollAt < (wakeHealthy ? 60_000 : 15_000)) return;
         commandPollRunning = true;
         lastCommandPollAt = Date.now();
-        try { await drainPendingCommands(config, options, executeExclusive); }
+        try { await drainPendingCommands(config, runnerOptions, executeExclusive); }
         catch (error) { emitLog(options, "error", error.message || "Command recovery poll failed."); }
         finally { commandPollRunning = false; }
       }, 5000);
@@ -7168,6 +7289,14 @@ function createBridgeRunner(options = {}) {
     },
     async runOnce() {
       await runSerially();
+    },
+    customerDuesStatus() {
+      return customerDues.status(duesCompany);
+    },
+    async prepareCustomerDues({ full = false } = {}) {
+      if (stopped) throw new Error("The connector has stopped.");
+      const company = await customerDues.prepare({ full });
+      return customerDues.status(company);
     },
     runTallyTask(task, priority = "background", lifecycle = {}) {
       return executeExclusive(task, priority, lifecycle);

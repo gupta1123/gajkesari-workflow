@@ -1,0 +1,6 @@
+# Customer Dues uses the existing connector scheduler and the collections company scan.
+# The bank-statement dispatch, matching, posting and parser logic keep their existing paths.
+apps/tally-bridge/src/bridge.mjs
+# The API and SQL allowlists add two device support operations and retain existing command types.
+apps/api/src/lib/tally/commands.ts
+supabase/migrations/20261120092730_connector_support_commands.sql

@@ -1,4 +1,6 @@
 export type TallyBridgeCommandType =
+  | "get_connector_diagnostics"
+  | "reconnect_live_channel"
   | "alter_ledger"
   | "create_ledger"
   | "fetch_bank_ledgers"
@@ -45,6 +47,8 @@ export type TallyBridgeCommandRow = {
 };
 
 export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
+  "get_connector_diagnostics",
+  "reconnect_live_channel",
   "alter_ledger",
   "create_ledger",
   "fetch_bank_ledgers",

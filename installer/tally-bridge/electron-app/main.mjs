@@ -644,6 +644,9 @@ async function startRunner() {
     appUserDataPath: app.getPath("userData"),
     embedTexts: requestSemanticEmbeddings,
     renderTallyPrintToPdf,
+    onCustomerDuesStatus(status) {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("customer-dues:status", status);
+    },
     onLog(entry) {
       appendLog(entry.level === "error" ? errPath : logPath, entry.message);
       if (entry.level === "error") {
@@ -803,8 +806,11 @@ function createWindow() {
           .windowControl{width:46px;height:100%;border:0;background:transparent;color:rgba(255,255,255,.82);display:grid;place-items:center;font-size:16px}
           .windowControl:hover{background:rgba(255,255,255,.1);color:#fff}.windowControl.close:hover{background:#c42b35}
           #appContent{height:calc(100% - 38px);overflow:auto}
-          #localPanel,#updatesPanel{display:none;position:absolute;inset:82px 0 0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 14px 16px}
-          #localPanel.open,#updatesPanel.open{display:block}
+          #localPanel,#updatesPanel,#duesPanel{display:none;position:absolute;inset:82px 0 0;background:var(--canvas);z-index:10;overflow-y:auto;overflow-x:hidden;padding:0 14px 16px}
+          #localPanel.open,#updatesPanel.open,#duesPanel.open{display:block}
+          #homeDuesCard{grid-column:1 / -1;display:flex;align-items:center;gap:10px}
+          #homeDuesCard .homeStatusIcon{margin:0;flex-shrink:0}
+          #duesPanel .row{margin-top:12px;gap:8px;flex-wrap:wrap}
           .stickyHeader{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:9px;padding:10px 0 5px;background:linear-gradient(var(--canvas) 82%,rgba(246,241,236,0))}
           .pageTitle,.screenTitle{font-family:"Aptos Display","Aptos",sans-serif;font-size:var(--text-lg);font-weight:700;line-height:1.2;letter-spacing:-.02em;margin:0}
           .screenSubtitle{font-size:var(--text-sm);color:var(--muted);line-height:1.3;margin-top:1px}
@@ -896,6 +902,10 @@ function createWindow() {
             <div class="homeStatusGrid">
               <button class="homeStatusCard" id="homeLedgerCard"><div class="homeStatusIcon" id="homeLedgerIcon">▦</div><b>Ledger data</b><span id="homeLedgerState">Not available</span></button>
               <button class="homeStatusCard" id="homeVectorCard"><div class="homeStatusIcon" id="homeVectorIcon">◇</div><b>Match preparation</b><span id="homeVectorState">Not available</span></button>
+              <button class="homeStatusCard" id="homeDuesCard">
+                <div class="homeStatusIcon" id="homeDuesIcon" aria-hidden="true">&#8377;</div>
+                <div><b>Customer dues</b><span id="homeDuesState">Not checked</span></div>
+              </button>
             </div>
             <button class="homeAction connectionAction" id="connectionCheckBtn" hidden>Recheck connection</button>
             <button class="homeAction" id="homeSetupBtn">Set up ledger matching</button>
@@ -931,6 +941,20 @@ function createWindow() {
 
         </div>
 
+        <div id="duesPanel">
+          <div class="stickyHeader">
+            <button id="duesBackBtn" class="iconBtn" aria-label="Back to connector status">&#8592;</button>
+            <h2 class="pageTitle">Customer dues</h2>
+          </div>
+          <p class="meta" id="duesCompany"></p>
+          <p class="meta">Prepare Tally dues for Cash Discounts and Payment Follow-ups.</p>
+          <div class="statusLine" id="duesStatus" role="status" aria-live="polite"></div>
+          <div class="row">
+            <button class="btn" id="checkDuesBtn">Check customer dues</button>
+            <button class="btnSecondary" id="rebuildDuesBtn" hidden>Check everything again</button>
+          </div>
+        </div>
+
         <div id="updatesPanel">
           <div class="stickyHeader">
             <button id="updatesBackBtn" class="iconBtn" aria-label="Back to connector status">←</button>
@@ -964,6 +988,9 @@ function createWindow() {
           const menuUpdates = document.getElementById('menuUpdates');
           const localPanel = document.getElementById('localPanel');
           const updatesPanel = document.getElementById('updatesPanel');
+          const duesPanel = document.getElementById('duesPanel');
+          const checkDuesBtn = document.getElementById('checkDuesBtn');
+          const rebuildDuesBtn = document.getElementById('rebuildDuesBtn');
           const backBtn = document.getElementById('backBtn');
           const updatesBackBtn = document.getElementById('updatesBackBtn');
           const checkUpdatesBtn = document.getElementById('checkUpdatesBtn');
@@ -1010,14 +1037,58 @@ function createWindow() {
           function showUpdates(){
             menu.style.display='none';
             localPanel.classList.remove('open');
+            duesPanel.classList.remove('open');
             updatesPanel.classList.add('open');
           }
           function showLedgerMatching(){
             menu.style.display='none';
             updatesPanel.classList.remove('open');
+            duesPanel.classList.remove('open');
             localPanel.classList.add('open');
             refreshLocalStatus();
           }
+          let duesStatus = {};
+          let duesRequestPending = false;
+          let duesError = '';
+          function renderDues(data = duesStatus){
+            if (data.companyName !== duesStatus.companyName) duesError = '';
+            duesStatus = data;
+            const checking = duesRequestPending || data.status === 'checking';
+            const prepared = Boolean(data.checkedAt);
+            const ready = !checking && !duesError && !data.lastError && prepared;
+            document.getElementById('duesCompany').textContent = [data.companyName, data.financialYear].filter(Boolean).join(' · ');
+            document.getElementById('duesStatus').textContent = checking ? (data.progress || 'Checking Tally…')
+              : duesError || data.lastError || (prepared ? 'Last checked ' + fmtTime(data.checkedAt)
+                : data.status === 'no_company' ? 'Open a company in Tally Prime, then check customer dues.' : 'Customer dues have not been prepared.');
+            const homeState = document.getElementById('homeDuesState');
+            homeState.textContent = checking ? 'Checking…' : ready ? 'Ready' : (duesError || data.lastError) ? 'Needs a check' : 'Not checked';
+            homeState.classList.toggle('ready', ready);
+            document.getElementById('homeDuesIcon').classList.toggle('ready', ready);
+            checkDuesBtn.textContent = prepared ? 'Check for changes' : 'Check customer dues';
+            checkDuesBtn.disabled = checking;
+            rebuildDuesBtn.hidden = !prepared;
+            rebuildDuesBtn.disabled = checking;
+          }
+          async function showDues(){
+            localPanel.classList.remove('open');
+            updatesPanel.classList.remove('open');
+            duesPanel.classList.add('open');
+            try { renderDues(await ipcRenderer.invoke('customer-dues:get-status')); }
+            catch (error) { duesError = error.message; renderDues(); }
+          }
+          async function checkDues(full){
+            duesRequestPending = true;
+            duesError = '';
+            renderDues();
+            try { renderDues(await ipcRenderer.invoke('customer-dues:prepare', { full })); }
+            catch (error) { duesError = error.message.replace(/^.*?Error: /, ''); }
+            finally { duesRequestPending = false; renderDues(); }
+          }
+          ipcRenderer.on('customer-dues:status', (_event, status) => renderDues(status));
+          document.getElementById('homeDuesCard').addEventListener('click', showDues);
+          document.getElementById('duesBackBtn').addEventListener('click', () => duesPanel.classList.remove('open'));
+          checkDuesBtn.addEventListener('click', () => checkDues(false));
+          rebuildDuesBtn.addEventListener('click', () => checkDues(true));
           menuLocalMatching.addEventListener('click', () => {
             showLedgerMatching();
           });
@@ -1235,6 +1306,7 @@ function createWindow() {
   mainWindow.once("ready-to-show", showWindow);
   mainWindow.webContents.on("did-finish-load", () => {
     sendStatus(lastStatus);
+    mainWindow.webContents.send("customer-dues:status", runner?.customerDuesStatus() ?? { status: "no_company" });
     if(updateAcknowledgement){fs.writeFileSync(updateAcknowledgement,JSON.stringify({version:CONNECTOR_VERSION}));updateAcknowledgement=null;}
   });
   mainWindow.webContents.on("did-fail-load", (_event, code, description) => {
@@ -1296,6 +1368,12 @@ if (!gotLock) {
     // Local Matching IPC (read-only, persistent)
     try {
       ipcMain.handle("connection:recheck", async () => handleConnectionRecheck());
+      ipcMain.handle("customer-dues:get-status", () => runner?.customerDuesStatus() ?? { status: "no_company" });
+      ipcMain.handle("customer-dues:prepare", (_event, payload) => {
+        if (updateInstalling) throw new Error("The connector is restarting for an update.");
+        if (!runner || runner.stopped) throw new Error("Connect this PC to Gajkesari first.");
+        return runner.prepareCustomerDues({ full: payload?.full === true });
+      });
       ipcMain.handle("local-matching:getStatus", async () => getLocalMatchingStatus());
       ipcMain.handle("local-matching:sync", async (_event, payload) => scheduleLocalSync({ forceFull: payload?.forceFull === true }));
       ipcMain.handle("local-matching:vectorise", async () => {

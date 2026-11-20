@@ -1,5 +1,6 @@
 "use client";
 
+import { ConnectorSupport } from "./ConnectorSupport";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { InvoicePanel, type PanelDate } from "./InvoicePanel";
 import { readCompaniesCache, writeCompaniesCache } from "@/lib/company-cache";
@@ -1059,6 +1060,11 @@ export function CollectionsDashboardPage() {
         </div>
       ) : null}
 
+      {selectedCompany && selectedConnectionId && <ConnectorSupport key={selectedCompany.id + selectedConnectionId}
+        connectionId={selectedConnectionId} companyName={selectedCompany.companyName} onReconnect={() => void refreshAll()} />}
+      {!dashboard ? <p role="status" className="rounded-xl border bg-white p-4 text-sm">
+        {loading ? "Reading customer dues..." : "Dues unavailable. Refresh after checking the connector and company."}
+      </p> : <>
       {dashboard?.setupRequired ? (
         <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800 shadow-sm">
           Cash Discounts tables are not ready. Run the database migration.
@@ -1400,6 +1406,8 @@ export function CollectionsDashboardPage() {
           </div>
         </Section>
       ) : null}
+
+      </>}
 
       {whatsappDialogProposals.length > 0 ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
