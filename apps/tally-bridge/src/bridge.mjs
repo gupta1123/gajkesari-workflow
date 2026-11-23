@@ -38,7 +38,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.97";
+const BRIDGE_VERSION = "0.1.98";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -7133,6 +7133,12 @@ function createBridgeRunner(options = {}) {
   let stopOperatorWorker;
   async function runOperatorJob(job, signal, progress) {
     const {operation, dataset, parameters, context} = job;
+    if (operation === "diagnose" && parameters.refreshDues === "true") {
+      progress("Refreshing customer dues from Tally");
+      const company = await customerDues.prepare({ full: true, target: dataset, signal });
+      signal.throwIfAborted();
+      return {company:company.companyName, financialYear:company.financialYear, dues:customerDues.summary(company)};
+    }
     if (operation === "update") {
       if (!options.stageOperatorUpdate) throw Error("This installation does not support remote updates.");
       return options.stageOperatorUpdate(parameters.version, signal);

@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 
 const DEFAULT_DEV_ORIGINS = [
   "http://localhost:3000",
@@ -48,6 +48,21 @@ export function jsonWithCors(
   body: unknown,
   init?: ResponseInit
 ) {
+  const status = init?.status ?? 200;
+  if (status >= 400) {
+    const token = request.headers.get("x-tally-browser-binding");
+    const route = new URL(request.url).pathname.replace(/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/gi,"[id]");
+    if (token && /^\/api\/(collections|bank-statements)(?:\/(?:[a-z-]{1,48}|\[id\])){0,6}$/.test(route)) {
+      const message = typeof body === "object" && body && "error" in body ? String(body.error) : "";
+      const requestId = request.headers.get("x-request-id");
+      after(async () => {
+        try {
+          const {recordSupportRequestError}=await import("@/lib/support-request-errors");
+          await recordSupportRequestError(token,route,request.method,status,message,requestId);
+        } catch { console.warn("Could not record connector support request error"); }
+      });
+    }
+  }
   return applyCorsHeaders(NextResponse.json(body, init), request);
 }
 

@@ -51,7 +51,8 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
     };
   }
 
-  function prepare({ full = false, automatic = false } = {}) {
+  function prepare({ full = false, automatic = false, target, signal } = {}) {
+    if (running && target) throw new Error("Customer dues are already being checked. Retry when idle.");
     if (running) return running;
     let file;
     const report = (message) => { progress = message; onStatus(); };
@@ -61,6 +62,8 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
         if (automatic) return null;
         throw new Error("Open a company in Tally Prime and try again.");
       }
+      signal?.throwIfAborted();
+      if (target && (target.company_guid.toLowerCase() !== company.guid || target.financial_year !== company.financialYear)) throw new Error("Open the selected company and financial year before refreshing dues.");
       const saved = get(company);
       if (automatic && !saved) return company;
       file = filename(company);
@@ -75,6 +78,7 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
         const result = await scan(company, {
           date, counters: before, cacheDir: directory(company), forceRebuild: full, onProgress: report,
         });
+        signal?.throwIfAborted();
         const active = await readActiveCompany();
         if (!active || directory(active) !== directory(company)) throw new Error("The active company in Tally changed. Check customer dues again.");
         const after = await readCounters(company);

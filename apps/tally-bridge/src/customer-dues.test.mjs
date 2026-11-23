@@ -34,6 +34,9 @@ test("prepared dues reuse the collections scan, stay scoped, and refuse stale re
     },
   });
   const dues = createStore();
+  await assert.rejects(dues.prepare({full:true,target:{company_guid:"other",financial_year:company.financialYear}}),/selected company/);
+  await assert.rejects(dues.prepare({full:true,target:{company_guid:company.guid,financial_year:"2025-26"}}),/selected company/);
+  assert.deepEqual(requests, []);
   await dues.prepare({ automatic: true });
   assert.deepEqual(requests, []);
   await dues.prepare();

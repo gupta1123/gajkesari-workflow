@@ -67,6 +67,18 @@ async function handle(req: Request) {
     if (datasetId && !d)
       return reply({ error: "Unknown company for this installation." }, 400);
     await expire(id);
+    if (req.method === "GET" && url.searchParams.get("view") === "errors") {
+      const events = await client
+        .from("tally_connection_events")
+        .select("created_at,payload")
+        .eq("owner_user_id", c.owner_user_id)
+        .eq("connection_id", id)
+        .eq("event_type", "support_request_error")
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (events.error) throw events.error;
+      return reply({ errors: events.data });
+    }
     if (req.method === "GET") {
       let jobs = client
         .from("connector_operator_jobs")
@@ -74,6 +86,18 @@ async function handle(req: Request) {
         .eq("connection_id", id)
         .eq("installation_id", c.installation_ref);
       if (d) jobs = jobs.eq("company_dataset_id", d.id);
+      const jobId = url.searchParams.get("jobId");
+      if (jobId) {
+        if (!d) return reply({ error: "Select the request's dataset." }, 400);
+        const job = await jobs.eq("id", jobId).maybeSingle();
+        if (job.error) throw job.error;
+        if (!job.data)
+          return reply(
+            { error: "Request unavailable in this selection." },
+            404,
+          );
+        return reply({ job: job.data });
+      }
       const history = await jobs
         .order("created_at", { ascending: false })
         .limit(20);
@@ -109,6 +133,17 @@ async function handle(req: Request) {
         403,
       );
     const parameters: Record<string, string> = {};
+    if (op === "diagnose" && body.refreshDues === true) {
+      if (
+        !c.bridge_version ||
+        c.bridge_version.localeCompare("0.1.98", "en", { numeric: true }) < 0
+      )
+        return reply(
+          { error: "Install connector 0.1.98 to refresh customer dues." },
+          409,
+        );
+      parameters.refreshDues = "true";
+    }
     const keys =
       op === "discount" || op === "followups"
         ? ["customer", "invoice"]
