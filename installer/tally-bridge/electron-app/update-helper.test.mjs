@@ -9,14 +9,15 @@ import {spawnSync} from 'node:child_process';
 // Exercise the real helper's file replacement and rollback in an isolated
 // temporary installation. All process/installer calls are mocked; Tally and
 // the actual installed connector are never started or modified.
-for(const scenario of ['success','cleanup-failed','installer-failed','wrong-version','restart-failed','hash-failed','outside-root']) {
+for(const scenario of ['success','custom-nsis','cleanup-failed','installer-failed','wrong-version','restart-failed','hash-failed','outside-root']) {
   test(`background updater handles ${scenario} without an installer window`,{skip:process.platform!=='win32'},t=>{
     const root=fs.mkdtempSync(path.join(os.tmpdir(),'gajkesari update test '));
     t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
     const install=path.join(root,'installation'),directory=path.join(root,'updates');
     fs.mkdirSync(path.join(install,'resources','app'),{recursive:true});fs.mkdirSync(directory);
-    fs.writeFileSync(path.join(install,'resources','app','package.json'),JSON.stringify({version:'0.1.80'}));
+    fs.writeFileSync(path.join(install,'resources','app','package.json'),JSON.stringify({version:'0.1.80',name:'gajkesari-tally-connector-wrapper',connectorUpdater:'electron-updater'}));
     fs.writeFileSync(path.join(install,'Gajkesari Tally Connector.exe'),'old connector');
+    if(scenario==='custom-nsis')fs.writeFileSync(path.join(install,'Uninstall Gajkesari Tally Connector.exe'),'test');
     const installer=path.join(directory,'installer.exe');fs.writeFileSync(installer,'example installer');
     const job={version:'0.1.81',parentPid:999998,installDir:scenario==='outside-root'?root:install,
       installer,sha256:createHash('sha256').update('example installer').digest('hex'),backup:path.join(directory,'backup'),
@@ -25,6 +26,10 @@ for(const scenario of ['success','cleanup-failed','installer-failed','wrong-vers
     const jobPath=path.join(directory,'job.json');fs.writeFileSync(jobPath,JSON.stringify(job));
     const quote=v=>v.replace(/'/g,"''");
     const mocks=`
+function Get-ItemPropertyValue {
+  param($LiteralPath,$Name,$ErrorAction)
+  if ('${scenario}' -eq 'custom-nsis') { return '${quote(install)}' }
+}
 function Wait-Process { param($Id,$Timeout,$ErrorAction) }
 function Get-Process { param($Id,$ErrorAction) return $null }
 function Stop-Process { param($Id,[switch]$Force,$ErrorAction) }
@@ -37,7 +42,8 @@ function Start-Process {
   param($FilePath,$ArgumentList,$WindowStyle,[switch]$PassThru,[switch]$Wait)
   if ($WindowStyle -ne 'Hidden') { throw 'An update process requested a visible window.' }
   if ($FilePath -eq $job.installer) {
-    if ($ArgumentList -notcontains '/VERYSILENT' -or $ArgumentList -notcontains '/NORESTART') { throw 'Unsafe installer arguments.' }
+    if ('${scenario}' -eq 'custom-nsis') { if ($ArgumentList -notcontains '/S') { throw 'Expected silent NSIS install.' } }
+    elseif ($ArgumentList -notcontains '/VERYSILENT' -or $ArgumentList -notcontains '/NORESTART') { throw 'Unsafe installer arguments.' }
     Set-Content -LiteralPath (Join-Path $installRoot 'Gajkesari Tally Connector.exe') -Value 'new connector'
     $next = if ('${scenario}' -eq 'wrong-version') {'0.1.99'} else {$job.version}
     @{version=$next} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $installRoot 'resources\\app\\package.json')
@@ -60,7 +66,7 @@ function Start-Process {
     }
     const receipt=JSON.parse(fs.readFileSync(job.receipt,'utf8').replace(/^\uFEFF/,''));
     const installed=JSON.parse(fs.readFileSync(path.join(install,'resources','app','package.json'),'utf8').replace(/^\uFEFF/,''));
-    if(scenario==='success'||scenario==='cleanup-failed'){
+    if(['success','cleanup-failed','custom-nsis'].includes(scenario)){
       assert.equal(result.status,0,JSON.stringify({receipt,stderr:result.stderr}));assert.equal(receipt.status,'installed');assert.equal(installed.version,'0.1.81');assert.equal(fs.existsSync(job.backup),scenario==='cleanup-failed');
     }else {
       assert.equal(receipt.status,'failed');assert.equal(installed.version,'0.1.80');

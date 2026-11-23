@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, net, ipcMain, safeStorage } from "electron"
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createConnectorUpdater } from "./updates.mjs";
 import { createElectronConnectorUpdater } from "./electron-updates.mjs";
 import { stageRelease } from "./signed-release.mjs";
@@ -45,7 +45,19 @@ let vectorising = false;
 let updateAcknowledgement = null;
 let stagedOperatorRelease = null;
 const operatorEvents = [];
-const nsisInstall = path.join(process.env.LOCALAPPDATA || "", "Programs", "gajkesari-tally-connector-wrapper");
+// Use the location written by the per-user installer for this app ID.
+function isRegisteredNsisInstall() {
+  if (process.platform !== "win32" || path.resolve(process.execPath).toLowerCase() !==
+      path.join(installDir,"Gajkesari Tally Connector.exe").toLowerCase()) return false;
+  const metadata = JSON.parse(fs.readFileSync(path.join(__dirname,"package.json"),"utf8"));
+  if (metadata.connectorUpdater !== "electron-updater") return false;
+  const reg = path.join(process.env.SystemRoot, "System32", "reg.exe");
+  const lookup = spawnSync(reg,["query","HKCU\\Software\\67f5b924-e8ce-5789-b7eb-192cc1f2e003","/v","InstallLocation","/reg:64"],
+    {windowsHide:true,encoding:"utf8",timeout:4000});
+  const location = lookup.stdout?.match(/^\s*InstallLocation\s+REG_SZ\s+(.+)$/im)?.[1]?.trim();
+  return lookup.status===0 && !!location && path.resolve(location).toLowerCase()===installDir.toLowerCase() &&
+    fs.existsSync(path.join(installDir,"Uninstall Gajkesari Tally Connector.exe"));
+}
 
 function sendUpdateState(state) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("updates:state", state);
@@ -53,7 +65,7 @@ function sendUpdateState(state) {
 
 async function installConnectorUpdate(update) {
   const directory = path.join(app.getPath("userData"), "updates");
-  if (process.platform !== "win32" || (path.resolve(installDir).toLowerCase() !== "c:\\gajkesari\\tally-bridge" && installDir.toLowerCase() !== nsisInstall.toLowerCase()) ||
+  if (process.platform !== "win32" || (path.resolve(installDir).toLowerCase() !== "c:\\gajkesari\\tally-bridge" && !isRegisteredNsisInstall()) ||
       path.basename(process.execPath) !== "Gajkesari Tally Connector.exe") {
     updateInstalling = false;
     throw new Error("Install this connector normally before using automatic updates.");
@@ -646,9 +658,10 @@ async function startRunner() {
 
   runner = createBridgeRunner({
     operatorSupportEnabled: true,
+    operatorUpdateAvailable: isRegisteredNsisInstall,
     operatorEvents: () => operatorEvents.slice(-60),
     async stageOperatorUpdate(version, signal) {
-      if (!app.isPackaged || installDir.toLowerCase() !== nsisInstall.toLowerCase()) throw Error("Remote updates require the per-user NSIS installer.");
+      if (!isRegisteredNsisInstall()) throw Error("This running executable does not match the registered per-user Gajkesari installation.");
       stagedOperatorRelease = await stageRelease(version,CONNECTOR_VERSION,path.join(app.getPath("userData"),"updates"),
         fs.readFileSync(path.join(__dirname,"operator-release-key.pem")),signal);
       return {version, verified:true};
@@ -1395,7 +1408,7 @@ if (!gotLock) {
     else pendingProtocolUrl = url;
   });
   app.whenReady().then(async () => {
-    if (process.platform==="win32" && app.isPackaged) {
+    if (process.platform==="win32" && (app.isPackaged || isRegisteredNsisInstall())) {
       app.setLoginItemSettings({openAtLogin:true,path:process.execPath,args:["--background"]});
       const dir=path.join(app.getPath("userData"),"updates");
       try{

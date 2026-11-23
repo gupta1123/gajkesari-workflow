@@ -3,8 +3,18 @@ $ErrorActionPreference = 'Stop'
 $job = Get-Content -LiteralPath $JobPath -Raw | ConvertFrom-Json
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $JobPath))
 $installRoot = [IO.Path]::GetFullPath('C:\Gajkesari\tally-bridge')
-$nsisRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs/gajkesari-tally-connector-wrapper'))
-$isNsis = [IO.Path]::GetFullPath($job.installDir) -eq $nsisRoot
+$nsisRoot = Get-ItemPropertyValue -LiteralPath 'HKCU:\Software\67f5b924-e8ce-5789-b7eb-192cc1f2e003' -Name InstallLocation -ErrorAction SilentlyContinue
+$isNsis = $false
+if ($nsisRoot) {
+  $nsisRoot = [IO.Path]::GetFullPath($nsisRoot)
+  $isNsis = [IO.Path]::GetFullPath($job.installDir) -eq $nsisRoot -and
+    (Test-Path -LiteralPath (Join-Path $nsisRoot 'Uninstall Gajkesari Tally Connector.exe') -PathType Leaf)
+  if ($isNsis) {
+    $package = Get-Content -LiteralPath (Join-Path $nsisRoot 'resources\app\package.json') -Raw | ConvertFrom-Json
+    if ($package.name -ne 'gajkesari-tally-connector-wrapper' -or $package.connectorUpdater -ne 'electron-updater') { throw 'Unexpected registered connector package.' }
+    if ($nsisRoot -eq [IO.Path]::GetPathRoot($nsisRoot) -or $root.StartsWith($nsisRoot + '\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe registered installation directory.' }
+  }
+}
 if ($isNsis) { $installRoot = $nsisRoot }
 if ([IO.Path]::GetFullPath($job.installDir) -ne $installRoot) { throw 'Unexpected connector installation directory.' }
 foreach ($name in @('backup','installer','receipt','ack','ready')) {

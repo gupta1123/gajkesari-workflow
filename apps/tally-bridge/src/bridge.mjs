@@ -38,7 +38,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.98";
+const BRIDGE_VERSION = "0.1.99";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -7209,6 +7209,7 @@ function createBridgeRunner(options = {}) {
       const companyMatches = Boolean(duesCompany && duesCompany.guid === command.payload.target.companyGuid);
       return {
         bridgeVersion: BRIDGE_VERSION, checkedAt: new Date().toISOString(), connectionId: config.connectionId,
+        remoteUpdateAvailable: options.operatorUpdateAvailable?.() ?? false,
         live: liveChannel.status(), companyObservedAt: tallyReadinessCache.fetchedAt ? new Date(tallyReadinessCache.fetchedAt).toISOString() : null,
         companyName: duesCompany?.companyName ?? null, companyGuid: duesCompany?.guid ?? null,
         financialYear: duesCompany?.financialYear ?? null, companyMatches,
