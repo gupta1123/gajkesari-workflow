@@ -3,6 +3,9 @@ $ErrorActionPreference = 'Stop'
 $job = Get-Content -LiteralPath $JobPath -Raw | ConvertFrom-Json
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $JobPath))
 $installRoot = [IO.Path]::GetFullPath('C:\Gajkesari\tally-bridge')
+$nsisRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs/gajkesari-tally-connector-wrapper'))
+$isNsis = [IO.Path]::GetFullPath($job.installDir) -eq $nsisRoot
+if ($isNsis) { $installRoot = $nsisRoot }
 if ([IO.Path]::GetFullPath($job.installDir) -ne $installRoot) { throw 'Unexpected connector installation directory.' }
 foreach ($name in @('backup','installer','receipt','ack','ready')) {
   $resolved = [IO.Path]::GetFullPath($job.$name)
@@ -30,7 +33,8 @@ try {
   Copy-Item -LiteralPath $installRoot -Destination $job.backup -Recurse -Force
   $backedUp = $true
   $changed = $true
-  $setup = Start-Process -FilePath $job.installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-','/NORESTART','/NOCANCEL',('/DIR="' + $installRoot + '"')) -WindowStyle Hidden -PassThru -Wait
+  $setupArgs = if ($isNsis) { @('/S') } else { @('/VERYSILENT','/SUPPRESSMSGBOXES','/SP-','/NORESTART','/NOCANCEL',('/DIR="' + $installRoot + '"')) }
+  $setup = Start-Process -FilePath $job.installer -ArgumentList $setupArgs -WindowStyle Hidden -PassThru -Wait
   if ($setup.ExitCode -ne 0) { throw ('Installation failed with exit code ' + $setup.ExitCode) }
   $package = Get-Content -LiteralPath (Join-Path $installRoot 'resources\app\package.json') -Raw | ConvertFrom-Json
   if ($package.version -ne $job.version) { throw 'Installed connector version did not match the update.' }

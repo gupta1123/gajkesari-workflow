@@ -4,6 +4,8 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 
+await import('./build-operator-analysis.mjs');
+
 const connector = {
   brandName: "Gajkesari",
   connectorName: "Gajkesari Tally Connector",
@@ -309,6 +311,10 @@ copyDir(path.join(electronAppSource, "assets"), path.join(appDir, "assets"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
 fs.copyFileSync(path.join(bridgeRoot, "src", "company-evidence-cache.mjs"), path.join(appDir, "src", "company-evidence-cache.mjs"));
 fs.copyFileSync(path.join(bridgeRoot, "src", "company-evidence-store.mjs"), path.join(appDir, "src", "company-evidence-store.mjs"));
+for (const name of ["operator-worker.mjs","operator-analysis.generated.mjs"])
+  fs.copyFileSync(path.join(bridgeRoot,"src",name), path.join(appDir,"src",name));
+for (const name of ["signed-release.mjs","operator-release-key.pem"])
+  fs.copyFileSync(path.join(electronAppSource,name), path.join(appDir,name));
 fs.copyFileSync(path.join(bridgeRoot, "src", "customer-dues.mjs"), path.join(appDir, "src", "customer-dues.mjs"));
 copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
 fs.copyFileSync(path.join(repoRoot, "packages/shared/src/lib/bank-bill-reference.mjs"), path.join(appDir, "src/local-matching/bill-reference.mjs"));

@@ -18,6 +18,8 @@ import {
   needsKeyReconcile, planEvidenceRefresh, RECONCILE_EVERY_MS,
 } from "./company-evidence-cache.mjs";
 import { getEvidenceStore } from "./company-evidence-store.mjs";
+import { startOperatorWorker, summarizeDashboard } from "./operator-worker.mjs";
+import { buildLiveCashDiscountDashboard, resolveScopedLedgers } from "./operator-analysis.generated.mjs";
 import { createCustomerDues } from "./customer-dues.mjs";
 import { applySeparatePaymentDecision } from "./local-matching/duplicate-resolution.mjs";
 import {
@@ -36,7 +38,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.96";
+const BRIDGE_VERSION = "0.1.97";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -7128,6 +7130,67 @@ function createBridgeRunner(options = {}) {
     onStatus: () => options.onCustomerDuesStatus?.(customerDues.status(duesCompany)),
   });
 
+  let stopOperatorWorker;
+  async function runOperatorJob(job, signal, progress) {
+    const {operation, dataset, parameters, context} = job;
+    if (operation === "update") {
+      if (!options.stageOperatorUpdate) throw Error("This installation does not support remote updates.");
+      return options.stageOperatorUpdate(parameters.version, signal);
+    }
+    return executeExclusive(() => liveReadContext.run({signal}, async () => {
+      signal.throwIfAborted();
+      if (operation === "logs") return {events: options.operatorEvents?.() ?? [], source:"Current connector session"};
+      if (operation === "diagnose" || operation === "reconnect") {
+        return runnerOptions.connectorSupport({commandType:operation === "diagnose" ? "get_connector_diagnostics" : "reconnect_live_channel",
+          createdAt:new Date().toISOString(),payload:{target:{companyGuid:dataset.company_guid}}});
+      }
+      const check = async () => {
+        signal.throwIfAborted();
+        const readiness = await testTally(tallyUrl);
+        const active = activeDuesCompany(await fetchAvailableCompanies(tallyUrl, readiness.companyName));
+        if (!readiness.companyLoaded || !active || active.guid !== dataset.company_guid.toLowerCase() || active.financialYear !== dataset.financial_year)
+          throw Error("Open the selected Tally company and financial year, then retry.");
+        return active;
+      };
+      const company = await check();
+      progress("Reading " + company.companyName);
+      let result;
+      if (operation === "verify") {
+        result = (await verifyBankTransactionInTally(config,{...context,companyName:company.companyName})).result;
+      } else if (operation === "parse" || operation === "match") {
+        const input={...context,companyName:company.companyName,companyGuid:company.guid,output:"json",topK:3};
+        const parsed=operation === "match" ? await parseDocumentAndSuggestLedgers(input,{
+          appUserDataPath:options.appUserDataPath,baseDir:options.localMatchingBaseDir,embedTexts:options.embedTexts,
+        }) : {parsed:await parseDocumentLocal(input)};
+        const rows=parsed.parsed.content?.transactions;
+        if (!Array.isArray(rows)) throw Error("No transaction preview available.");
+        result={source:"PDF preview",totalRows:rows.length,matchedRows:parsed.matching?.filter(r=>r.suggestions.length).length,
+          rows:rows.slice(0,50).map((r,i)=>({date:r.date||r.transactionDate,description:String(r.description||"").slice(0,200),
+            debit:r.debit??r.debitAmount,credit:r.credit??r.creditAmount,suggestions:parsed.matching?.[i]?.suggestions.map(m=>m.ledgerName),
+            reason:parsed.matching?.[i]?.emptyReason}))};
+      } else if (operation === "discount" || operation === "followups") {
+        const masters=await collectTallyMasters(config,{companyName:company.companyName,requestedMasterTypes:["ledger","group"],fieldProfile:"bank_statement"});
+        const customers=resolveScopedLedgers(masters,context.scope);
+        if (!customers.length) throw Error("No customers match the selected scope.");
+        const names=customers.map(row=>row.name);
+        const guardCounters=()=>readTallyChangeCounters(tallyUrl,company.companyName,exportTallyCollection,company.guid);
+        const before=await guardCounters();
+        const scan=await fetchCompanyOpenBillsScan(config,{companyName:company.companyName,scopeLedgerNames:names},{
+          signal,onProgress:progress,forceRebuild:true,cacheDir:path.join(options.appUserDataPath||CONFIG_DIR,"support-evidence",
+            createHash("sha256").update(JSON.stringify([company.guid,company.financialYear])).digest("hex"))});
+        const buckets=scan.result.byLedger;
+        if (Object.keys(buckets).length!==names.length || Object.values(buckets).some(b=>b.complete===false)) throw Error("Incomplete bill scan. Retry before relying on totals.");
+        const after=await guardCounters();
+        if(before.altVchId!==after.altVchId || before.altMstId!==after.altMstId)throw Error("Tally changed during this scan. Retry.");
+        const dashboard=buildLiveCashDiscountDashboard({connectionId:config.connectionId,companyName:company.companyName,financialYear:company.financialYear,
+          scan:{openBillsResult:scan.result,ledgers:customers},proposalRows:context.proposals,followUps:false});
+        result=summarizeDashboard(dashboard,job,customers,buckets);
+      } else throw Error("Unknown support operation.");
+      await check();
+      return result;
+    }), "background", {signal});
+  }
+
   const runnerOptions = {
     ...options,
     async connectorSupport(command) {
@@ -7151,6 +7214,7 @@ function createBridgeRunner(options = {}) {
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
     stopped = true;
+    stopOperatorWorker?.();
     duesAbort.abort();
     clearInterval(duesTimer);
     if (timer) {
@@ -7223,6 +7287,9 @@ function createBridgeRunner(options = {}) {
         ...runnerOptions, onWakeHealth: (healthy) => { wakeHealthy = healthy; },
       });
       liveChannel = startTallyLiveChannel(config, executeExclusive, { ...options, customerDues });
+      if(options.operatorSupportEnabled) stopOperatorWorker=startOperatorWorker(config,{
+        run:runOperatorJob,afterUpdate:options.applyOperatorUpdate,log:message=>emitLog(options,"warn",message),
+      });
       duesTimer = setInterval(() => {
         if (!duesCompany || executeExclusive.isBusy() || customerDues.status(duesCompany).status !== "prepared") return;
         customerDues.prepare({ automatic: true }).catch((error) => emitLog(options, "warn", `Customer dues refresh: ${error.message}`));

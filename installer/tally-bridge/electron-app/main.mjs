@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { createConnectorUpdater } from "./updates.mjs";
 import { createElectronConnectorUpdater } from "./electron-updates.mjs";
+import { stageRelease } from "./signed-release.mjs";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
 import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, upsertGroups, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
 import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable, closeZvecCollections } from "./src/local-matching/vector.mjs";
@@ -42,6 +43,9 @@ let updater = null;
 let updateInstalling = false;
 let vectorising = false;
 let updateAcknowledgement = null;
+let stagedOperatorRelease = null;
+const operatorEvents = [];
+const nsisInstall = path.join(process.env.LOCALAPPDATA || "", "Programs", "gajkesari-tally-connector-wrapper");
 
 function sendUpdateState(state) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("updates:state", state);
@@ -49,7 +53,7 @@ function sendUpdateState(state) {
 
 async function installConnectorUpdate(update) {
   const directory = path.join(app.getPath("userData"), "updates");
-  if (process.platform !== "win32" || path.resolve(installDir).toLowerCase() !== "c:\\gajkesari\\tally-bridge" ||
+  if (process.platform !== "win32" || (path.resolve(installDir).toLowerCase() !== "c:\\gajkesari\\tally-bridge" && installDir.toLowerCase() !== nsisInstall.toLowerCase()) ||
       path.basename(process.execPath) !== "Gajkesari Tally Connector.exe") {
     updateInstalling = false;
     throw new Error("Install this connector normally before using automatic updates.");
@@ -641,6 +645,35 @@ async function startRunner() {
   if (runner && !runner.stopped) runner.stop("restarting");
 
   runner = createBridgeRunner({
+    operatorSupportEnabled: true,
+    operatorEvents: () => operatorEvents.slice(-60),
+    async stageOperatorUpdate(version, signal) {
+      if (!app.isPackaged || installDir.toLowerCase() !== nsisInstall.toLowerCase()) throw Error("Remote updates require the per-user NSIS installer.");
+      stagedOperatorRelease = await stageRelease(version,CONNECTOR_VERSION,path.join(app.getPath("userData"),"updates"),
+        fs.readFileSync(path.join(__dirname,"operator-release-key.pem")),signal);
+      return {version, verified:true};
+    },
+    async applyOperatorUpdate(version, authorize) {
+      if (stagedOperatorRelease?.version !== version) throw Error("Selected release is not staged.");
+      const current=runner;
+      const until=Date.now()+8*60_000;
+      while(Date.now()<until && runner===current && !current.stopped){
+        if(!vectorising && !localSyncInFlight && !updateInstalling){
+          await authorize();
+          if(runner!==current || current.stopped)throw Error("Connector session changed.");
+          if(vectorising || localSyncInFlight || updateInstalling || !current.prepareForUpdate()){
+            await new Promise(resolve=>setTimeout(resolve,2000));
+            continue;
+          }
+          updateInstalling=true;
+          try {await installConnectorUpdate(stagedOperatorRelease);}
+          catch(e){updateInstalling=false;if(current.stopped)await startRunner();throw e;}
+          return;
+        }
+        await new Promise(resolve=>setTimeout(resolve,2000));
+      }
+      throw Error("Restart deferred; this PC did not become idle.");
+    },
     appUserDataPath: app.getPath("userData"),
     embedTexts: requestSemanticEmbeddings,
     renderTallyPrintToPdf,
@@ -648,6 +681,12 @@ async function startRunner() {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("customer-dues:status", status);
     },
     onLog(entry) {
+      const text=String(entry.message||"");
+      const event=/Live Tally channel connected/i.test(text)?"Live channel authenticated":
+        /Live Tally channel (closed|is unavailable)/i.test(text)?"Live channel disconnected":
+        /heartbeat failed/i.test(text)?"Heartbeat failed":/support service returned/i.test(text)?"Support service unavailable":
+        /Live operation (started|failed|completed)/.exec(text)?.[0];
+      if(event){operatorEvents.push({time:new Date().toISOString(),level:entry.level,event});if(operatorEvents.length>100)operatorEvents.shift();}
       appendLog(entry.level === "error" ? errPath : logPath, entry.message);
       if (entry.level === "error") {
         const expired = /invalid bridge token|401|403/i.test(entry.message);
@@ -1303,7 +1342,7 @@ function createWindow() {
     </html>
   `)}`;
 
-  mainWindow.once("ready-to-show", showWindow);
+  if(!process.argv.includes("--background"))mainWindow.once("ready-to-show", showWindow);
   mainWindow.webContents.on("did-finish-load", () => {
     sendStatus(lastStatus);
     mainWindow.webContents.send("customer-dues:status", runner?.customerDuesStatus() ?? { status: "no_company" });
@@ -1356,6 +1395,14 @@ if (!gotLock) {
     else pendingProtocolUrl = url;
   });
   app.whenReady().then(async () => {
+    if (process.platform==="win32" && app.isPackaged) {
+      app.setLoginItemSettings({openAtLogin:true,path:process.execPath,args:["--background"]});
+      const dir=path.join(app.getPath("userData"),"updates");
+      try{
+        const receipt=JSON.parse(fs.readFileSync(path.join(dir,"update-result.json"),"utf8").replace(/^\uFEFF/,""));
+        if(receipt.status==="installed" && receipt.version===CONNECTOR_VERSION)updateAcknowledgement=path.join(dir,"update-ack.json");
+      }catch{}
+    }
     installSystemNetworkFetch();
     await startConnectorUpdater();
     ipcMain.on("window:minimize", () => mainWindow?.minimize());

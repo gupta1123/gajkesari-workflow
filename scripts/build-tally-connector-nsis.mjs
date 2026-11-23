@@ -13,13 +13,14 @@ const app = path.join(payload, 'resources/app');
 const versionIndex = process.argv.indexOf('--version');
 const version = versionIndex < 0 ? JSON.parse(fs.readFileSync(path.join(installer, 'electron-app/package.json'), 'utf8')).version : process.argv[versionIndex + 1];
 if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Provide a numeric connector version.');
+if (process.argv.includes('--reuse-payload')) await import('./build-operator-analysis.mjs');
 if (!process.argv.includes('--reuse-payload')) {
   execFileSync(process.execPath, [path.join(root, 'scripts/build-tally-connector-installer.mjs'), '--payload-only'], {cwd: root, stdio: 'inherit'});
 } else {
   if (!fs.existsSync(path.join(app, 'package.json'))) throw new Error('No prepared connector payload to reuse.');
   console.log('Reusing the prepared runtime; refreshing wrapper and bridge sources.');
   for (const entry of fs.readdirSync(path.join(installer, 'electron-app'), {withFileTypes:true})) {
-    if (entry.isFile() && /\.(mjs|html|css|ps1)$/.test(entry.name)) fs.copyFileSync(path.join(installer, 'electron-app', entry.name), path.join(app, entry.name));
+    if (entry.isFile() && /\.(mjs|html|css|ps1|pem)$/.test(entry.name)) fs.copyFileSync(path.join(installer, 'electron-app', entry.name), path.join(app, entry.name));
   }
   fs.cpSync(path.join(root, 'apps/tally-bridge/src'), path.join(app, 'src'), {recursive:true});
   // Match the normal payload builder's standalone module replacements.
