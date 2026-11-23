@@ -2,18 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { apiFetch } from "@/lib/api-client";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import {
   CircleAlert,
   CircleDashed,
-  FileText,
   Landmark,
   LogOut,
   ChevronsUpDown,
   Settings,
   ChevronLeft,
-  MessageCircle,
   PlugZap,
 } from "lucide-react";
 
@@ -22,19 +19,12 @@ import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
 import styles from "./DashboardSidebar.module.css";
 
 /* ── Sectioned nav ───────────────────────────── */
-// Collections ships behind the same flag as the live Cash Discount scan.
-const COLLECTIONS_ENABLED = process.env.NEXT_PUBLIC_CASH_DISCOUNT_LIVE === "true";
-
 const SIDEBAR_SECTIONS = [
   {
     id: "agents",
     title: "Agents",
     items: [
       { href: "/bank-statements", label: "Bank Reconciliation", icon: Landmark },
-      ...(COLLECTIONS_ENABLED ? [
-        { href: "/collections", label: "Cash Discounts", icon: FileText },
-        { href: "/collections/follow-ups", label: "Payment Follow-ups", icon: MessageCircle },
-      ] : []),
     ],
   },
   {
@@ -48,7 +38,7 @@ const SIDEBAR_SECTIONS = [
 
 function isActivePath(pathname: string, href: string) {
   const hrefPath = href.split("?")[0];
-  if (hrefPath === "/" || hrefPath === "/collections") return pathname === hrefPath;
+  if (hrefPath === "/") return pathname === hrefPath;
   return pathname === hrefPath || pathname.startsWith(`${hrefPath}/`);
 }
 
@@ -66,17 +56,6 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
   const pathname = usePathname();
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
-  const [hasSupport,setHasSupport]=useState(false);
-  useEffect(()=>{
-    const controller=new AbortController();
-    apiFetch("/api/operator-support",{signal:controller.signal,cache:"no-store"})
-      .then(async res=>res.ok && (await res.json()).connections?.length>0)
-      .then(allowed=>{if(!controller.signal.aborted)setHasSupport(Boolean(allowed));})
-      .catch(()=>{});
-    return ()=>controller.abort();
-  },[user?.email]);
-  const sections=hasSupport?SIDEBAR_SECTIONS.map(section=>section.id==="system" ? {...section,items:[...section.items,
-    {href:"/connector-support",label:"Remote connector support",icon:Settings}]}:section):SIDEBAR_SECTIONS;
   const userRowRef = useRef<HTMLDivElement>(null);
   const { connection, loading } = useTallyConnectionStatus();
 
@@ -128,7 +107,7 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
 
       {/* ── DESKTOP SECTIONED NAVIGATION ── */}
       <nav className={`${styles.navSection} ${styles.desktopNav}`}>
-        {sections.map((section) => (
+        {SIDEBAR_SECTIONS.map((section) => (
           <div key={section.id} className={styles.sectionGroup}>
             {!collapsed && <h3 className={styles.sectionHeader}>{section.title}</h3>}
             <ul className={styles.navList} role="list">
@@ -160,7 +139,7 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
       {/* ── MOBILE FLAT NAVIGATION ── */}
       <nav className={`${styles.navSection} ${styles.mobileNav}`}>
         <ul className={styles.navList} role="list">
-          {sections.flatMap((s) => s.items).map((item) => {
+          {SIDEBAR_SECTIONS.flatMap((s) => s.items).map((item) => {
             const active = isActivePath(pathname, item.href);
             const Icon = item.icon;
             return (
