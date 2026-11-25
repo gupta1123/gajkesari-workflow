@@ -542,6 +542,7 @@ export async function POST(
           .insert({
             owner_user_id: connection.owner_user_id,
             connection_id: connection.id,
+            company_dataset_id: command.company_dataset_id,
             company_name: toNullableText(commandPayload.companyName, 240) ?? connection.last_company_name,
             financial_year: toNullableText(sourceProposal.financialYear, 20),
             source_transaction_id: null,
