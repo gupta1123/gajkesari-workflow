@@ -7,7 +7,8 @@ import { analyseCashDiscountNarration, isCashDiscountRecoveryStatus } from "@/li
 import { isNonSalesVoucher } from '@/lib/payment-terms';
 import { toNumber, toText } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { browserOwnsConnection } from "@/lib/tally/browser-scope";
+import { browserOwnsConnection, resolveTallyTarget } from "@/lib/tally/browser-scope";
+import { liveDebitNoteCommandId } from "@/lib/live-debit-note-command-id";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
 import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/tally/commands";
 
@@ -209,19 +210,19 @@ async function POSTHandler(request: Request) {
       return jsonWithCors(request, { commandPayload });
     }
 
-    const idempotencyKey = [companyName, String(requestedProposal.financialYear || ''), matchingBill.ledgerName, linkedInvoiceNumber, referenceSuffix]
-      .map(normalized)
-      .join("|");
+    const target = await resolveTallyTarget(request, user.id, connection.id, companyName);
+    const commandId = liveDebitNoteCommandId(target.companyDatasetId, matchingBill.ledgerName,
+      linkedInvoiceNumber, invoiceDate, referenceSuffix);
     const { data: commandData, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert({
         connection_id: connection.id,
         owner_user_id: user.id,
         command_type: "create_debit_note",
-        idempotency_key: idempotencyKey,
+        id: commandId,
         status: "queued",
         priority: 35,
-        payload: commandPayload,
+        payload: { ...commandPayload, target },
       })
       .select("*")
       .single();
