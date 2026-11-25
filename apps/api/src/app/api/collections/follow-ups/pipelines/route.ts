@@ -46,7 +46,7 @@ export async function GET(request: Request) {
     const attempts = pipelineIds.length
       ? (await createSupabaseAdminClient()
           .from("invoice_followup_attempts")
-          .select("id,pipeline_id,status,recipient,outstanding,stage_index,error,created_at,finished_at")
+          .select("id,pipeline_id,status,recipient,outstanding,stage_index,error,created_at,finished_at,delivery_status,delivery_reason,delivery_updated_at")
           .eq("owner_user_id", user.id)
           .in("pipeline_id", pipelineIds)
           .order("created_at", { ascending: false })

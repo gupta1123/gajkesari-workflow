@@ -42,6 +42,9 @@ export type FollowupAttempt = {
   error: string | null;
   created_at: string;
   finished_at: string | null;
+  delivery_status?: "sent" | "delivered" | "read" | "failed" | null;
+  delivery_reason?: string | null;
+  delivery_updated_at?: string | null;
 };
 
 export type ReminderMessage = { key: string; name: string; text: string };

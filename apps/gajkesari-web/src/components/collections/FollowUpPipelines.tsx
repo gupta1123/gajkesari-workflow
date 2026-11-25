@@ -64,6 +64,16 @@ const ATTEMPT_LABEL: Record<FollowupAttempt["status"], { label: string; cls: str
   uncertain: { label: "Uncertain", cls: "pill-sky" },
 };
 
+// An accepted message shows what MSG91 reported afterwards, once it has.
+const DELIVERY_LABEL: Record<NonNullable<FollowupAttempt["delivery_status"]>, { label: string; cls: string }> = {
+  sent: { label: "Sent", cls: "pill-amber" },
+  delivered: { label: "Delivered", cls: "pill-green" },
+  read: { label: "Read", cls: "pill-green" },
+  failed: { label: "Failed", cls: "pill-red" },
+};
+const attemptLabel = (attempt: FollowupAttempt) =>
+  attempt.status === "accepted" && attempt.delivery_status ? DELIVERY_LABEL[attempt.delivery_status] : ATTEMPT_LABEL[attempt.status];
+
 const money = (value: number | null | undefined) =>
   value == null ? "Not checked" : new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(value);
 const fmtDate = (value: string | null | undefined) =>
@@ -256,6 +266,14 @@ export function FollowUpPipelines() {
       }
       await Promise.all([plansLoaded, remindersLoaded]);
     })();
+  }, [refresh]);
+
+  // Delivery reports arrive after the page loads, so keep the list fresh while it is open.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") refresh().catch(() => undefined);
+    }, 20_000);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   const scan = useCallback(async () => {
@@ -801,14 +819,14 @@ export function FollowUpPipelines() {
                   <tbody>
                     {slice(attempts).map((attempt) => {
                       const pipe = rows.find((row) => row.id === attempt.pipeline_id);
-                      const status = ATTEMPT_LABEL[attempt.status];
+                      const status = attemptLabel(attempt);
                       return (
                         <tr key={attempt.id}>
                           <td><span className="cname">{pipe?.customer ?? "—"}</span><span className="csub">{pipe?.invoice}</span></td>
                           <td className="r num">{money(attempt.outstanding)}</td>
                           <td>{maskPhone(attempt.recipient)}</td>
                           <td>{fmtDateTime(attempt.created_at)}</td>
-                          <td><span className={`pill ${status.cls}`}>{status.label}</span>{attempt.error && <span className="snote">{attempt.error}</span>}</td>
+                          <td><span className={`pill ${status.cls}`}>{status.label}</span>{(attempt.error || attempt.delivery_reason) && <span className="snote">{attempt.error || attempt.delivery_reason}</span>}</td>
                         </tr>
                       );
                     })}
@@ -973,7 +991,7 @@ export function FollowUpPipelines() {
               <ul className="tl">
                 {attempts.filter((a) => a.pipeline_id === detail.id).map((attempt) => (
                   <li key={attempt.id} className={attempt.status === "rejected" ? "t-warn" : "t-sent"}>
-                    <span className="d" /><div><b>Reminder {ATTEMPT_LABEL[attempt.status].label.toLowerCase()}</b><time>{fmtDateTime(attempt.created_at)} · {money(attempt.outstanding)}</time></div>
+                    <span className="d" /><div><b>Reminder {attemptLabel(attempt).label.toLowerCase()}</b><time>{fmtDateTime(attempt.created_at)} · {money(attempt.outstanding)}</time></div>
                   </li>
                 ))}
                 <li><span className="d" /><div><b>Reminder journey created</b></div></li>
