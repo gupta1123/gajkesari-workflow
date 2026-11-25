@@ -800,7 +800,7 @@ export function FollowUpPipelines() {
                   {!pageGroups.length && <div className="empty cg-empty">{scanError ? "Tally could not be read." : "No customers have unpaid invoices that need a follow-up."}</div>}
                 </div>
               ) : tab === "dues" ? (
-                <table className="grid">
+                <table className="gt">
                   <thead><tr>
                     <th style={{ width: 36 }}><input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} /></th>
                     <th>Customer</th><th style={{ width: "20%" }}>Invoice</th><th className="r" style={{ width: 140 }}>Outstanding</th>
@@ -828,7 +828,7 @@ export function FollowUpPipelines() {
                   </tbody>
                 </table>
               ) : tab === "history" ? (
-                <table className="grid p">
+                <table className="gt p">
                   <thead><tr><th style={{ width: "26%" }}>Customer / invoice</th><th className="r" style={{ width: 150 }}>Amount</th><th style={{ width: "18%" }}>WhatsApp number</th><th style={{ width: "20%" }}>Sent at</th><th>Status</th><th style={{ width: 70 }} /></tr></thead>
                   <tbody>
                     {slice(attempts).map((attempt) => {
@@ -849,7 +849,7 @@ export function FollowUpPipelines() {
                   </tbody>
                 </table>
               ) : (
-                <table className="grid p">
+                <table className="gt p">
                   <thead><tr>
                     <th style={{ width: 36 }}><input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} /></th>
                     <th style={{ width: "22%" }}>Customer / invoice</th><th className="r" style={{ width: 130 }}>Outstanding</th><th style={{ width: "16%" }}>Stage</th>
