@@ -38,7 +38,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.99";
+const BRIDGE_VERSION = "0.1.100";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -2930,33 +2930,36 @@ function isNumericMasterId(value) {
   return /^\d+$/.test(String(value ?? "").trim());
 }
 
-async function resolveDebitNoteVoucher(tallyUrl, payload, fallbackCompanyName) {
+export async function resolveDebitNoteVoucher(tallyUrl, payload, fallbackCompanyName) {
   const companyName = payload?.companyName || fallbackCompanyName;
   const requestedMasterId = String(payload?.tallyVoucherId || payload?.voucherId || "").trim();
   const requestedReference = String(payload?.referenceNumber || payload?.expectedReference || "").trim();
   const requestedParty = String(payload?.partyLedgerName || "").trim();
   const requestedAmount = Number(payload?.amount ?? 0);
-  const xml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Gajkesari Debit Note Voucher Lookup",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
-    companyName,
-    // Tally's default collection window ends at its current date. Debit Notes
-    // created with a future-effective date must still be found and exported.
-    dateFrom: "2000-04-01",
-    dateTo: "2099-03-31",
-  });
-  const vouchers = parseVoucherCollection(xml).filter(
-    (voucher) => isSameTallyText(voucher.voucherType, "Debit Note") && !/^yes$/i.test(voucher.isCancelled || "")
-  );
+  const day = normalizeDateForCompare(toIsoLikeDate(payload?.voucherDate));
+  const filter = "GajkesariExactDebitNote";
+  async function lookup(condition) {
+    const xml = await exportTallyCollection(tallyUrl, {
+      collectionName: "Gajkesari Debit Note Voucher Lookup",
+      tallyType: "Voucher",
+      fetchFields: "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,GUID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount",
+      companyName, dateFrom: day, dateTo: day,
+      filterNames: [filter],
+      formulae: [{name: filter, formula: `($$IsEqual:$VoucherTypeName:"Debit Note") AND (${condition})`}],
+      timeoutMs: 15000,
+    });
+    return parseVoucherCollection(xml).filter(voucher =>
+      isSameTallyText(voucher.voucherType, "Debit Note") && !/^yes$/i.test(voucher.isCancelled || ""));
+  }
 
-  let matches = isNumericMasterId(requestedMasterId)
-    ? vouchers.filter((voucher) => String(voucher.masterId || "") === requestedMasterId)
-    : [];
-
-  if (matches.length === 0 && requestedReference) {
-    matches = vouchers.filter((voucher) => isSameTallyText(voucher.reference, requestedReference));
+  let matches = [];
+  if (isNumericMasterId(requestedMasterId) && Number(requestedMasterId) > 0) {
+    matches = (await lookup(`$MasterID = ${requestedMasterId}`))
+      .filter(voucher => String(voucher.masterId) === requestedMasterId);
+  }
+  if (!matches.length && requestedReference) {
+    matches = (await lookup(`$$IsEqual:$Reference:${tallyFormulaString(requestedReference)}`))
+      .filter(voucher => isSameTallyText(voucher.reference, requestedReference));
   }
   if (requestedParty) {
     matches = matches.filter(
@@ -2972,8 +2975,8 @@ async function resolveDebitNoteVoucher(tallyUrl, payload, fallbackCompanyName) {
   if (matches.length !== 1) {
     throw new Error(
       matches.length === 0
-        ? "Tally did not return the expected Debit Note for native PDF export."
-        : "More than one Tally Debit Note matched this request. Native PDF export was stopped."
+        ? "Tally did not return the expected Debit Note for this reference and voucher date."
+        : "More than one Tally Debit Note matched this reference."
     );
   }
 
@@ -2991,6 +2994,33 @@ async function resolveDebitNoteVoucher(tallyUrl, payload, fallbackCompanyName) {
     throw new Error("Tally Debit Note amount does not match the Gajkesari request.");
   }
   return voucher;
+}
+
+export async function postAndVerifyDebitNote(tallyUrl, payload, post = postDebitNote, lookup = resolveDebitNoteVoucher) {
+  const reference = payload.referenceNumber || payload.linkedInvoiceNumber || "(see invoice)";
+  let posted;
+  try {
+    posted = await post(tallyUrl, payload, payload.companyName);
+  } catch (error) {
+    const uncertain = Boolean(commandExecutionContext.getStore()?.writeOutcomeUnknown);
+    return {success:false, error: uncertain
+      ? `Tally did not confirm the posting request. Check reference ${reference} in Tally before retrying.`
+      : String(error.message || error),
+      result:{proposalId:payload.proposalId, reconciliationRequired:uncertain, referenceNumber:reference, detail:String(error.message || error)}};
+  }
+  const {outcome} = posted;
+  const result = {...outcome.result, proposalId:payload.proposalId, referenceNumber:reference, requestXml:previewXml(posted.xml)};
+  if (!outcome.success) return {...outcome, error:outcome.error || "Tally rejected the Debit Note import.", result};
+  try {
+    const voucher = await lookup(tallyUrl, {...payload, tallyVoucherId:result.lastVchId}, payload.companyName);
+    return {...outcome, result:{...result, voucherId:voucher.masterId, voucherGuid:voucher.guid || null,
+      voucherNumber:voucher.voucherNumber, openReferenceName:voucher.reference || null, voucherReference:voucher.reference || null,
+      voucherAlterId:voucher.alterId || null, voucherType:voucher.voucherType, partyLedgerName:voucher.partyLedgerName || null,
+      voucherDate:normalizeDateForCompare(voucher.effectiveDate || voucher.date)}};
+  } catch (error) {
+    return {success:false, error:`Tally accepted the Debit Note import, but the connector could not verify the voucher. Check reference ${reference} in Tally before retrying.`,
+      result:{...result, reconciliationRequired:true, verificationError:String(error.message || error)}};
+  }
 }
 
 function debitNoteVoucherAmount(voucher) {
@@ -6115,68 +6145,8 @@ async function executeCommand(config, command, options = {}) {
   }
 
   if (command.commandType === "create_debit_note") {
-    let xml = null;
-    try {
-      const posted = await postDebitNote(
-        config.tallyUrl,
-        command.payload,
-        command.payload?.companyName || null
-      );
-      xml = posted.xml;
-      const outcome = posted.outcome;
-      const voucher = await resolveDebitNoteVoucher(
-        config.tallyUrl,
-        {
-          ...command.payload,
-          tallyVoucherId: outcome.result?.lastVchId,
-          expectedReference: command.payload?.referenceNumber,
-        },
-        command.payload?.companyName || null
-      );
-      await sendCommandResult(config, command, {
-        ...outcome,
-        result: {
-          ...(outcome.result || {}),
-          requestXml: previewXml(xml),
-          proposalId: command.payload?.proposalId,
-          voucherId: voucher.masterId,
-          voucherGuid: voucher.guid || null,
-          voucherNumber: voucher.voucherNumber,
-          openReferenceName: voucher.reference || null,
-          voucherReference: voucher.reference || null,
-          voucherAlterId: voucher.alterId || null,
-          voucherType: voucher.voucherType,
-          partyLedgerName: voucher.partyLedgerName || null,
-          voucherDate: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
-        },
-      });
-      console.log(
-        outcome.success
-          ? `Command ${command.id} completed: debit note created.`
-          : `Command ${command.id} failed: ${outcome.error || "Tally returned an error."}`
-      );
-      if (!outcome.success) {
-        console.log(`Command ${command.id} Tally request XML: ${previewXml(xml)}`);
-      }
-    } catch (error) {
-      const message =
-        error?.name === "AbortError"
-          ? "Tally did not respond within 30 seconds while creating the debit note."
-          : error instanceof Error
-            ? error.message
-            : String(error ?? "Debit note creation failed.");
-      await sendCommandResult(config, command, {
-        success: false,
-        error: message,
-        result: {
-          requestXml: xml ? previewXml(xml) : null,
-          commandPayload: command.payload ?? {},
-          proposalId: command.payload?.proposalId,
-          voucherId: command.payload?.referenceNumber || command.id,
-        },
-      });
-      console.log(`Command ${command.id} failed: ${message}`);
-    }
+    const outcome = await postAndVerifyDebitNote(config.tallyUrl, command.payload);
+    await sendCommandResult(config, command, outcome);
     return;
   }
 

@@ -119,6 +119,7 @@ type WhatsappSendResult = {
 type TallyCommand = {
   id: string;
   connectionId?: string;
+  payload?: { referenceNumber?: string };
   status: "queued" | "claimed" | "succeeded" | "failed" | "canceled";
   error?: string | null;
 };
@@ -489,7 +490,7 @@ export function CollectionsDashboardPage() {
     return (payload.masters ?? []).filter(isDebtorLedger).map((master) => master.name).filter(Boolean);
   }, []);
 
-  const pollCommand = useCallback(async (connectionId: string, commandId: string) => {
+  const pollCommand = useCallback(async (connectionId: string, commandId: string, debitNoteReference?: string) => {
     for (let attempt = 0; attempt < 45; attempt += 1) {
       await wait(1000);
       const response = await apiFetch(
@@ -504,10 +505,15 @@ export function CollectionsDashboardPage() {
       const command = payload.commands?.find((item) => item.id === commandId);
       if (command?.status === "succeeded") return;
       if (command?.status === "failed" || command?.status === "canceled") {
-        throw new Error(command.error || "Tally open-bill scan failed.");
+        if (debitNoteReference && /Debit Note Voucher Lookup timed out/i.test(command.error || "")) {
+          throw new Error(`The posting request was sent, but the connector could not verify the voucher. Check ${debitNoteReference} in Tally before retrying.`);
+        }
+        throw new Error(command.error || (debitNoteReference ? "Debit note command stopped." : "Tally command stopped."));
       }
     }
-    throw new Error("Tally open-bill scan timed out. Keep the connector open and refresh again.");
+    throw new Error(debitNoteReference
+      ? `The connector has not reported a final result. Check ${debitNoteReference} in Tally before retrying.`
+      : "Tally has not reported a final result. Keep the connector open and refresh again.");
   }, []);
 
   const refreshLiveTallyCompany = useCallback(async (connectionId: string) => {
@@ -692,7 +698,7 @@ export function CollectionsDashboardPage() {
 
     const commandConnectionId = command?.connectionId ?? selectedConnectionId;
     if (command?.id && commandConnectionId) {
-      await pollCommand(commandConnectionId, command.id);
+      await pollCommand(commandConnectionId, command.id, command.payload?.referenceNumber || proposal.linkedInvoiceNumber || "the debit note");
     } else {
       await wait(1800);
     }
