@@ -83,6 +83,18 @@ const fmtDateTime = (value: string | null | undefined) =>
 // Large balances read better as lakh or crore.
 const shortMoney = (value: number) =>
   value >= 1e7 ? `₹${(value / 1e7).toFixed(2)} crore` : value >= 1e5 ? `₹${(value / 1e5).toFixed(2)} lakh` : money(value);
+// Plain CSV download of the invoices the user selected, for sharing or a spreadsheet.
+function downloadCsv(filename: string, header: string[], lines: Array<Array<string | number>>) {
+  const cell = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
+  const body = [header, ...lines].map((line) => line.map(cell).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob(["\ufeff" + body], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 const maskPhone = (value: string | null | undefined) => (value ? `+91 ${value.slice(-10, -5)} ${value.slice(-5)}` : "—");
 
 function tenDigits(value: string | null | undefined) {
@@ -559,12 +571,14 @@ export function FollowUpPipelines() {
         <>
           <button className="bb pri" disabled={!startableGroups.length} onClick={() => openEnrollCustomers(startableGroups.map((group) => group.name), false)}>Start reminders<small>{startableGroups.length}</small></button>
           <button className="bb" disabled={!startableGroups.length} onClick={() => openEnrollCustomers(startableGroups.map((group) => group.name), true)}>Send once<small>{startableGroups.length}</small></button>
+          <button className="bb" disabled={!selGroups.length} onClick={() => downloadCsv("payment-follow-ups-customers.csv", ["Customer", "Unpaid invoices", "Outstanding", "Oldest invoice", "Days overdue", "WhatsApp"], selGroups.map((group) => [group.name, group.invoices.length, group.total.toFixed(2), group.oldest === "9999" ? "" : group.oldest, Math.max(group.maxAge, 0), group.phone]))}>Export CSV<small>{selGroups.length}</small></button>
           {startableGroups.some((group) => !group.phone) && <button className="bb warn" onClick={() => openEnrollCustomers(startableGroups.map((group) => group.name), false)}>⚠ {startableGroups.filter((group) => !group.phone).length} no contact</button>}
         </>
       ) : tab === "dues" ? (
         <>
           <button className="bb pri" disabled={!startable.length} onClick={() => openEnroll(startable.map((row) => row.id), false)}>Start reminders<small>{startable.length}</small></button>
           <button className="bb" disabled={!startable.length} onClick={() => openEnroll(startable.map((row) => row.id), true)}>Send once<small>{startable.length}</small></button>
+          <button className="bb" disabled={!selDues.length} onClick={() => downloadCsv("payment-follow-ups-invoices.csv", ["Customer", "Invoice", "Invoice date", "Outstanding", "Days overdue", "WhatsApp"], selDues.map((row) => [row.partyLedgerName, row.linkedInvoiceNumber ?? "", row.linkedInvoiceDate ?? "", row.outstandingAmount.toFixed(2), row.ageDays ?? "", tenDigits(row.partyPhone)]))}>Export CSV<small>{selDues.length}</small></button>
           {noPhone > 0 && <button className="bb warn" onClick={() => openEnroll(startable.map((row) => row.id), false)}>⚠ {noPhone} no contact</button>}
         </>
       ) : (
@@ -815,7 +829,7 @@ export function FollowUpPipelines() {
                 </table>
               ) : tab === "history" ? (
                 <table className="grid p">
-                  <thead><tr><th style={{ width: "26%" }}>Customer / invoice</th><th className="r" style={{ width: 150 }}>Amount</th><th style={{ width: "18%" }}>WhatsApp number</th><th style={{ width: "20%" }}>Sent at</th><th>Status</th></tr></thead>
+                  <thead><tr><th style={{ width: "26%" }}>Customer / invoice</th><th className="r" style={{ width: 150 }}>Amount</th><th style={{ width: "18%" }}>WhatsApp number</th><th style={{ width: "20%" }}>Sent at</th><th>Status</th><th style={{ width: 70 }} /></tr></thead>
                   <tbody>
                     {slice(attempts).map((attempt) => {
                       const pipe = rows.find((row) => row.id === attempt.pipeline_id);
@@ -827,10 +841,11 @@ export function FollowUpPipelines() {
                           <td>{maskPhone(attempt.recipient)}</td>
                           <td>{fmtDateTime(attempt.created_at)}</td>
                           <td><span className={`pill ${status.cls}`}>{status.label}</span>{(attempt.error || attempt.delivery_reason) && <span className="snote">{attempt.error || attempt.delivery_reason}</span>}</td>
+                          <td>{pipe && <button className="btn" onClick={() => setDetailId(pipe.id)}>View</button>}</td>
                         </tr>
                       );
                     })}
-                    {!attempts.length && <tr><td colSpan={5} className="empty">No messages submitted yet.</td></tr>}
+                    {!attempts.length && <tr><td colSpan={6} className="empty">No messages submitted yet.</td></tr>}
                   </tbody>
                 </table>
               ) : (
@@ -849,7 +864,7 @@ export function FollowUpPipelines() {
                         <td>{row.stages[row.stage_index]?.name ?? "—"}<span className="csub">{row.stage_sent} of {row.stages[row.stage_index]?.limit ?? 1} sent</span></td>
                         <td>{row.next_due_at ? fmtDateTime(row.next_due_at) : <span className="muted">None</span>}</td>
                         <td>
-                          <span className={`pill ${row.status === "settled" ? "pill-green" : row.status === "review" || row.status === "uncertain" ? "pill-amber" : "pill-stone"}`}>{STATUS_LABEL[row.status]}</span>
+                          <span className={`pill ${row.status === "settled" || row.status === "active" ? "pill-green" : row.status === "review" || row.status === "uncertain" || row.status === "sending" ? "pill-amber" : row.status === "stopped" ? "pill-red" : "pill-stone"}`}>{STATUS_LABEL[row.status]}</span>{row.note && <span className="snote">{row.note}</span>}
                           {row.note && <span className="snote">{row.note}</span>}
                         </td>
                         <td>

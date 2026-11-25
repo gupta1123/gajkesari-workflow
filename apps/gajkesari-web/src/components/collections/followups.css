@@ -1,7 +1,7 @@
 /* Payment follow-ups: styles ported from the client demo, scoped under .fu */
 .fu{--fu-line:#e0d8cc;font-family:inherit;color:#1a1a1a;background:#f7f7f5;min-height:100%}
 .fu *{box-sizing:border-box}
-.fu .page{padding:0 24px 40px;max-width:1240px;margin:0 auto}
+.fu .page{padding:0 24px 40px;max-width:1480px;width:100%;margin:0 auto;min-width:0}
 .fu header.ph{border-bottom:1px solid var(--fu-line);padding:10px 0;margin:16px 0 4px}
 .fu .ph-top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
 .fu .ph-title{display:flex;align-items:center;gap:10px;min-width:0}
@@ -18,7 +18,7 @@
 .fu .btn.primary{background:#2f2924;color:#fff;border-color:#2f2924;font-weight:600}.fu .btn.primary:hover:not(:disabled){background:#463d35}
 .fu .btn.hd{height:32px;border-radius:8px;padding:0 12px;font-size:12px}
 .fu .btn.lg{min-height:40px;border-radius:8px;font-size:12px;font-weight:600;padding:8px 16px}
-.fu .metaline{display:flex;justify-content:flex-end;align-items:center;gap:8px;min-height:24px;margin:8px 0;font-size:10px;line-height:16px;color:#756b60}
+.fu .metaline{display:flex;justify-content:flex-end;align-items:center;gap:8px;min-height:24px;margin:8px 0;font-size:10px;line-height:16px;color:#756b60;flex-wrap:wrap;text-align:right;overflow-wrap:anywhere}
 .fu .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:0 0 16px}
 @media(max-width:800px){.fu .kpis{grid-template-columns:repeat(2,1fr)}}
 .fu .kpi{background:#fff;border:1px solid var(--fu-line);border-radius:12px;padding:12px 16px}
@@ -42,8 +42,8 @@
 .fu .bb small{opacity:.65;margin-left:4px}.fu .bb-sep{width:1px;height:18px;background:rgba(255,255,255,.22);margin:0 4px}
 .fu .bb-x{margin-left:auto;border:0;background:transparent;color:#f3eee8;font-size:20px;width:32px;height:32px;border-radius:8px;cursor:pointer}
 .fu .flat{width:100%;overflow-x:auto;margin-top:12px}
-.fu table.grid{width:100%;min-width:1000px;table-layout:fixed;border-collapse:collapse;text-align:left}
-.fu table.grid.p{min-width:900px}
+.fu table.grid{width:100%;min-width:880px;table-layout:fixed;border-collapse:collapse;text-align:left}
+.fu table.grid.p{min-width:820px}
 .fu thead th{background:#f7f4ef;text-align:left;padding:8px 10px;font-size:12px;color:#3d3530;height:40px;font-weight:600;border-bottom:1px solid var(--fu-line)}
 .fu tbody tr{height:52px;border-bottom:1px solid #ece6dc}.fu tbody tr:hover{background:rgba(237,230,217,.4)}
 .fu tbody td{padding:8px 10px;vertical-align:middle;font-size:12px;color:#5a5046}

@@ -195,7 +195,8 @@ function statusClass(value?: string) {
   if (value === "created_in_tally") return "border-emerald-250 bg-emerald-50 text-emerald-800";
   if (value === "queued_in_tally" || value === "approved") return "border-amber-250 bg-amber-50 text-amber-800";
   if (value === "failed") return "border-red-250 bg-red-50 text-red-800";
-  return "border-slate-200 bg-white text-slate-500";
+  // A proposal that is ready to create reads as positive, not as an empty outline.
+  return "border-emerald-200 bg-emerald-50 text-emerald-800";
 }
 
 function messageStatusClass(value?: string | null) {
@@ -249,7 +250,7 @@ function createButtonLabel(proposal: DebitNoteProposal) {
   const status = proposal.status;
   if (status === "failed") return "Retry";
   if (status === "approved" || status === "queued_in_tally") return "Queued";
-  return "Create debit note";
+  return "Review";
 }
 
 function canCreateInTally(proposal: DebitNoteProposal) {
@@ -268,6 +269,27 @@ function contactStatus(proposal: DebitNoteProposal) {
   if (proposal.partyPhone) return "WhatsApp ready";
   if (proposal.partyEmail) return "Email only";
   return "No contact";
+}
+
+type DiscountType = "advance" | "same_day" | "other";
+
+// The rule name carries the rate: 1.5% is the advance RTGS rule, 1% is same day.
+function discountType(proposal: DebitNoteProposal): DiscountType {
+  const rate = Number(/(\d+(?:\.\d+)?)\s*%/.exec(proposal.cashDiscountRuleName ?? "")?.[1]);
+  if (rate === 1.5) return "advance";
+  if (rate === 1) return "same_day";
+  return "other";
+}
+
+const DISCOUNT_TYPE_LABEL: Record<DiscountType, string> = {
+  advance: "Advance RTGS",
+  same_day: "Same-day RTGS",
+  other: "Other terms",
+};
+
+function customerInitials(name: string) {
+  const letters = name.split(/\s+/).filter(Boolean).map((word) => word[0]).join("");
+  return (letters.slice(0, 2) || "?").toUpperCase();
 }
 
 function getTenDigitPhone(value: string) {
@@ -401,6 +423,13 @@ export function CollectionsDashboardPage() {
   const [scanInfo, setScanInfo] = useState<ScanInfo | null>(null);
   const [scanProgress, setScanProgress] = useState<string | null>(null);
   const [panelId, setPanelId] = useState("");
+  const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState<"all" | DiscountType>("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | "ready" | "retry" | "queued">("all");
+  const [sortKey, setSortKey] = useState<"recovery" | "newest" | "customer">("recovery");
+  // What the person is about to confirm: one debit note, or every selected one.
+  const [reviewTarget, setReviewTarget] = useState<{ kind: "one"; id: string } | { kind: "bulk" } | null>(null);
+  const [reviewChecked, setReviewChecked] = useState(false);
   const initialLoadStartedRef = useRef(false);
   const lastLoadedConnectionRef = useRef("");
 
@@ -908,6 +937,23 @@ export function CollectionsDashboardPage() {
   const pendingProposals = proposals.filter(isPendingDebitNote);
   const createdProposals = proposals.filter(isCreatedDebitNote);
   const panelProposal = proposals.find((proposal) => proposal.id === panelId);
+  const visiblePending = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    const matches = pendingProposals.filter((proposal) => {
+      if (typeFilter !== "all" && discountType(proposal) !== typeFilter) return false;
+      if (statusFilter === "retry" && !proposal.lastError) return false;
+      if (statusFilter === "queued" && !(proposal.status === "approved" || proposal.status === "queued_in_tally")) return false;
+      if (statusFilter === "ready" && (proposal.lastError || proposal.status === "approved" || proposal.status === "queued_in_tally")) return false;
+      if (!needle) return true;
+      return `${proposal.partyLedgerName} ${proposal.linkedInvoiceNumber ?? ""}`.toLowerCase().includes(needle);
+    });
+    return matches.sort((a, b) => {
+      if (sortKey === "customer") return a.partyLedgerName.localeCompare(b.partyLedgerName);
+      if (sortKey === "newest") return String(b.linkedInvoiceDate ?? "").localeCompare(String(a.linkedInvoiceDate ?? ""));
+      return (Number(b.recoverableAmount) || 0) - (Number(a.recoverableAmount) || 0);
+    });
+  }, [pendingProposals, search, typeFilter, statusFilter, sortKey]);
+  const reviewProposal = reviewTarget?.kind === "one" ? proposals.find((proposal) => proposal.id === reviewTarget.id) : undefined;
   const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectedPendingProposals = selectablePendingProposals.filter((proposal) => selectedPendingIds.has(proposal.id));
   const selectableCreatedProposals = createdProposals.filter((proposal) => proposal.communicationStatus !== "sent");
@@ -1110,11 +1156,11 @@ export function CollectionsDashboardPage() {
               <button
                 className="inline-flex h-8.5 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={bulkCreating}
-                onClick={() => void approveSelectedProposals()}
+                onClick={() => { setReviewChecked(false); setReviewTarget({ kind: "bulk" }); }}
                 type="button"
               >
                 {bulkCreating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                Create {selectedPendingProposals.length} debit notes
+                Review {selectedPendingProposals.length} debit notes
               </button>
             ) : null
           }
@@ -1127,6 +1173,51 @@ export function CollectionsDashboardPage() {
             </EmptyState>
           ) : (
             <div>
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <input
+                  aria-label="Search customer or invoice"
+                  className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none focus:border-[#2d2d2d] sm:w-64"
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search customer or invoice"
+                  type="search"
+                  value={search}
+                />
+                <select
+                  aria-label="Payment type"
+                  className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#3d3530]"
+                  onChange={(event) => setTypeFilter(event.target.value as typeof typeFilter)}
+                  value={typeFilter}
+                >
+                  <option value="all">All types</option>
+                  <option value="advance">Advance RTGS</option>
+                  <option value="same_day">Same-day RTGS</option>
+                  <option value="other">Other terms</option>
+                </select>
+                <select
+                  aria-label="Status"
+                  className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#3d3530]"
+                  onChange={(event) => setStatusFilter(event.target.value as typeof statusFilter)}
+                  value={statusFilter}
+                >
+                  <option value="all">All statuses</option>
+                  <option value="ready">Ready</option>
+                  <option value="retry">Needs retry</option>
+                  <option value="queued">Queued</option>
+                </select>
+                <select
+                  aria-label="Sort"
+                  className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#3d3530]"
+                  onChange={(event) => setSortKey(event.target.value as typeof sortKey)}
+                  value={sortKey}
+                >
+                  <option value="recovery">Highest recovery</option>
+                  <option value="newest">Newest invoice</option>
+                  <option value="customer">Customer name</option>
+                </select>
+                <span className="ml-auto text-[11px] font-semibold text-slate-400">
+                  Showing {visiblePending.length} of {pendingProposals.length}
+                </span>
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full min-w-[860px] border-collapse text-left">
                   <thead>
@@ -1150,7 +1241,14 @@ export function CollectionsDashboardPage() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                    {pendingProposals.map((proposal) => {
+                    {visiblePending.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-10 text-center text-xs font-semibold text-slate-400" colSpan={7}>
+                          No debit notes match these filters.
+                        </td>
+                      </tr>
+                    ) : null}
+                    {visiblePending.map((proposal) => {
                       const shortfall = calculateShortfall(proposal);
                       const createEnabled = tallyCompanyVerified && canCreateInTally(proposal);
                       const displayAmount = proposal.recoverableAmount;
@@ -1169,17 +1267,25 @@ export function CollectionsDashboardPage() {
                             />
                           </td>
                           <td className="px-4 py-4">
-                            <div className="max-w-[280px] truncate text-sm font-semibold text-[#1a1a1a]" title={proposal.partyLedgerName}>
-                              {proposal.partyLedgerName}
-                            </div>
-                            <div className="mt-1 inline-flex rounded-full border border-[#e5ddd0] bg-[#fcfbfa] px-2 py-0.5 text-[10px] font-semibold text-slate-500">
-                              {contactStatus(proposal)}
-                            </div>
-                            {proposal.lastError ? (
-                              <div className="mt-1 max-w-[280px] truncate text-[11px] text-red-600 font-semibold">
-                                {proposal.lastError}
+                            <div className="flex items-start gap-3">
+                              <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#2d2d2d] text-[11px] font-bold text-white">
+                                {customerInitials(proposal.partyLedgerName)}
+                              </span>
+                              <div className="min-w-0">
+                                <div className="max-w-[260px] truncate text-sm font-semibold text-[#1a1a1a]" title={proposal.partyLedgerName}>
+                                  {proposal.partyLedgerName}
+                                </div>
+                                <div className="mt-0.5 text-[11px] font-medium text-slate-500">{DISCOUNT_TYPE_LABEL[discountType(proposal)]}</div>
+                                <div className="mt-1 inline-flex rounded-full border border-[#e5ddd0] bg-[#fcfbfa] px-2 py-0.5 text-[10px] font-semibold text-slate-500">
+                                  {contactStatus(proposal)}
+                                </div>
+                                {proposal.lastError ? (
+                                  <div className="mt-1 max-w-[260px] truncate text-[11px] text-red-600 font-semibold">
+                                    {proposal.lastError}
+                                  </div>
+                                ) : null}
                               </div>
-                            ) : null}
+                            </div>
                           </td>
                           <td className="px-4 py-4">
                             <button className="block max-w-full truncate text-left text-sm font-semibold text-[#1a1a1a] hover:underline" title="Show invoice details" onClick={() => setPanelId(proposal.id)} type="button">
@@ -1210,7 +1316,7 @@ export function CollectionsDashboardPage() {
                             ) : null}
                           </td>
                           <td className="px-4 py-4 text-right">
-                            <div className="tabular-nums text-sm font-semibold text-[#1a1a1a]">{formatMoney(displayAmount)}</div>
+                            <div className="tabular-nums text-sm font-bold text-emerald-700">{formatMoney(displayAmount)}</div>
                             <div className="mt-1 text-[11px] font-medium text-slate-400">
                               <span title={proposal.cashDiscountRuleName || "Cash discount"}>{(proposal.cashDiscountRuleName || "Cash discount").split(" — ")[0]}</span>
                             </div>
@@ -1225,7 +1331,9 @@ export function CollectionsDashboardPage() {
                               className="inline-flex min-h-8.5 min-w-[130px] items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[#2d2d2d] px-4 py-2 text-xs font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                               disabled={!createEnabled || approvingId === proposal.id}
                               onClick={() => {
-                                if (createEnabled) void approveProposal(proposal);
+                                if (!createEnabled) return;
+                                setReviewChecked(false);
+                                setReviewTarget({ kind: "one", id: proposal.id });
                               }}
                               type="button"
                             >
@@ -1537,6 +1645,67 @@ export function CollectionsDashboardPage() {
         </div>
       ) : null}
 
+      {reviewTarget && (reviewProposal || reviewTarget.kind === "bulk") ? (
+        <ReviewDrawer
+          busy={reviewTarget.kind === "bulk" ? bulkCreating : approvingId === reviewProposal?.id}
+          checked={reviewChecked}
+          confirmDisabled={!tallyCompanyVerified}
+          confirmLabel={reviewTarget.kind === "bulk" ? `Create ${selectedPendingProposals.length} debit notes in Tally` : "Create debit note in Tally"}
+          onCheck={setReviewChecked}
+          onClose={() => setReviewTarget(null)}
+          onConfirm={() => {
+            const target = reviewTarget;
+            setReviewTarget(null);
+            if (target.kind === "bulk") void approveSelectedProposals();
+            else if (reviewProposal) void approveProposal(reviewProposal);
+          }}
+          subtitle={reviewTarget.kind === "bulk"
+            ? `${selectedPendingProposals.length} invoices selected`
+            : `${shortText(reviewProposal?.linkedInvoiceNumber, "No invoice")} · ${formatDate(reviewProposal?.linkedInvoiceDate)}`}
+          tag={reviewTarget.kind === "one" && reviewProposal ? `${DISCOUNT_TYPE_LABEL[discountType(reviewProposal)]}` : undefined}
+          title={reviewTarget.kind === "bulk" ? "Create selected debit notes" : reviewProposal?.partyLedgerName ?? ""}
+          total={reviewTarget.kind === "bulk" ? sumRecoverable(selectedPendingProposals) : Number(reviewProposal?.recoverableAmount) || 0}
+        >
+          {reviewTarget.kind === "bulk" ? (
+            <ReviewBlock title="Debit notes to create">
+              {selectedPendingProposals.slice(0, 12).map((proposal) => (
+                <ReviewRow key={proposal.id} label={`${proposal.partyLedgerName} · ${shortText(proposal.linkedInvoiceNumber, "No invoice")}`} value={formatMoney(proposal.recoverableAmount)} />
+              ))}
+              {selectedPendingProposals.length > 12 ? <ReviewRow label={`and ${selectedPendingProposals.length - 12} more`} value="" /> : null}
+              <ReviewRow bold label="Total recoverable" value={formatMoney(sumRecoverable(selectedPendingProposals))} />
+            </ReviewBlock>
+          ) : reviewProposal ? (
+            <>
+              <ReviewBlock title="How the amount is worked out">
+                <ReviewRow label="Invoice value" value={formatMoney(reviewProposal.originalInvoiceAmount)} />
+                <ReviewRow label="Received so far" value={formatMoney(reviewProposal.amountReceived)} />
+                {typeof reviewProposal.expectedDiscount === "number" ? <ReviewRow label="Discount allowed" value={formatMoney(reviewProposal.expectedDiscount)} /> : null}
+                <ReviewRow bold label="Debit note amount" value={formatMoney(reviewProposal.recoverableAmount)} />
+              </ReviewBlock>
+              <ReviewBlock title="Effect on outstanding">
+                <ReviewRow label="Pending now" value={formatMoney(reviewProposal.pendingAmount ?? null)} />
+                <ReviewRow
+                  bold
+                  label="After this debit note"
+                  value={formatMoney((reviewProposal.pendingAmount ?? 0) + (Number(reviewProposal.recoverableAmount) || 0))}
+                />
+              </ReviewBlock>
+              <ReviewBlock title="Why this applies">
+                <ReviewRow label="Result" value={issueLabel(reviewProposal)} />
+                <ReviewRow label="Discount deadline" value={formatDate(reviewProposal.discountDeadline)} />
+                <ReviewRow label="Payment received" value={reviewProposal.receiptDate ? formatDate(reviewProposal.receiptDate) : "Not received"} />
+                <ReviewRow label="Rule" value={reviewProposal.cashDiscountRuleName || "Cash discount"} />
+              </ReviewBlock>
+              {reviewProposal.narration ? (
+                <ReviewBlock title="Narration in Tally">
+                  <p className="px-4 py-3 text-xs leading-5 text-slate-600">{reviewProposal.narration}</p>
+                </ReviewBlock>
+              ) : null}
+            </>
+          ) : null}
+        </ReviewDrawer>
+      ) : null}
+
       {panelProposal ? (
         <InvoicePanel
           invoice={panelProposal.linkedInvoiceNumber ?? "Invoice"}
@@ -1557,6 +1726,81 @@ export function CollectionsDashboardPage() {
           onClose={() => setPanelId("")}
         />
       ) : null}
+    </div>
+  );
+}
+
+function ReviewBlock({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="mt-5">
+      <h4 className="mb-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">{title}</h4>
+      <div className="divide-y divide-[#ece6dc] rounded-xl border border-[#e5ddd0] bg-white">{children}</div>
+    </section>
+  );
+}
+
+function ReviewRow({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
+  return (
+    <div className={`flex items-start justify-between gap-4 px-4 py-2.5 text-xs ${bold ? "font-bold text-[#1a1a1a]" : "font-medium text-slate-600"}`}>
+      <span className="min-w-0 break-words">{label}</span>
+      <span className="shrink-0 tabular-nums text-right">{value}</span>
+    </div>
+  );
+}
+
+// The last look before something is written to Tally: the working, then a tick box.
+function ReviewDrawer({
+  title, subtitle, tag, total, children, checked, onCheck, onClose, onConfirm, confirmLabel, confirmDisabled, busy,
+}: {
+  title: string; subtitle: string; tag?: string; total: number; children: ReactNode; checked: boolean;
+  onCheck: (value: boolean) => void; onClose: () => void; onConfirm: () => void;
+  confirmLabel: string; confirmDisabled: boolean; busy: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/30" onClick={onClose} role="presentation">
+      <aside
+        aria-label="Review debit note"
+        className="flex h-full w-full max-w-[460px] flex-col bg-[#f7f5f1] shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="flex items-start justify-between gap-3 border-b border-[#e5ddd0] bg-white px-5 py-4">
+          <div className="min-w-0">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Review debit note</div>
+            <h3 className="mt-1 truncate text-base font-bold text-[#1a1a1a]">{title}</h3>
+            <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>
+          </div>
+          <button aria-label="Close" className="rounded-lg px-2 text-xl leading-none text-slate-400 hover:bg-[#f3eee8]" onClick={onClose} type="button">×</button>
+        </header>
+        <div className="flex-1 overflow-y-auto px-5 pb-6 pt-5">
+          <div className="flex items-center justify-between rounded-2xl bg-[#2d2d2d] px-5 py-4 text-white">
+            <div>
+              <div className="text-[11px] font-medium text-white/70">Debit note to create</div>
+              <div className="mt-1 text-2xl font-bold tabular-nums">+{formatMoney(total)}</div>
+            </div>
+            {tag ? <span className="rounded-full border border-white/30 px-3 py-1 text-[11px] font-semibold">{tag}</span> : null}
+          </div>
+          {children}
+        </div>
+        <footer className="border-t border-[#e5ddd0] bg-white px-5 py-4">
+          <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-700">
+            <input checked={checked} className="h-4 w-4 rounded border-[#d6cabb] text-[#2d2d2d]" onChange={(event) => onCheck(event.target.checked)} type="checkbox" />
+            I checked the invoice and debit note amount.
+          </label>
+          {confirmDisabled ? <p className="mt-2 text-[11px] font-semibold text-amber-700">Open the selected company in Tally first.</p> : null}
+          <div className="mt-3 flex justify-end gap-2">
+            <button className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4]" onClick={onClose} type="button">Cancel</button>
+            <button
+              className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white shadow-sm hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={!checked || confirmDisabled || busy}
+              onClick={onConfirm}
+              type="button"
+            >
+              {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+              {confirmLabel}
+            </button>
+          </div>
+        </footer>
+      </aside>
     </div>
   );
 }
