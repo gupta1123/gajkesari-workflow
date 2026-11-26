@@ -55,6 +55,16 @@ const STATUS_LABEL: Record<FollowupPipeline["status"], string> = {
   active: "Active", paused: "Paused", review: "Needs review", settled: "Settled",
   finished: "Limit reached", stopped: "Stopped", sending: "Sending", uncertain: "Delivery uncertain",
 };
+const STATUS_HELP: Record<FollowupPipeline["status"], string> = {
+  active: "Reminders are running. The next one goes out when it is due.",
+  paused: "You paused this. Nothing is sent until you resume it.",
+  review: "Tally shows something changed (the amount, or an invoice is no longer open). Check it before sending.",
+  settled: "Tally shows this is paid. No more reminders will be sent.",
+  finished: "All planned reminders were sent. Nothing more will go out.",
+  stopped: "You stopped this. No more reminders will be sent.",
+  sending: "A reminder is being sent right now.",
+  uncertain: "WhatsApp did not confirm the last send. Check Sent messages before sending again.",
+};
 const KIND_LABEL: Record<Exclude<Kind, "all">, string> = {
   regular: "Regular credit", same_day: "Same-day RTGS", advance: "Advance RTGS", unclear: "Unclear terms",
 };
@@ -138,7 +148,7 @@ function billDates(row: DueInvoice): PanelDate[] {
 }
 
 function ageCell(row: DueInvoice) {
-  if (kindOf(row) === "unclear") return <span className="muted">Terms unclear</span>;
+  if (kindOf(row) === "unclear") return <span className="muted" title="The invoice narration does not say how this customer pays (advance, same-day or regular credit), so it cannot be judged late. Check it before sending a reminder.">Terms unclear</span>;
   const days = row.ageDays ?? 0;
   if (days > 0) return <span className={days > 30 ? "age-bad" : "age-warn"}>{row.ageLabel || `Overdue ${days} days`}</span>;
   return <span>{row.ageLabel || "Due today"}</span>;
@@ -235,6 +245,8 @@ export function FollowUpPipelines() {
   const [sending, setSending] = useState(false);
   const [busy, setBusy] = useState("");
   const [detailId, setDetailId] = useState("");
+  const [detailAttemptId, setDetailAttemptId] = useState("");
+  const closeDetail = () => { setDetailId(""); setDetailAttemptId(""); };
 
   const company = companies.find((c) => c.id === companyId) ?? companies[0] ?? null;
 
@@ -330,6 +342,13 @@ export function FollowUpPipelines() {
     )),
     [rows]
   );
+  // Newest first, so the first match is the latest reminder for that journey.
+  const lastAttempt = useCallback((pipelineId: string) => attempts.find((a) => a.pipeline_id === pipelineId), [attempts]);
+  const overdueDays = useCallback((pipe: FollowupPipeline) => {
+    const wanted = new Set(pipe.kind === "customer" ? (pipe.invoices ?? []).map((i) => i.invoice) : [pipe.invoice]);
+    const ages = due.filter((r) => r.partyLedgerName === pipe.customer && r.linkedInvoiceNumber && wanted.has(r.linkedInvoiceNumber)).map((r) => r.ageDays ?? 0);
+    return ages.length ? Math.max(...ages) : null;
+  }, [due]);
   const customerPipeline = useCallback(
     (name: string) => rows.find((p) => p.kind === "customer" && p.customer === name && isOpen(p)),
     [rows]
@@ -761,7 +780,7 @@ export function FollowUpPipelines() {
             <p className="footnote">
               {tab === "dues" && (byCustomer ? "One message per customer lists all their unpaid invoices. Invoices with unclear payment terms are left out." : "Open invoices read from Tally. Select invoices to start reminders in bulk.")}
               {tab === "due" && "Reminders that are due now. Tally is checked before each one is sent."}
-              {tab === "pipelines" && "Every reminder journey, running or finished."}
+              {tab === "pipelines" && "Every reminder journey, running or finished. Needs review means Tally shows a change to check before sending; Delivery uncertain means WhatsApp did not confirm the last send."}
               {tab === "history" && "Every WhatsApp reminder, newest first."}
             </p>
             <div className="flat">
@@ -824,7 +843,7 @@ export function FollowUpPipelines() {
                           <td><span className="cname" title={row.partyLedgerName}>{row.partyLedgerName}</span>{!phone && <span className="csub">No contact on file</span>}</td>
                           <td>{row.linkedInvoiceNumber ? <button className="lnk" style={{ textDecoration: "none" }} onClick={() => setBillId(row.id)}>{row.linkedInvoiceNumber}</button> : "—"}<span className="csub">{fmtDate(row.linkedInvoiceDate)}</span></td>
                           <td className="r num">{money(row.outstandingAmount)}</td>
-                          <td>{KIND_LABEL[kindOf(row)]}</td>
+                          <td title={kindOf(row) === "unclear" ? "The invoice narration does not say the payment terms." : undefined}>{KIND_LABEL[kindOf(row)]}</td>
                           <td>{ageCell(row)}</td>
                           <td>{pipe
                             ? <span className="pill pill-stone">{STATUS_LABEL[pipe.status]}</span>
@@ -849,7 +868,7 @@ export function FollowUpPipelines() {
                           <td>{maskPhone(attempt.recipient)}</td>
                           <td>{fmtDateTime(attempt.created_at)}</td>
                           <td><span className={`pill ${status.cls}`}>{status.label}</span>{(attempt.error || attempt.delivery_reason) && <span className="snote">{attempt.error || attempt.delivery_reason}</span>}</td>
-                          <td>{pipe && <button className="btn" onClick={() => setDetailId(pipe.id)}>View</button>}</td>
+                          <td>{pipe && <button className="btn" onClick={() => { setDetailId(pipe.id); setDetailAttemptId(attempt.id); }}>View</button>}</td>
                         </tr>
                       );
                     })}
@@ -857,11 +876,11 @@ export function FollowUpPipelines() {
                   </tbody>
                 </table>
               ) : (
-                <table className="gt p">
+                <table className="gt p w">
                   <thead><tr>
                     <th style={{ width: 36 }}><input type="checkbox" aria-label="Select all on this page" checked={pageIds.length > 0 && pageIds.every((id) => selected.has(id))} onChange={(e) => togglePage(e.target.checked)} /></th>
-                    <th style={{ width: "22%" }}>Customer / invoice</th><th className="r" style={{ width: 130 }}>Outstanding</th><th style={{ width: "16%" }}>Stage</th>
-                    <th style={{ width: "17%" }}>Next reminder</th><th style={{ width: "16%" }}>Status</th><th style={{ width: 200 }} />
+                    <th style={{ width: "20%" }}>Customer / invoice</th><th className="r" style={{ width: 120 }}>Outstanding</th><th style={{ width: 120 }}>Overdue</th><th style={{ width: "14%" }}>Stage</th><th style={{ width: "14%" }}>Last reminder</th>
+                    <th style={{ width: "13%" }}>Next reminder</th><th style={{ width: "12%" }}>Status</th><th style={{ width: 200 }} />
                   </tr></thead>
                   <tbody>
                     {pagePipes.map((row) => (
@@ -869,10 +888,12 @@ export function FollowUpPipelines() {
                         <td><input type="checkbox" aria-label={`Select ${row.invoice}`} checked={selected.has(row.id)} onChange={(e) => toggle(row.id, e.target.checked)} /></td>
                         <td><button className="lnk" style={{ textDecoration: "none", textAlign: "left" }} onClick={() => setDetailId(row.id)}><span className="cname">{row.customer}</span></button><span className="csub">{row.invoice}</span></td>
                         <td className="r num">{money(row.outstanding)}</td>
+                        <td>{(() => { const days = overdueDays(row); return days == null ? <span className="muted">—</span> : days > 0 ? <span className={days > 30 ? "age-bad" : "age-warn"}>{days} days</span> : <span>Not overdue</span>; })()}</td>
                         <td>{row.stages[row.stage_index]?.name ?? "—"}<span className="csub">{row.stage_sent} of {row.stages[row.stage_index]?.limit ?? 1} sent</span></td>
+                        <td>{(() => { const last = lastAttempt(row.id); if (!last) return <span className="muted">Not sent yet</span>; const label = attemptLabel(last); return <><span className={`pill ${label.cls}`}>{label.label}</span><span className="csub">{fmtDateTime(last.created_at)}</span></>; })()}</td>
                         <td>{row.next_due_at ? fmtDateTime(row.next_due_at) : <span className="muted">None</span>}</td>
                         <td>
-                          <span className={`pill ${row.status === "settled" || row.status === "active" ? "pill-green" : row.status === "review" || row.status === "uncertain" || row.status === "sending" ? "pill-amber" : row.status === "stopped" ? "pill-red" : "pill-stone"}`}>{STATUS_LABEL[row.status]}</span>{row.note && <span className="snote">{row.note}</span>}
+                          <span title={STATUS_HELP[row.status]} className={`pill ${row.status === "settled" || row.status === "active" ? "pill-green" : row.status === "review" || row.status === "uncertain" || row.status === "sending" ? "pill-amber" : row.status === "stopped" ? "pill-red" : "pill-stone"}`}>{STATUS_LABEL[row.status]}</span>{row.note && <span className="snote">{row.note}</span>}
                           {row.note && <span className="snote">{row.note}</span>}
                         </td>
                         <td>
@@ -884,7 +905,7 @@ export function FollowUpPipelines() {
                             {menuId === row.id && (
                               <div style={{ position: "absolute", right: 0, top: 34, width: 190, background: "#fff", border: "1px solid #ded8d0", borderRadius: 8, boxShadow: "0 12px 28px rgba(0,0,0,.14)", padding: 6, zIndex: 20 }}>
                                 {[
-                                  { label: "View details", run: () => { setMenuId(""); setDetailId(row.id); }, show: true },
+                                  { label: "View details", run: () => { setMenuId(""); setDetailAttemptId(""); setDetailId(row.id); }, show: true },
                                   { label: "Check outstanding in Tally", run: () => void rowAction(row, "check"), show: LIVE.includes(row.status) },
                                   { label: "Pause reminders", run: () => void rowAction(row, "pause"), show: row.status === "active" || row.status === "review" },
                                   { label: "Resume reminders", run: () => void rowAction(row, "resume"), show: row.status === "paused" },
@@ -898,7 +919,7 @@ export function FollowUpPipelines() {
                         </td>
                       </tr>
                     ))}
-                    {!pagePipes.length && <tr><td colSpan={7} className="empty">{tab === "due" ? "No reminders are due right now." : "No reminders started yet. Pick invoices under Unpaid invoices."}</td></tr>}
+                    {!pagePipes.length && <tr><td colSpan={9} className="empty">{tab === "due" ? "No reminders are due right now." : "No reminders started yet. Pick invoices under Unpaid invoices."}</td></tr>}
                   </tbody>
                 </table>
               )}
@@ -990,11 +1011,11 @@ export function FollowUpPipelines() {
 
       {detail && (
         <>
-          <div className="scrim" onClick={() => setDetailId("")} />
+          <div className="scrim" onClick={closeDetail} />
           <aside className="panel" role="dialog" aria-label="Invoice reminders">
             <div className="panel-h">
               <div><h2>{detail.invoice}</h2><p>{detail.customer}</p></div>
-              <button className="icon-btn" aria-label="Close" onClick={() => setDetailId("")}>×</button>
+              <button className="icon-btn" aria-label="Close" onClick={closeDetail}>×</button>
             </div>
             <div className="panel-b">
               <dl className="facts">
@@ -1010,6 +1031,29 @@ export function FollowUpPipelines() {
                 <div><dt>Plan</dt><dd>{detail.plan_name}</dd></div>
               </dl>
               {detail.note && <div className="alert">{detail.note}</div>}
+              {(() => {
+                const mine = attempts.filter((a) => a.pipeline_id === detail.id);
+                const shown = mine.find((a) => a.id === detailAttemptId) ?? mine.find((a) => a.status === "accepted") ?? mine[0];
+                if (!shown) return null;
+                const text = messageText(messageFor(templateKeyFor(detail, detail.stages[shown.stage_index]?.template)), { ...detail, outstanding: shown.outstanding }, detail.company_name);
+                const label = attemptLabel(shown);
+                const why = shown.error || shown.delivery_reason;
+                return (
+                  <>
+                    <h3 style={{ fontSize: 12, margin: "20px 0 8px" }}>Message sent</h3>
+                    <p style={{ fontSize: 12, color: "#756b60", margin: "0 0 10px" }}>
+                      To {maskPhone(shown.recipient)} · {fmtDateTime(shown.created_at)} · <span className={`pill ${label.cls}`}>{label.label}</span>
+                    </p>
+                    {why && <div className="alert err">{why}</div>}
+                    {text
+                      ? <WhatsappBubble name={detail.customer} phone={shown.recipient} text={text} />
+                      : <p className="muted" style={{ fontSize: 12 }}>The message template is not available.</p>}
+                    <p className="muted" style={{ fontSize: 11, margin: "8px 0 0" }}>
+                      Shown from the saved template with the amount at the time of sending. A customer message lists the invoices as they are now.
+                    </p>
+                  </>
+                );
+              })()}
               <h3 style={{ fontSize: 12, margin: "20px 0 12px" }}>What happened</h3>
               <ul className="tl">
                 {attempts.filter((a) => a.pipeline_id === detail.id).map((attempt) => (

@@ -246,6 +246,16 @@ function issueLabel(proposal: DebitNoteProposal) {
   return "Late short payment";
 }
 
+// Tally keeps the debit note open until the customer pays it, so what is left
+// on it says whether the discount has actually been recovered.
+function recoveryState(proposal: DebitNoteProposal): { label: string; tone: "ok" | "warn" | "quiet" } {
+  const left = proposal.remainingRecoverableAmount;
+  if (left === null || left === undefined) return { label: "Payment not checked yet", tone: "quiet" };
+  if (left <= 0.5) return { label: "Recovered", tone: "ok" };
+  if (left < proposal.recoverableAmount - 0.5) return { label: `${formatMoney(left)} still to recover`, tone: "warn" };
+  return { label: "Not paid yet", tone: "warn" };
+}
+
 function createButtonLabel(proposal: DebitNoteProposal) {
   const status = proposal.status;
   if (status === "failed") return "Retry";
@@ -967,6 +977,11 @@ export function CollectionsDashboardPage() {
     selectableCreatedProposals.length > 0 && selectableCreatedProposals.every((proposal) => selectedCreatedIds.has(proposal.id));
   const pendingRecoverableTotal = sumRecoverable(pendingProposals);
   const createdRecoverableTotal = sumRecoverable(createdProposals);
+  const createdRecoveredTotal = createdProposals.reduce((sum, proposal) => {
+    const left = proposal.remainingRecoverableAmount;
+    return left === null || left === undefined ? sum : sum + Math.max(0, proposal.recoverableAmount - left);
+  }, 0);
+  const createdUnchecked = createdProposals.filter((proposal) => proposal.remainingRecoverableAmount == null).length;
   const activeRule = rules[0];
   const companyReady = tallyCompanyVerified;
   const whatsappDialogMissingCount = whatsappDialogProposals.filter((proposal) => !proposal.partyPhone).length;
@@ -1374,7 +1389,7 @@ export function CollectionsDashboardPage() {
               </button>
             ) : null
           }
-          description={`${formatMoney(createdRecoverableTotal)} posted as debit notes.`}
+          description={`${formatMoney(createdRecoverableTotal)} posted as debit notes · ${formatMoney(createdRecoveredTotal)} recovered so far${createdUnchecked ? ` · ${createdUnchecked} not checked yet` : ""}.`}
           title="Created"
         >
           {createdProposals.length === 0 ? (
@@ -1448,8 +1463,16 @@ export function CollectionsDashboardPage() {
                               ) : null}
                             </div>
                           </td>
-                          <td className="px-4 py-4 text-right tabular-nums text-sm font-semibold text-[#1a1a1a]">
-                            {formatMoney(proposal.recoverableAmount)}
+                          <td className="px-4 py-4 text-right">
+                            <div className="tabular-nums text-sm font-semibold text-[#1a1a1a]">{formatMoney(proposal.recoverableAmount)}</div>
+                            {(() => {
+                              const recovery = recoveryState(proposal);
+                              return (
+                                <div className={`mt-1 text-[11px] font-semibold ${recovery.tone === "ok" ? "text-emerald-700" : recovery.tone === "warn" ? "text-amber-700" : "text-slate-400"}`}>
+                                  {recovery.label}
+                                </div>
+                              );
+                            })()}
                           </td>
                           <td className="px-4 py-4">
                             <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${statusClass(proposal.status)}`}>
