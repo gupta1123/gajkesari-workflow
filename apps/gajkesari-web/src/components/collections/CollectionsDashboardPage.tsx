@@ -17,7 +17,7 @@ import {
 
 import { apiFetch } from "@/lib/api-client";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
-import { loadLiveCashDiscountDashboard, queueLiveDebitNote, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
+import { loadLiveCashDiscountDashboard, peekLiveDashboard, queueLiveDebitNote, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 
 type CompanyOption = {
   id: string;
@@ -488,6 +488,9 @@ export function CollectionsDashboardPage() {
         return;
       }
       if (CASH_DISCOUNT_LIVE && companyName) {
+        // Show the last result for this company at once; Tally is re-read behind it.
+        const previous = peekLiveDashboard<DashboardPayload>({ connectionId, companyName, financialYear });
+        if (previous) setDashboard(previous.payload);
         setScanProgress("Starting...");
         try {
           setDashboard(await loadLiveCashDiscountDashboard<DashboardPayload>({

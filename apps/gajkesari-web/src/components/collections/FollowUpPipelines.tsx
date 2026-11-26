@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
-import { loadLiveCashDiscountDashboard, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
+import { loadLiveCashDiscountDashboard, peekLiveDashboard, type ScanInfo } from "@/lib/cash-discount-live-dashboard";
 import { resolveTallyConnectionId } from "@/lib/resolve-tally-connection";
 import {
   createPipelines, listPipelines, runPipelineAction,
@@ -34,6 +34,7 @@ type DueInvoice = {
   receipts?: Array<{ date: string | null; amount: number; voucherNumber: string | null; voucherType: string | null }>;
   partyEmail?: string | null;
 };
+const FOLLOWUPS_ANALYSE = "/api/collections/follow-ups/analyse";
 type FollowUpPayload = { tabs?: { paymentFollowUps?: DueInvoice[] } };
 
 type Tab = "due" | "dues" | "pipelines" | "history";
@@ -293,11 +294,18 @@ export function FollowUpPipelines() {
     setScanning(true);
     setScanError("");
     setScanLine("Starting...");
+    const previous = peekLiveDashboard<FollowUpPayload>({ analysePath: FOLLOWUPS_ANALYSE, connectionId: company.connectionId, companyName: company.companyName, financialYear: company.financialYear });
+    if (previous) {
+      // Show the last result straight away; Tally is re-read behind it.
+      setDue(previous.payload.tabs?.paymentFollowUps ?? []);
+      setScannedAt(new Date(previous.at));
+    }
     try {
       const payload = await loadLiveCashDiscountDashboard<FollowUpPayload>({
         connectionId: company.connectionId,
         companyName: company.companyName,
         financialYear: company.financialYear,
+        analysePath: FOLLOWUPS_ANALYSE,
         onProgress: setScanLine,
         onScanInfo: setScanInfo,
       });

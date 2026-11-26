@@ -77,11 +77,23 @@ export async function loadCustomerScope(connectionId: string, companyName: strin
 // fail with "Tally is busy". Callers share the scan that is already running.
 const scansInFlight = new Map<string, Promise<unknown>>();
 
+// The last finished result per company, kept in memory only (never written to
+// browser storage), so reopening a page shows it at once while Tally is re-read.
+const lastResults = new Map<string, { at: number; payload: unknown }>();
+const scanKey = (params: Pick<LiveReadParams, "analysePath" | "connectionId" | "companyName" | "financialYear">) =>
+  `${params.analysePath ?? ""}::${params.connectionId}::${params.companyName}::${params.financialYear ?? ""}`;
+
+export function peekLiveDashboard<T>(params: Pick<LiveReadParams, "analysePath" | "connectionId" | "companyName" | "financialYear">) {
+  return (lastResults.get(scanKey(params)) as { at: number; payload: T } | undefined) ?? null;
+}
+
 export function loadLiveCashDiscountDashboard<T>(params: LiveReadParams): Promise<T> {
-  const key = `${params.connectionId}::${params.companyName}::${params.financialYear ?? ""}`;
+  const key = scanKey(params);
   const running = scansInFlight.get(key);
   if (running) return running as Promise<T>;
-  const scan = runLiveCashDiscountDashboard<T>(params).finally(() => scansInFlight.delete(key));
+  const scan = runLiveCashDiscountDashboard<T>(params)
+    .then((payload) => { lastResults.set(key, { at: Date.now(), payload }); return payload; })
+    .finally(() => scansInFlight.delete(key));
   scansInFlight.set(key, scan);
   return scan;
 }
@@ -91,6 +103,8 @@ export type LiveReadParams = {
   companyName: string;
   financialYear?: string | null;
   signal?: AbortSignal;
+  // Which analysis the API runs; the follow-ups page asks for its own, lighter one.
+  analysePath?: string;
   onProgress?: (message: string) => void;
   onScanInfo?: (info: ScanInfo) => void;
 };
@@ -170,17 +184,31 @@ async function readLiveOpenBillsNow(params: LiveReadParams): Promise<LiveOpenBil
   return { customers, byLedger };
 }
 
+// The scan is several MB of repeating text. Sent gzipped it is about a tenth of
+// that. An API that predates this answers 400 or rejects the request; the plain
+// body is then sent instead.
+async function postAnalysis(path: string, signal: AbortSignal | undefined, payload: unknown) {
+  const text = JSON.stringify(payload);
+  const send = (body: BodyInit, type: string) => apiFetch(path, { method: "POST", headers: { "Content-Type": type }, signal, body });
+  if (typeof CompressionStream !== "undefined") {
+    try {
+      const packed = await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+      const response = await send(packed, "application/x-gzip-json");
+      if (response.status !== 400) return response;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }
+  return send(text, "application/json");
+}
+
 /** Reads the open bills, then has the API analyse them for the Cash Discount page. */
 async function runLiveCashDiscountDashboard<T>(params: LiveReadParams): Promise<T> {
   const { connectionId, companyName, signal, onProgress } = params;
   const financialYear = params.financialYear ?? null;
   const { customers, byLedger } = await readLiveOpenBills(params);
   onProgress?.("Analysing...");
-  const response = await apiFetch("/api/collections/live/analyse", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal,
-    body: JSON.stringify({
+  const response = await postAnalysis(params.analysePath ?? "/api/collections/live/analyse", signal, {
       connectionId,
       companyName,
       financialYear,
@@ -190,8 +218,7 @@ async function runLiveCashDiscountDashboard<T>(params: LiveReadParams): Promise<
         ledgers: customers.map((customer) => ({ name: customer.name, parent: customer.parent ?? null, gstin: customer.gstin ?? null, raw: contactFields(customer) })),
         scanSummary: { complete: true, customerCount: customers.length },
       },
-    }),
-  });
+    });
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as T;
 }
