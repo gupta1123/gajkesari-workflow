@@ -140,3 +140,40 @@ test("the ordinary queue diagnoses a broken live channel and restores a prepared
   assert.equal(outcome.data.dataSource, "prepared_customer_dues");
   assert.equal(outcome.data.openBills.length, 1);
 });
+
+test("the live channel reconnects by itself when the server restarts", { timeout: 30000 }, async t => {
+  const gateway = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(gateway, "listening");
+  const oldUrl = process.env.TALLY_LIVE_GATEWAY_URL;
+  process.env.TALLY_LIVE_GATEWAY_URL = "ws://127.0.0.1:" + gateway.address().port;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "connector-restart-"));
+  const config = { apiBase: "http://support.invalid", tallyUrl: "http://tally.invalid", connectionId: "connector",
+    bridgeToken: "local-fixture", installationRef: "installation", sessionGeneration: 1 };
+  const runner = createBridgeRunner({ config, appUserDataPath: dir, onLog() {} });
+  t.after(async () => {
+    runner.stop();
+    for (const client of gateway.clients) client.terminate();
+    await new Promise(resolve => gateway.close(resolve));
+    if (oldUrl === undefined) delete process.env.TALLY_LIVE_GATEWAY_URL;
+    else process.env.TALLY_LIVE_GATEWAY_URL = oldUrl;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  t.mock.method(globalThis, "fetch", async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith("/commands/next")) return Response.json({ commands: [] });
+    return Response.json({});
+  });
+  let sessions = 0;
+  const secondSession = Promise.withResolvers();
+  gateway.on("connection", socket => socket.on("message", bytes => {
+    if (JSON.parse(bytes.toString()).type !== "authenticate") return;
+    sessions += 1;
+    socket.send(JSON.stringify({ type: "authenticated" }));
+    // Like a deploy: the first session is closed by the server.
+    if (sessions === 1) setTimeout(() => socket.close(1001, "Server shutting down."), 100);
+    else secondSession.resolve();
+  }));
+  await runner.start();
+  await secondSession.promise;
+  assert.equal(sessions, 2);
+});

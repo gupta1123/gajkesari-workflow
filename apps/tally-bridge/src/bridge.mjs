@@ -6461,6 +6461,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   let socket = null;
   let reconnectTimer = null;
   let stopped = false;
+  let failedAttempts = 0;
+  let replacedUntil = 0;
+  let watchdog = null;
   const operations = new Map();
   const observation = { state: "disconnected", gatewayHost: null, lastAttemptAt: null,
     lastAuthenticatedAt: null, lastCloseCode: null, lastError: null };
@@ -6469,13 +6472,30 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   const send = (payload) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   };
+  // Retry quickly at first (a server restart is back within seconds), then
+  // back off so a gateway that is down does not get hammered. A connector that a
+  // newer one replaced waits longer, so two copies do not keep kicking each other.
   const scheduleReconnect = () => {
     if (stopped || reconnectTimer) return;
+    const delay = Math.max(Math.min(3000 * 2 ** Math.min(failedAttempts, 2), 12000), replacedUntil - Date.now());
+    failedAttempts += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
-    }, 3000);
+    }, delay);
     reconnectTimer.unref?.();
+  };
+  // The gateway pings every 30 s. A link that has gone quiet for longer (a router
+  // restart, a laptop that slept) can look open while being dead, so drop it and
+  // reconnect. The same check covers a connection attempt that never finishes.
+  const armWatchdog = (attemptSocket, ms) => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      if (socket !== attemptSocket || stopped) return;
+      log("error", "Live Tally channel went quiet; reconnecting.");
+      attemptSocket.terminate();
+    }, ms);
+    watchdog.unref?.();
   };
 
   const handleOperation = async (message) => {
@@ -6727,6 +6747,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
       const attemptSocket = socket = new WebSocket(gateway, {
         ca: windowsTlsCertificates(),
       });
+      armWatchdog(attemptSocket, 20_000);
+      socket.on("ping", () => { if (socket === attemptSocket && observation.state === "authenticated") armWatchdog(attemptSocket, 75_000); });
       socket.addEventListener("open", () => {
         if (socket !== attemptSocket || stopped) return;
         send({
@@ -6741,7 +6763,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         try {
           const message = JSON.parse(String(event.data || "{}"));
           if (message.type === "authenticated") {
+            failedAttempts = 0;
             observation.state = "authenticated";
+            armWatchdog(attemptSocket, 75_000);
             observation.lastAuthenticatedAt = new Date().toISOString();
             log("info", "Live Tally channel connected.");
           } else if (message.type === "operation") {
@@ -6764,11 +6788,13 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
       });
       socket.addEventListener("close", (event) => {
         if (socket !== attemptSocket || stopped) return;
+        clearTimeout(watchdog);
         for (const controller of operations.values()) controller.abort();
         const code = Number(event?.code || 0);
         observation.state = "disconnected";
         observation.lastCloseCode = code;
         const reason = String(event?.reason || "").trim();
+        if (/replaced this one/i.test(reason)) replacedUntil = Date.now() + 30_000;
         if (!stopped && (code !== 1000 || reason)) {
           log("error", `Live Tally channel closed (code ${code || "unknown"}${reason ? `: ${reason}` : ""}); retrying.`);
         }
@@ -6790,6 +6816,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
       if (operations.size || executeExclusive.hasPendingInteractive()) throw new Error("Tally is busy. Retry when the current operation finishes.");
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
+      failedAttempts = 0;
+      replacedUntil = 0;
       const previous = socket;
       socket = null;
       previous?.close();
@@ -6804,6 +6832,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
       stopped = true;
       for (const controller of operations.values()) controller.abort();
       clearTimeout(reconnectTimer);
+      clearTimeout(watchdog);
       socket?.close();
     },
   };
