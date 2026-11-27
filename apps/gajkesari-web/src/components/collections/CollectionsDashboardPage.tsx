@@ -440,6 +440,10 @@ export function CollectionsDashboardPage() {
   // What the person is about to confirm: one debit note, or every selected one.
   const [reviewTarget, setReviewTarget] = useState<{ kind: "one"; id: string } | { kind: "bulk" } | null>(null);
   const [reviewChecked, setReviewChecked] = useState(false);
+  // The debit notes in the bulk review, kept while they are created one by one.
+  const [bulkBatch, setBulkBatch] = useState<DebitNoteProposal[]>([]);
+  const [bulkStatus, setBulkStatus] = useState<Record<string, "waiting" | "creating" | "done" | "failed">>({});
+  const loadErrorRef = useRef("");
   const initialLoadStartedRef = useRef(false);
   const lastLoadedConnectionRef = useRef("");
 
@@ -508,6 +512,8 @@ export function CollectionsDashboardPage() {
             onProgress: setScanProgress,
             onScanInfo: setScanInfo,
           }));
+          // An earlier load that failed (for example with a stale saved connection) is no longer true.
+          setMessage((current) => (current && current.text === loadErrorRef.current ? null : current));
         } finally {
           setScanProgress(null);
         }
@@ -662,7 +668,15 @@ export function CollectionsDashboardPage() {
         await Promise.all([liveCheck, loadDashboard(connectionId, company?.companyName, company?.financialYear ?? null)]);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
-        setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
+        const text = error instanceof Error ? error.message : "Could not load Cash Discounts data.";
+        // The last company is saved in the browser. If its connection no longer exists
+        // (the connector was paired again), read the current list instead of showing an error.
+        if (options?.fromCache && /connection not found/i.test(text)) {
+          void refreshAll({ quiet: true });
+          return;
+        }
+        loadErrorRef.current = text;
+        setMessage({ tone: "error", text });
       } finally {
         setLoading(false);
       }
@@ -927,7 +941,9 @@ export function CollectionsDashboardPage() {
         if (!CASH_DISCOUNT_LIVE) await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
         await loadDashboard(selectedConnectionId, company?.companyName);
       } catch (error) {
-        setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
+        const text = error instanceof Error ? error.message : "Could not load Cash Discounts data.";
+        loadErrorRef.current = text;
+        setMessage({ tone: "error", text });
       } finally {
         setLoading(false);
       }
@@ -1031,18 +1047,24 @@ export function CollectionsDashboardPage() {
       setMessage({ tone: "error", text: `Tally is open to ${activeTallyCompanyName || "another company"}. Switch it to ${selectedCompany?.companyName || "the selected company"}, refresh, then create debit notes.` });
       return;
     }
-    if (selectedPendingProposals.length === 0) return;
-    const confirmed = window.confirm(
-      `Create ${selectedPendingProposals.length} debit note${selectedPendingProposals.length === 1 ? "" : "s"} in Tally?`
-    );
-    if (!confirmed) return;
+    // The review drawer is the confirmation; there is no second pop-up.
+    const batch = bulkBatch;
+    if (batch.length === 0) return;
 
     try {
       setBulkCreating(true);
-      setMessage({ tone: "info", text: `Creating ${selectedPendingProposals.length} debit notes in Tally...` });
-      for (const proposal of selectedPendingProposals) {
+      setBulkStatus(Object.fromEntries(batch.map((proposal) => [proposal.id, "waiting" as const])));
+      setMessage({ tone: "info", text: `Creating ${batch.length} debit notes in Tally...` });
+      for (const proposal of batch) {
         setApprovingId(proposal.id);
-        await createDebitNoteForProposal(proposal);
+        setBulkStatus((current) => ({ ...current, [proposal.id]: "creating" }));
+        try {
+          await createDebitNoteForProposal(proposal);
+        } catch (error) {
+          setBulkStatus((current) => ({ ...current, [proposal.id]: "failed" }));
+          throw error;
+        }
+        setBulkStatus((current) => ({ ...current, [proposal.id]: "done" }));
       }
       if (selectedConnectionId) {
         if (!CASH_DISCOUNT_LIVE) await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
@@ -1051,8 +1073,11 @@ export function CollectionsDashboardPage() {
         await loadDashboard();
       }
       setSelectedPendingIds(new Set());
+      setReviewTarget(null);
+      setBulkBatch([]);
+      setBulkStatus({});
       setActiveView("done");
-      setMessage({ tone: "success", text: `${selectedPendingProposals.length} debit notes created in Tally.` });
+      setMessage({ tone: "success", text: `${batch.length} debit notes created in Tally.` });
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not create selected debit notes." });
       await loadDashboard().catch(() => undefined);
@@ -1174,7 +1199,7 @@ export function CollectionsDashboardPage() {
               <button
                 className="inline-flex h-8.5 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={bulkCreating}
-                onClick={() => { setReviewChecked(false); setReviewTarget({ kind: "bulk" }); }}
+                onClick={() => { setReviewChecked(false); setBulkStatus({}); setBulkBatch(selectedPendingProposals); setReviewTarget({ kind: "bulk" }); }}
                 type="button"
               >
                 {bulkCreating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
@@ -1676,29 +1701,51 @@ export function CollectionsDashboardPage() {
           busy={reviewTarget.kind === "bulk" ? bulkCreating : approvingId === reviewProposal?.id}
           checked={reviewChecked}
           confirmDisabled={!tallyCompanyVerified}
-          confirmLabel={reviewTarget.kind === "bulk" ? `Create ${selectedPendingProposals.length} debit notes in Tally` : "Create debit note in Tally"}
+          confirmLabel={reviewTarget.kind === "bulk" ? `Create ${bulkBatch.length} debit notes in Tally` : "Create debit note in Tally"}
           onCheck={setReviewChecked}
-          onClose={() => setReviewTarget(null)}
+          label={reviewTarget.kind === "bulk" ? `${bulkBatch.length} debit notes to create` : undefined}
+          onClose={() => { setReviewTarget(null); setBulkStatus({}); }}
           onConfirm={() => {
             const target = reviewTarget;
+            if (target.kind === "bulk") { void approveSelectedProposals(); return; }
             setReviewTarget(null);
-            if (target.kind === "bulk") void approveSelectedProposals();
-            else if (reviewProposal) void approveProposal(reviewProposal);
+            if (reviewProposal) void approveProposal(reviewProposal);
           }}
           subtitle={reviewTarget.kind === "bulk"
-            ? `${selectedPendingProposals.length} invoices selected`
+            ? `${bulkBatch.length} invoices selected`
             : `${shortText(reviewProposal?.linkedInvoiceNumber, "No invoice")} · ${formatDate(reviewProposal?.linkedInvoiceDate)}`}
           tag={reviewTarget.kind === "one" && reviewProposal ? `${DISCOUNT_TYPE_LABEL[discountType(reviewProposal)]}` : undefined}
           title={reviewTarget.kind === "bulk" ? "Create selected debit notes" : reviewProposal?.partyLedgerName ?? ""}
-          total={reviewTarget.kind === "bulk" ? sumRecoverable(selectedPendingProposals) : Number(reviewProposal?.recoverableAmount) || 0}
+          total={reviewTarget.kind === "bulk" ? sumRecoverable(bulkBatch) : Number(reviewProposal?.recoverableAmount) || 0}
         >
           {reviewTarget.kind === "bulk" ? (
-            <ReviewBlock title="Debit notes to create">
-              {selectedPendingProposals.slice(0, 12).map((proposal) => (
-                <ReviewRow key={proposal.id} label={`${proposal.partyLedgerName} · ${shortText(proposal.linkedInvoiceNumber, "No invoice")}`} value={formatMoney(proposal.recoverableAmount)} />
-              ))}
-              {selectedPendingProposals.length > 12 ? <ReviewRow label={`and ${selectedPendingProposals.length - 12} more`} value="" /> : null}
-              <ReviewRow bold label="Total recoverable" value={formatMoney(sumRecoverable(selectedPendingProposals))} />
+            <ReviewBlock title={bulkBusyTitle(bulkStatus, bulkBatch.length)}>
+              <div className="max-h-[52vh] divide-y divide-[#ece6dc] overflow-y-auto">
+                {bulkBatch.map((proposal) => {
+                  const state = bulkStatus[proposal.id];
+                  return (
+                    <div className="flex items-start justify-between gap-3 px-4 py-2.5 text-xs" key={proposal.id}>
+                      <div className="flex min-w-0 items-start gap-2.5">
+                        <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                          {state === "done" ? <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                            : state === "creating" ? <Loader2 className="h-4 w-4 animate-spin text-slate-500" />
+                            : state === "failed" ? <TriangleAlert className="h-4 w-4 text-red-600" />
+                            : <span className="h-2 w-2 rounded-full bg-[#d6cabb]" />}
+                        </span>
+                        <div className="min-w-0">
+                          <div className="truncate font-semibold text-[#1a1a1a]">{proposal.partyLedgerName}</div>
+                          <div className="truncate text-[11px] text-slate-500">
+                            {shortText(proposal.linkedInvoiceNumber, "No invoice")} · {issueLabel(proposal)}
+                            {state === "failed" ? " · Not created" : ""}
+                          </div>
+                        </div>
+                      </div>
+                      <span className="shrink-0 font-semibold tabular-nums text-[#1a1a1a]">{formatMoney(proposal.recoverableAmount)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <ReviewRow bold label="Total recoverable" value={formatMoney(sumRecoverable(bulkBatch))} />
             </ReviewBlock>
           ) : reviewProposal ? (
             <>
@@ -1775,15 +1822,23 @@ function ReviewRow({ label, value, bold }: { label: string; value: string; bold?
 }
 
 // The last look before something is written to Tally: the working, then a tick box.
+function bulkBusyTitle(status: Record<string, "waiting" | "creating" | "done" | "failed">, total: number) {
+  const values = Object.values(status);
+  if (values.length === 0) return "Debit notes to create";
+  const done = values.filter((value) => value === "done").length;
+  if (values.includes("failed")) return `${done} of ${total} created. Stopped at the first one that failed`;
+  return done === total ? "All created" : `Creating in Tally: ${done} of ${total} done`;
+}
+
 function ReviewDrawer({
-  title, subtitle, tag, total, children, checked, onCheck, onClose, onConfirm, confirmLabel, confirmDisabled, busy,
+  title, subtitle, tag, label, total, children, checked, onCheck, onClose, onConfirm, confirmLabel, confirmDisabled, busy,
 }: {
-  title: string; subtitle: string; tag?: string; total: number; children: ReactNode; checked: boolean;
+  title: string; subtitle: string; tag?: string; label?: string; total: number; children: ReactNode; checked: boolean;
   onCheck: (value: boolean) => void; onClose: () => void; onConfirm: () => void;
   confirmLabel: string; confirmDisabled: boolean; busy: boolean;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-black/30" onClick={onClose} role="presentation">
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/30" onClick={busy ? undefined : onClose} role="presentation">
       <aside
         aria-label="Review debit note"
         className="flex h-full w-full max-w-[460px] flex-col bg-[#f7f5f1] shadow-2xl"
@@ -1795,12 +1850,12 @@ function ReviewDrawer({
             <h3 className="mt-1 truncate text-base font-bold text-[#1a1a1a]">{title}</h3>
             <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p>
           </div>
-          <button aria-label="Close" className="rounded-lg px-2 text-xl leading-none text-slate-400 hover:bg-[#f3eee8]" onClick={onClose} type="button">×</button>
+          <button aria-label="Close" className="rounded-lg px-2 text-xl leading-none text-slate-400 hover:bg-[#f3eee8] disabled:opacity-30" disabled={busy} onClick={onClose} type="button">×</button>
         </header>
         <div className="flex-1 overflow-y-auto px-5 pb-6 pt-5">
           <div className="flex items-center justify-between rounded-2xl bg-[#2d2d2d] px-5 py-4 text-white">
             <div>
-              <div className="text-[11px] font-medium text-white/70">Debit note to create</div>
+              <div className="text-[11px] font-medium text-white/70">{label ?? "Debit note to create"}</div>
               <div className="mt-1 text-2xl font-bold tabular-nums">+{formatMoney(total)}</div>
             </div>
             {tag ? <span className="rounded-full border border-white/30 px-3 py-1 text-[11px] font-semibold">{tag}</span> : null}
@@ -1809,12 +1864,12 @@ function ReviewDrawer({
         </div>
         <footer className="border-t border-[#e5ddd0] bg-white px-5 py-4">
           <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-700">
-            <input checked={checked} className="h-4 w-4 rounded border-[#d6cabb] text-[#2d2d2d]" onChange={(event) => onCheck(event.target.checked)} type="checkbox" />
+            <input checked={checked} className="h-4 w-4 rounded border-[#d6cabb] text-[#2d2d2d]" disabled={busy} onChange={(event) => onCheck(event.target.checked)} type="checkbox" />
             I checked the invoice and debit note amount.
           </label>
           {confirmDisabled ? <p className="mt-2 text-[11px] font-semibold text-amber-700">Open the selected company in Tally first.</p> : null}
           <div className="mt-3 flex justify-end gap-2">
-            <button className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4]" onClick={onClose} type="button">Cancel</button>
+            <button className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] disabled:opacity-40" disabled={busy} onClick={onClose} type="button">Cancel</button>
             <button
               className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white shadow-sm hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-40"
               disabled={!checked || confirmDisabled || busy}

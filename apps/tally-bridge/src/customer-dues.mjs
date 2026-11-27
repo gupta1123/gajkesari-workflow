@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { RECONCILE_EVERY_MS } from "./company-evidence-cache.mjs";
 
 const SCHEMA = 1;
+const RETRY_AFTER_FAILURE_MS = 10 * 60_000;
+const WAIT_FOR_REFRESH_MS = 90_000;
 
 function sameCounters(left, right) {
   return left.altVchId === right.altVchId && left.altMstId === right.altMstId;
@@ -33,9 +35,12 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
     return snapshots.get(key);
   }
 
-  function isCurrent(snapshot, date, counters) {
+  // `ignoreAge` is for answering a page: Tally's change counters already prove
+  // nothing changed, so an old snapshot is still right. The hourly rebuild is
+  // done in the background and must never leave a page waiting on a full export.
+  function isCurrent(snapshot, date, counters, ignoreAge = false) {
     return snapshot?.asOfDate === date && sameCounters(snapshot.counters, counters) &&
-      Date.now() - Date.parse(snapshot.preparedAt) < RECONCILE_EVERY_MS;
+      (ignoreAge || Date.now() - Date.parse(snapshot.preparedAt) < RECONCILE_EVERY_MS);
   }
 
   function status(company) {
@@ -67,6 +72,8 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
       const saved = get(company);
       if (automatic && !saved) return company;
       file = filename(company);
+      // A rebuild that just failed (Tally busy or slow) is not retried every minute.
+      if (automatic && failure?.file === file && Date.now() - failure.at < RETRY_AFTER_FAILURE_MS) return company;
       if (failure?.file === file) failure = null;
       report("Checking Tally for changes…");
       const date = today();
@@ -96,7 +103,7 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
       snapshots.set(file, snapshot);
       return company;
     })().catch((error) => {
-      if (file) failure = { file, message: error.message };
+      if (file) failure = { file, message: error.message, at: Date.now() };
       throw error;
     }).finally(() => { running = null; progress = ""; onStatus(); });
     onStatus();
@@ -104,10 +111,20 @@ export function createCustomerDues({ dir, normalizeLedger, readActiveCompany, re
   }
 
   async function read(company, ledgerNames, verifyCounters) {
-    const saved = get(company);
+    let saved = get(company);
     if (!saved || saved.asOfDate !== today()) return null;
-    const counters = await verifyCounters();
-    if (!isCurrent(saved, today(), counters)) return null;
+    let counters = await verifyCounters();
+    if (!isCurrent(saved, today(), counters, true) && running) {
+      // Tally changed and a refresh is already under way: wait for it instead of
+      // starting a second full read of the same data.
+      let timer;
+      await Promise.race([running.catch(() => null), new Promise((resolve) => { timer = setTimeout(resolve, WAIT_FOR_REFRESH_MS); })]);
+      clearTimeout(timer);
+      saved = get(company);
+      if (!saved || saved.asOfDate !== today()) return null;
+      counters = await verifyCounters();
+    }
+    if (!isCurrent(saved, today(), counters, true)) return null;
     const indexed = new Map(saved.buckets.map((bucket) => [normalizeLedger(bucket.ledgerName), bucket]));
     const byLedger = Object.fromEntries(ledgerNames.map((name) => {
       const bucket = indexed.get(normalizeLedger(name));

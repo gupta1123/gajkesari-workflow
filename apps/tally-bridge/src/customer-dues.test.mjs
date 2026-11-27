@@ -47,6 +47,11 @@ test("prepared dues reuse the collections scan, stay scoped, and refuse stale re
   assert.equal(result.byLedger["customer a"].openBills[0].pendingAmount, 1000);
   assert.equal(result.byLedger["customer a"].openBills[0].narration, "Same day RTGS");
   assert.deepEqual(result.byLedger["Customer B"].openBills, []);
+  // Two hours later with Tally unchanged: the page is still answered from the saved dues.
+  const realNow = Date.now;
+  const later = t.mock.method(Date, "now", () => realNow() + 2 * 60 * 60 * 1000);
+  assert.equal((await afterRestart.read(company, ["customer a"], readCounters)).dataSource, "prepared_customer_dues");
+  later.mock.restore();
   assert.equal(await afterRestart.read({ ...company, guid: "other" }, ["Customer A"], readCounters), null);
   assert.equal(await afterRestart.read({ ...company, financialYear: "2025-26" }, ["Customer A"], readCounters), null);
 
