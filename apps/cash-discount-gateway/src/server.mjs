@@ -8,6 +8,7 @@ let apiBaseUrl = (process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:30
 const AUTH_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 4 * 60_000;
 const MAX_MESSAGE_BYTES = 30 * 1024 * 1024;
+const CONNECTOR_RECONNECT_WAIT_MS = 25_000;
 
 const metadata = new WeakMap();
 const connectors = new Map();
@@ -177,7 +178,23 @@ async function handleBrowserRequest(socket, message, meta) {
     send(socket, { type: "result", requestId, success: false, error: "This live request is already running." });
     return;
   }
-  const connector = connectors.get(meta.connectionId);
+  // A deploy or restart of this server drops the connector's live link for a few
+  // seconds; it reconnects by itself every 3 s. Wait for that instead of failing.
+  const connectorReady = () => {
+    const candidate = connectors.get(meta.connectionId);
+    const candidateMeta = candidate ? metadata.get(candidate) : null;
+    return candidate && candidate.readyState === WebSocket.OPEN && candidateMeta?.ownerUserId === meta.ownerUserId ? candidate : null;
+  };
+  let connector = connectorReady();
+  if (!connector) {
+    const giveUpAt = Date.now() + CONNECTOR_RECONNECT_WAIT_MS;
+    send(socket, { type: "progress", requestId, message: "Waiting for the Tally connector to reconnect..." });
+    while (!connector && Date.now() < giveUpAt && socket.readyState === WebSocket.OPEN) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      connector = connectorReady();
+    }
+    if (socket.readyState !== WebSocket.OPEN) return;
+  }
   const connectorMeta = connector ? metadata.get(connector) : null;
   if (!connector || connector.readyState !== WebSocket.OPEN || connectorMeta?.ownerUserId !== meta.ownerUserId) {
     send(socket, {
